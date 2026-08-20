@@ -1,0 +1,26 @@
+import importlib, app
+importlib.reload(app)
+msg = "I'm calling for my husband, William Vance. I need to get his recent lab results"
+print('INPUT:', msg)
+resp = app.determine_pre_chart_response(msg, msg.lower())
+print('response:', resp)
+print('third_party_detected:', getattr(app, 'third_party_detected', None))
+print('caller_first_name:', getattr(app, 'caller_first_name', None))
+print('caller_last_name:', getattr(app, 'caller_last_name', None))
+print('patient_first_name:', getattr(app, 'patient_first_name', None))
+print('patient_last_name:', getattr(app, 'patient_last_name', None))
+print('dob_collected:', getattr(app, 'dob_collected', None))
+print('caller_is_patient:', getattr(app, 'caller_is_patient', None))
+# Simulate caller giving their name
+resp2 = app.determine_pre_chart_response('This is Jane Vance', 'this is jane vance')
+print('\nCALLER REPLY: This is Jane Vance')
+print('response2:', resp2)
+print('caller_first_name:', app.caller_first_name)
+print('caller_last_name:', app.caller_last_name)
+# Simulate providing DOB
+resp3 = app.determine_pre_chart_response('5/7/1950', '5/7/1950')
+print('\nDOB REPLY: 5/7/1950')
+print('response3:', resp3)
+print('dob_collected:', app.dob_collected)
+print('third_party_detected:', app.third_party_detected)
+print('current_hipaa_status:', getattr(app, 'current_hipaa_status', None))

@@ -1,0 +1,16 @@
+#Environment variables
+.env
+
+# Virtual environments
+.venv/
+venv/
+
+#Pycharm
+.idea/
+
+#Python cache
+_pycache_/
+*.pyc
+
+#Pytest
+.pytest_cache/

@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Patient Services Chatbot</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f0f4f8;
+        }
+        h1 {
+            text-align: center;
+            color: #2c5282;
+        }
+        #chat-box {
+            height: 500px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            border-radius: 10px;
+            padding: 20px;
+            background-color: white;
+            margin-bottom: 20px;
+        }
+        .user-message {
+            text-align: right;
+            margin: 10px 0;
+        }
+        .user-message span {
+            background-color: #2c5282;
+            color: white;
+            padding: 10px 15px;
+            border-radius: 15px;
+            display: inline-block;
+            max-width: 70%;
+        }
+        .bot-message {
+            text-align: left;
+            margin: 10px 0;
+        }
+        .bot-message span {
+            background-color: #e2e8f0;
+            color: #2d3748;
+            padding: 10px 15px;
+            border-radius: 15px;
+            display: inline-block;
+            max-width: 70%;
+        }
+        #input-area {
+            display: flex;
+            gap: 10px;
+        }
+        #user-input {
+            flex: 1;
+            padding: 12px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            font-size: 16px;
+        }
+        button {
+            padding: 12px 25px;
+            background-color: #2c5282;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #2a4365;
+        }
+    </style>
+</head>
+<body>
+    <h1>🏥 Patient Services Assistant</h1>
+    <div id="chat-box">
+        <div class="bot-message">
+            <span>Hello! Thank you for calling the Sykes Creek Primary Care office. This is Steve. For whom do I have the pleasure of speaking with today? Please provide your first and last name.</span>
+        </div>
+    </div>
+    <div id="input-area">
+        <input type="text" id="user-input" placeholder="Type your message here..." />
+        <button onclick="sendMessage()">Send</button>
+    </div>
+
+    <script>
+        async function sendMessage() {
+            const input = document.getElementById("user-input");
+            const chatBox = document.getElementById("chat-box");
+            const message = input.value.trim();
+            if (!message) return;
+
+            chatBox.innerHTML += `<div class="user-message"><span>${message}</span></div>`;
+            input.value = "";
+
+            const response = await fetch("/chat", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({message: message})
+            });
+
+            const data = await response.json();
+            chatBox.innerHTML += `<div class="bot-message"><span>${data.response}</span></div>`;
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        document.getElementById("user-input").addEventListener("keypress", function(e) {
+            if (e.key === "Enter") sendMessage();
+        });
+    </script>
+</body>
+</html>
