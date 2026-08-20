@@ -91,6 +91,11 @@ same_day_virtual_clinic_offer_pending = False
 next_available_options_pending = False
 next_day_or_urgent_care_pending = False
 
+# Before office hours acute contagious state
+before_hours_acute_active = False
+before_hours_virtual_offered = False
+before_hours_pcp_message_pending = False
+
 # Scenario 16/17: Reschedule / Cancel Acute Visit
 acute_existing_appt_day = None
 acute_existing_appt_time = None
@@ -859,6 +864,7 @@ CONTAGIOUS_SYMPTOM_TRIGGERS = [
     "pink eye", "conjunctivitis", "hand foot and mouth", "rsv",
     "contagious", "fever and cough", "sore throat and fever",
     "stomach bug", "norovirus", "pneumonia", "bronchitis",
+    "flu-like", "fever", "cough", "congestion", "body aches", "sore throat",
 ]
 
 VIRTUAL_VISIT_REFUSAL_TRIGGERS = [
@@ -2952,6 +2958,7 @@ def home():
     global ma_request_reason_collected
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
+    global before_hours_acute_active, before_hours_virtual_offered, before_hours_pcp_message_pending
 
     profanity_count = 0
     hipaa_status_determined = False
@@ -2981,6 +2988,9 @@ def home():
     same_day_virtual_clinic_offer_pending = False
     next_available_options_pending = False
     next_day_or_urgent_care_pending = False
+    before_hours_acute_active = False
+    before_hours_virtual_offered = False
+    before_hours_pcp_message_pending = False
     acute_existing_appt_day = None
     acute_existing_appt_time = None
     acute_reschedule_confirm_pending = False
@@ -3097,6 +3107,7 @@ def chat():
     global med_pro_collection_complete, med_pro_referral_looked_up
     global med_pro_referral_status, med_pro_referral_date
     global med_pro_referral_provider, med_pro_referral_reason
+    global before_hours_acute_active, before_hours_virtual_offered, before_hours_pcp_message_pending
 
     user_message = request.json.get("message")
     message_lower = user_message.lower()
@@ -3674,8 +3685,16 @@ def chat():
         word in message_lower for word in same_day_keywords
     ) and any(
         word in message_lower for word in
-        ["appointment", "come in", "be seen", "schedule", "slot", "get in"]
+        ["appointment", "come in", "be seen", "schedule", "slot", "get in", "today", "seen today"]
     )
+
+    is_before_hours = not is_within_office_hours()
+    is_contagious_case = (
+        contagious_visit_active
+        or any(trigger in message_lower for trigger in CONTAGIOUS_SYMPTOM_TRIGGERS)
+    )
+    if is_before_hours and is_contagious_case and is_same_day:
+        before_hours_acute_active = True
 
     # ── Context injections ──
 
@@ -4139,8 +4158,87 @@ def chat():
             f"before matching it to the weekly availability above.\n"
         )
 
+    before_hours_acute_context = ""
+    if before_hours_acute_active and not is_within_office_hours() and not is_medical_professional_caller:
+        if not before_hours_virtual_offered:
+            before_hours_virtual_offered = True
+            before_hours_acute_context = (
+                "BEFORE_HOURS_ACUTE_VIRTUAL_OFFER INJECTED BY SYSTEM:\n"
+                "Conditions met: Acute contagious symptoms, before office hours, same-day appointment request.\n"
+                "The office is closed and medical assistants/staff are NOT working.\n"
+                "Do NOT claim to check with a medical assistant or staff.\n"
+                "Do NOT claim the PCP is unavailable or perform real-time checks.\n"
+                "Do NOT offer Elizabeth Horowitz or covering provider availability.\n"
+                "STEP 1: Offer Same-Day Virtual Clinic.\n"
+                f"Provide: Same-Day Virtual Clinic phone number ({SAME_DAY_VIRTUAL_CLINIC_PHONE_NUMBER}) and Same-Day Virtual Clinic hours (e.g. 8:00 AM to 8:00 PM).\n"
+                "Ask if they would like to use the Same-Day Virtual Clinic.\n"
+            )
+        elif before_hours_pcp_message_pending:
+            phone_num = re.search(r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b', user_message)
+            if phone_num:
+                before_hours_acute_context = (
+                    "BEFORE_HOURS_ACUTE_PCP_MESSAGE_CONFIRMED INJECTED BY SYSTEM:\n"
+                    "Callback number collected.\n"
+                    "Confirm that a HIGH PRIORITY phone message has been created for their provider when the office opens.\n"
+                    "Do NOT claim to have checked with staff. Do NOT claim to have checked availability.\n"
+                    "Wish the patient well and ask if there is anything else.\n"
+                )
+            else:
+                before_hours_acute_context = (
+                    "BEFORE_HOURS_ACUTE_PCP_MESSAGE_REQUEST INJECTED BY SYSTEM:\n"
+                    "Patient specifically wants to be seen by their PCP today.\n"
+                    "Collect callback number to create a HIGH PRIORITY phone message.\n"
+                    "Do NOT claim to have checked with staff. Do NOT claim to have checked availability.\n"
+                )
+        else:
+            wants_pcp_specifically = any(
+                p in message_lower for p in [
+                    "dr.", "dr ", "doctor", "foster", "pcp", "my doctor", "my provider",
+                    "specifically", "want to be seen by dr", "want dr"
+                ]
+            )
+            wants_in_person = any(
+                p in message_lower for p in [
+                    "in person", "in-person", "don't want virtual", "do not want virtual",
+                    "no virtual", "want to be seen", "prefer to be seen"
+                ]
+            )
+            patient_accepted_virtual = (
+                patient_wants_to_proceed(message_lower)
+                and not wants_pcp_specifically
+                and not wants_in_person
+            )
+
+            if patient_accepted_virtual:
+                before_hours_acute_context = (
+                    "BEFORE_HOURS_ACUTE_ACCEPTED INJECTED BY SYSTEM:\n"
+                    "STEP 2: Patient ACCEPTS Same-Day Virtual Clinic.\n"
+                    f"Provide Same-Day Virtual Clinic information: phone number {SAME_DAY_VIRTUAL_CLINIC_PHONE_NUMBER}.\n"
+                    "Wish the patient a nice day (e.g. 'I've provided the Same-Day Virtual Clinic information. I hope you feel better soon and have a nice day.').\n"
+                    "End the workflow. STOP. Do NOT continue scheduling.\n"
+                )
+            elif wants_pcp_specifically:
+                before_hours_pcp_message_pending = True
+                before_hours_acute_context = (
+                    "BEFORE_HOURS_ACUTE_DECLINED_PCP INJECTED BY SYSTEM:\n"
+                    "STEP 4: Patient declines virtual clinic because they specifically want their PCP today.\n"
+                    "Collect callback number to create a HIGH PRIORITY phone message.\n"
+                    "Do NOT claim to have checked with staff. Do NOT claim to have checked availability.\n"
+                )
+            elif wants_in_person or patient_wants_to_decline(message_lower):
+                before_hours_acute_context = (
+                    "BEFORE_HOURS_ACUTE_DECLINED_IN_PERSON INJECTED BY SYSTEM:\n"
+                    "STEP 3: Patient declines virtual clinic because they want to be seen IN PERSON.\n"
+                    "Advise Urgent Care.\n"
+                )
+            else:
+                before_hours_acute_context = (
+                    "BEFORE_HOURS_ACUTE_VIRTUAL_OFFER INJECTED BY SYSTEM:\n"
+                    f"Provide Same-Day Virtual Clinic information (phone: {SAME_DAY_VIRTUAL_CLINIC_PHONE_NUMBER}) and ask if they accept.\n"
+                )
+
     same_day_context = ""
-    if is_same_day and not is_medical_professional_caller:
+    if is_same_day and not is_medical_professional_caller and not (before_hours_acute_active and not is_within_office_hours()):
         now = datetime.now()
         current_time_str = now.strftime("%I:%M %p")
         office_open = is_office_open_today()
@@ -4994,7 +5092,7 @@ def chat():
         lab_result_fax_outside_context + "\n" +
         referral_lookup_context + "\n" +
         medication_inquiry_context + "\n" +
-        contagious_virtual_refusal_context + "\n" +
+        (contagious_virtual_refusal_context if not (before_hours_acute_active and not is_within_office_hours()) else "") + "\n" +
         uti_antibiotic_demand_context + "\n" +
         same_day_context + "\n" +
         covering_provider_context + "\n" +
@@ -5004,7 +5102,8 @@ def chat():
         controlled_substance_context + "\n" +
         urgent_context + "\n" +
         hipaa_context + "\n" +
-        phf_context
+        phf_context + "\n" +
+        before_hours_acute_context
     )
 
     messages = [{"role": "system", "content": system_with_context}] + \
