@@ -1,4 +1,21 @@
 import os
+import sys
+
+# Root-cause fix: when this file is launched directly (`python app.py`),
+# Python loads it as the module `__main__`, NOT as a module named
+# `app`. Sprint13.py and Sprint14.py both do `import app` internally
+# (to read this file's live conversation_history/patient_first_name/
+# etc.) - without this registration, that `import app` doesn't find
+# this already-running module, so Python loads app.py from disk AGAIN
+# as a brand-new, second, disconnected module object with its own
+# fresh globals (conversation_history=[], patient_first_name=None...)
+# that no HTTP request ever touches. That phantom copy is what
+# Sprint13/Sprint14 were reading from, which is why they'd see empty
+# state despite the real, request-handling copy being fully populated.
+# Registering this module under the name "app" up front means any
+# later `import app` reuses this exact object instead of re-loading a
+# duplicate. Must run before the Sprint13/Sprint14 imports below.
+sys.modules.setdefault("app", sys.modules[__name__])
 
 #os.environ["STEVE_FORCE_PCP_AVAILABLE"] = "false"
 import re
@@ -9,8 +26,9 @@ from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify
 from groq import Groq
 import Sprint13
+import Sprint14
 
-os.environ["GROQ_API_KEY"] = "Withheldforprotection"
+os.environ["GROQ_API_KEY"] = "WITHHELDFORPROTECTION"
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -70,6 +88,18 @@ new_patient_appointment_selection = None
 # Urgent symptoms state
 urgent_symptoms_active = False
 urgent_can_wait_asked = False
+# Sticky same-day/acute urgency flag. Traced Scenario 13 defect: is_same_day
+# is recomputed fresh from each individual message's own wording, so once a
+# patient establishes same-day urgency ("I need an appointment today...")
+# and then, in a LATER message, describes their symptoms without repeating
+# "today" (e.g. "I have a very persistent cough..."), is_same_day silently
+# reverts to False for that turn and the AI improvises without the
+# deterministic same-day/office-hours context - asking "can this wait"
+# again even though urgency was already established. Once True, this stays
+# True for the rest of the call (reset only at Sprint14.reset_state() time,
+# alongside the other per-call state below) instead of being recomputed
+# per-message.
+acute_same_day_established = False
 ma_availability_determined = False
 current_ma_availability = None
 
@@ -97,6 +127,31 @@ acute_existing_appt_time = None
 acute_reschedule_confirm_pending = False
 acute_cancel_confirm_pending = False
 acute_new_time_pending = False
+
+# Generic (non-PHF) appointment reschedule - mirrors the acute-visit
+# pending flags above, scoped to routine future appointments stored in
+# generic_appointment_records instead of the simulated acute visit.
+generic_reschedule_pending = False
+
+# Controlled-substance appointment bridge follow-up (Scenario 11/12).
+# Set when a patient explicitly requests an appointment with a named
+# controlled substance as the reason (see
+# patient_explicitly_requested_appointment_for_med below) - persists
+# across turns until the LLM-driven booking is captured, at which
+# point a deterministic Python-authored bridge question is appended
+# and controlled_substance_bridge_awaiting_days takes over for the
+# next turn. Kept fully deterministic (no reliance on the LLM
+# correctly remembering to ask this) given the repeated prompt-
+# compliance issues already found on this same appointment path.
+controlled_substance_appt_pending = False
+controlled_substance_appt_medication_word = None
+controlled_substance_appt_schedule = None
+controlled_substance_bridge_awaiting_days = False
+controlled_substance_appt_day_name = None
+controlled_substance_bridge_awaiting_dosage = False
+controlled_substance_bridge_dosage = None
+controlled_substance_bridge_awaiting_pharmacy = False
+controlled_substance_bridge_confirmed_insufficient = False
 
 # Pre-chart state
 caller_first_name = None
@@ -201,6 +256,16 @@ LAB_WORK_TRIGGERS = [
     "run labs", "get some blood work", "get my blood drawn"
 ]
 
+SAME_DAY_KEYWORDS = [
+    "today", "same day", "as soon as possible",
+    "this morning", "this afternoon", "asap"
+]
+SAME_DAY_ACTION_WORDS = [
+    "appointment", "come in", "be seen", "schedule", "slot",
+    "get in", "anything", "available", "availability",
+    "opening", "openings", "fit me in", "fit in", "see",
+]
+
 LAB_ORDER_PICKUP_TRIGGERS = [
     "pick up", "pick them up", "pick up my labs",
     "pick up the labs", "pick up lab orders",
@@ -242,7 +307,7 @@ CANNOT_WAIT_PHRASES = [
     "immediately", "no it cannot", "no it can't",
     "no she can't", "no he can't", "no i can't", "no we can't",
     "need assistance right away", "needs assistance right away",
-    "it cannot wait", "it can't wait", "help now",
+    "it cannot wait", "it can't wait", "help now", "help right now",
     "urgent", "emergency", "immediate assistance", "need immediate",
     "right away",
 ]
@@ -565,6 +630,25 @@ def get_stored_generic_appointment_record(first_name, last_name):
     return generic_appointment_records.get(key)
 
 
+def cancel_generic_appointment_record(first_name, last_name):
+    """Remove a persisted generic appointment record for this patient,
+    if one exists. Returns True if a record was found and removed,
+    False otherwise. Mirrors get_stored_generic_appointment_record's
+    key logic and disk re-read pattern exactly, so a record written by
+    a different process is still found before concluding there is
+    nothing to cancel."""
+    key = _generic_patient_record_key(first_name, last_name)
+    if not key:
+        return False
+    if key not in generic_appointment_records:
+        generic_appointment_records.update(_load_generic_appointment_records())
+    if key in generic_appointment_records:
+        del generic_appointment_records[key]
+        _save_generic_appointment_records()
+        return True
+    return False
+
+
 _GENERIC_APPT_DAY_NAMES = [
     "monday", "tuesday", "wednesday", "thursday", "friday",
     "saturday", "sunday",
@@ -572,6 +656,9 @@ _GENERIC_APPT_DAY_NAMES = [
 _GENERIC_APPT_CONFIRM_KEYWORDS = [
     "scheduled", "confirmed", "booked", "got you down",
     "appointment is set", "you're all set", "all set for",
+    "squared away", "all squared away", "you're set", "set you up",
+    "set for you", "taken care of", "locked in", "have you down",
+    "we have you down", "put you down for",
 ]
 
 
@@ -598,6 +685,35 @@ def _extract_generic_appointment_confirmation(assistant_text):
     if day_match and time_match:
         return f"{day_match.group(1).capitalize()} @ {time_match.group(1).upper()}"
     return None
+
+
+def _extract_day_time_from_reply(message):
+    """Extract just a weekday name + time from a raw PATIENT reply
+    (e.g. "Please reschedule it for wednesday at 930AM"), instead of
+    persisting the entire sentence verbatim. Unlike
+    _extract_generic_appointment_confirmation() above (which scans the
+    AI's own reply and can rely on the system's consistent "H:MM AM/PM"
+    time formatting), patient input is unpredictable - this uses a
+    more permissive time regex that also handles a compact form with
+    no colon (e.g. "930AM" as 9:30 AM, not "30 AM" with the leading
+    digit dropped). Returns None if no day or no time is found, so the
+    caller can fall back to the raw message rather than silently
+    losing the reschedule on an unparseable reply."""
+    day_match = re.search(
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        message, re.IGNORECASE
+    )
+    time_match = re.search(
+        r"\b(\d{1,2})(?::?(\d{2}))?\s*(am|pm)\b",
+        message, re.IGNORECASE
+    )
+    if not day_match or not time_match:
+        return None
+    day_name = day_match.group(1).capitalize()
+    hour = time_match.group(1)
+    minutes = time_match.group(2) or "00"
+    meridiem = time_match.group(3).upper()
+    return f"{day_name} @ {hour}:{minutes} {meridiem}"
 
 
 GENERIC_APPOINTMENT_INQUIRY_TRIGGERS = [
@@ -679,6 +795,104 @@ def detect_controlled_substance(message_lower):
     return None
 
 
+def find_controlled_substance_word(message_lower):
+    """Returns the exact matched drug word/phrase (e.g. 'alprazolam'),
+    not just its schedule number. Additive sibling to
+    detect_controlled_substance() above - does not modify that
+    function or any of its existing callers, avoiding any risk to
+    already-working code that depends on its current return signature.
+    Used only for wording the Scenario 11/12 post-booking bridge
+    question with the patient's actual medication name."""
+    for med in SCHEDULE_1 + SCHEDULE_2 + SCHEDULE_3:
+        if med in message_lower:
+            return med
+    return None
+
+
+_DAY_COUNT_WORD_TO_NUM = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+}
+
+
+def parse_days_remaining_from_reply(message_lower):
+    """Parses a day-count out of a free-form reply to 'Do you have
+    enough medication to hold you over until your appointment?'.
+    Handles raw digits ('2 days'), spelled-out counts ('a week', 'one
+    week', 'two weeks'), and a bare number with no unit at all ('10').
+    Checked BEFORE any sufficiency-phrase check (see
+    patient_confirms_sufficient_medication() below) so a reply that
+    names an actual count - even inside an otherwise affirmative-
+    sounding sentence - is measured against the real days-until-
+    appointment rather than trusted at face value. Returns an int day
+    count, or None if nothing recognizable is present."""
+    match = re.search(r'\b(\d+)\s*weeks?\b', message_lower)
+    if match:
+        return int(match.group(1)) * 7
+    match = re.search(
+        r'\b(a|an|one|two|three|four)\s+weeks?\b', message_lower
+    )
+    if match:
+        return _DAY_COUNT_WORD_TO_NUM[match.group(1)] * 7
+    match = re.search(r'\b(\d+)\s*days?\b', message_lower)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'\b(a|an|one|two|three|four)\s+days?\b', message_lower)
+    if match:
+        return _DAY_COUNT_WORD_TO_NUM[match.group(1)]
+    match = re.search(r'\b(\d+)\b', message_lower)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+_SUFFICIENT_MEDICATION_PHRASES = [
+    "enough to hold me over", "have enough", "should be enough",
+    "should hold me over", "should last", "i'll be fine",
+    "i will be fine", "i think i have enough", "plenty",
+    "more than enough",
+]
+
+_NEGATION_BEFORE_ENOUGH_PATTERN = re.compile(
+    r"\b(not|no|don't|do not|doesn't|does not|won't|will not|"
+    r"can't|cannot|isn't|is not|wasn't|was not)\b[^.?!]{0,20}\benough\b",
+    re.IGNORECASE
+)
+
+_INSUFFICIENT_MEDICATION_PHRASES = [
+    "not enough", "won't be enough", "will not be enough",
+    "wouldn't be enough", "would not be enough", "insufficient",
+    "running low", "don't think i have enough",
+    "do not think i have enough",
+]
+
+
+def patient_declines_sufficient_medication(message_lower):
+    """Detects an explicit insufficiency statement, INCLUDING a
+    negated form of the sufficiency phrase itself (e.g. 'I do NOT
+    have enough medication to hold me over'). MUST be checked BEFORE
+    patient_confirms_sufficient_medication() below - that function's
+    naive substring check on 'have enough' also matches inside 'do
+    not have enough', silently inverting the patient's actual answer.
+    Traced root cause of the Scenario 11 regression: a patient stating
+    insufficiency was misclassified as confirming sufficiency, and the
+    bridge-request workflow was skipped entirely."""
+    if _NEGATION_BEFORE_ENOUGH_PATTERN.search(message_lower):
+        return True
+    return any(p in message_lower for p in _INSUFFICIENT_MEDICATION_PHRASES)
+
+
+def patient_confirms_sufficient_medication(message_lower):
+    """A direct sufficiency affirmation with no day-count attached at
+    all (e.g. 'I have enough alprazolam to hold me over') - only
+    checked once parse_days_remaining_from_reply() above has already
+    found nothing to measure, so this never overrides an actual number
+    the patient gave. Callers MUST check
+    patient_declines_sufficient_medication() first - this function's
+    own phrase list is a positive-only substring match and does not
+    itself detect negation (e.g. 'do not have enough')."""
+    return any(p in message_lower for p in _SUFFICIENT_MEDICATION_PHRASES)
+
+
 def check_response_time_stated(text):
     text_lower = text.lower()
     return any(phrase in text_lower for phrase in RESPONSE_TIME_PHRASES)
@@ -724,18 +938,22 @@ COVERING_PROVIDER_BARE_NAME = "Elizabeth Horowitz"
 COVERING_PROVIDER_CREDENTIAL = "Nurse Practitioner"
 COVERING_PROVIDER_MA_NAME = "Catherine"
 SAME_DAY_VIRTUAL_CLINIC_PHONE_NUMBER = "321-555-0143"
+# ASSUMPTION — confirm actual Same-Day Virtual Clinic hours before deploying.
+SAME_DAY_VIRTUAL_CLINIC_HOURS = "7:00 AM to 7:00 PM, seven days a week"
 
 # Scenario 16/17: Reschedule / Cancel Acute Visit
 RESCHEDULE_ACUTE_VISIT_TRIGGERS = [
     "reschedule my appointment", "reschedule the appointment",
     "reschedule my visit", "need to reschedule", "want to reschedule",
     "change my appointment", "move my appointment",
+    "reschedule it", "reschedule this", "like to reschedule",
 ]
 
 CANCEL_ACUTE_VISIT_TRIGGERS = [
     "cancel my appointment", "cancel the appointment",
     "cancel my visit", "need to cancel my appointment",
     "want to cancel my appointment", "cancel my acute visit",
+    "cancel it", "cancel this", "like to cancel",
 ]
 
 QUERY_ACUTE_VISIT_TRIGGERS = [
@@ -1278,6 +1496,44 @@ def patient_wants_to_proceed(message_lower):
 
 def patient_wants_to_decline(message_lower):
     return any(phrase in message_lower for phrase in NEW_PATIENT_DECLINE_PHRASES)
+
+
+# RT13 fix: general conversation-closing phrase list, used when Steve's
+# own last message asked "anything else I can help you with today?" -
+# see is_conversation_closing_reply() below. Matched against the FULL
+# message after normalization, not as a substring, so a continuation
+# like "No, actually I have another question" is correctly NOT treated
+# as closing intent (it normalizes to something other than one of
+# these exact phrases).
+CONVERSATION_CLOSING_PHRASES = [
+    "no", "no thank you", "no thanks", "nope", "nope thank you",
+    "nope thanks", "nothing else", "that's all", "thats all",
+    "that's all thank you", "thats all thank you", "that will be all",
+    "i'm good", "im good", "no i'm good", "no im good",
+    "i'm all set", "im all set", "no i'm all set", "no im all set",
+    "all set", "that's it", "thats it",
+    "no sir", "no ma'am", "no i am all set",
+    "no that's all", "no that is all",
+    "no that's everything", "no that is everything",
+    "no i am good", "no thank you that's all", "no thank you that is all",
+    "no have a good day", "no that's it", "no thats it",
+    "no we're good", "no we are good",
+    "no i don't need anything else", "no i do not need anything else",
+]
+
+
+def is_conversation_closing_reply(message_lower):
+    """Returns True only if the ENTIRE message, after stripping
+    trailing punctuation (periods, commas, exclamation points, question
+    marks) and collapsing whitespace, exactly matches a known closing
+    phrase - not a substring match. This is what makes "No. Thank you."
+    equivalent to "No thank you" (the period+space between them is the
+    only difference) without needing every punctuated variant spelled
+    out separately, while still refusing to match a longer reply that
+    merely starts with "no" but continues into a new request."""
+    normalized = re.sub(r"[.,!?]", "", message_lower).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized in CONVERSATION_CLOSING_PHRASES
 
 
 def detect_self_pay_intent(message_lower):
@@ -2258,13 +2514,13 @@ def extract_names_from_message(message):
         "patient_first": None, "patient_last": None
     }
     caller_patterns = [
-        r"(?i:this\s+is)\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)",
-        r"(?i:my\s+name\s+is)\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)",
+        r"(?i:this\s+is)\s+([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
+        r"(?i:my\s+name\s+is)\s+([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
         # Avoid matching verbs like 'calling' after "I'm" or "I am".
         # Use a negative lookahead to skip common phrases such as
         # "I'm calling for" or "I'm calling about".
-        r"(?i:i(?:'|)m)\s+(?!(?i:calling\b|calling\s+for\b|calling\s+about\b))([A-Z][a-z]+)\s+([A-Z][a-z]+)",
-        r"(?i:i\s+am)\s+(?!(?i:calling\b|calling\s+for\b|calling\s+about\b))([A-Z][a-z]+)\s+([A-Z][a-z]+)",
+        r"(?i:i(?:'|)m)\s+(?!(?i:calling\b|calling\s+for\b|calling\s+about\b))([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
+        r"(?i:i\s+am)\s+(?!(?i:calling\b|calling\s+for\b|calling\s+about\b))([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
         # Fallback: a bare "Firstname Lastname" reply with no prefix at
         # all (e.g. answering "for whom do I have the pleasure of
         # speaking" with just "Nick Adams"). Anchored to the WHOLE
@@ -2275,12 +2531,30 @@ def extract_names_from_message(message):
         # Uses [A-Za-z]* (not [a-z]+) after the leading capital so a
         # mixed-case typo like "WIlliams" still matches - only the
         # first letter of each word needs to be capitalized.
+        # Deliberately NOT relaxed to accept a lowercase leading letter
+        # like patterns 1-4 above: this pattern has no contextual
+        # anchor ("this is", "my name is", etc.), so accepting a bare
+        # lowercase two-word message here would meaningfully raise the
+        # risk of matching an unrelated two-word reply as if it were a
+        # name.
         r"^\s*([A-Z][A-Za-z]*)\s+([A-Z][A-Za-z]*)\s*$",
     ]
     for pattern in caller_patterns:
         match = re.search(pattern, message)
         if match:
-            matched_first, matched_last = match.group(1), match.group(2)
+            # Root cause fix: patterns 1-4 above now accept a lowercase
+            # leading letter (real callers, and phone transcription in
+            # particular, don't reliably capitalize spoken names - e.g.
+            # "this is dan wolowitz"). Title-casing here keeps every
+            # downstream consumer's contract intact either way: Steve's
+            # own replies (e.g. "Thank you {caller_first_name}") and the
+            # generic-appointment-store key builder both expect a
+            # properly-formatted name string. Title-casing an
+            # already-capitalized match (the pre-existing, working case)
+            # is a no-op, so this changes nothing for input that was
+            # already being captured correctly.
+            matched_first = match.group(1).title()
+            matched_last = match.group(2).title()
             # If this phrase actually names the PATIENT (not the original
             # caller), the patient is announcing themselves mid-call, not
             # the caller restating their own identity. Do not let this
@@ -2539,6 +2813,27 @@ def determine_pre_chart_response(message, message_lower):
 
 system_prompt = """You are Steve, a professional patient services representative at the Sykes Creek Primary Care office.
 
+ACTIVE OVERRIDES — READ THIS FIRST, HIGHEST PRIORITY:
+Any block appended below that ends in "INJECTED BY SYSTEM" reflects a
+decision already made this turn from the patient's own words or from
+Python-computed facts (availability, dates, eligibility, what the
+patient already asked for). When any such injected block conflicts
+with a static instruction elsewhere in this prompt — even one that
+looks more specific, more detailed, or comes with its own numbered
+steps — the injected block wins COMPLETELY for this turn. Do not
+average the two, do not partially apply the static instruction "just
+to be safe," and do not re-derive your own version of a question or
+choice the injected block already says is settled. Examples of what
+this means in practice: if a signal says the patient already chose an
+appointment over a refill, do not re-offer that choice in any words,
+including softer phrasings like "alternatively, if you'd prefer...";
+if a signal says a determination or collection step is being handled
+by Python, do not attempt your own version of it, even briefly, even
+combined with something else you're already saying this turn; if a
+signal gives you an exact date or exact list of options, use exactly
+those and do not adjust, recalculate, or hedge them based on other
+instructions in this prompt.
+
 YOUR NAME:
 Your name is Steve. The opening greeting already says so.
 Do NOT re-introduce yourself mid-conversation.
@@ -2584,6 +2879,11 @@ Respond: "That sounds great. When [patient name] calls we will be happy
 to assist further. Is there anything else I can help you with today?"
 
 VERBAL CONSENT TRANSITION:
+THIS SECTION APPLIES ONLY TO THIRD-PARTY CALLERS — someone calling on
+behalf of the patient, not the patient calling for themselves. If
+caller_is_patient is True, this section does NOT apply. Do NOT say
+"I'll wait while you get [patient name] on the line" to a caller who
+IS the patient.
 SITUATION A — PATIENT IS PRESENT:
 Say ONLY: "Of course! I'll wait while you get [patient name] on the line."
 
@@ -2753,6 +3053,39 @@ When the stated reason for the visit is a work note, school note, FMLA
 form, or other documentation to be signed or completed, this is a
 documentation request — handle it separately from a routine
 appointment request.
+0. FIRST check whether the patient has explicitly asked for an
+   APPOINTMENT (e.g. "I need to schedule an appointment", "I need an
+   appointment so my provider can...") with paperwork stated as the
+   REASON for that appointment. If so, this is a normal FUTURE
+   appointment request with paperwork as the reason — treat it exactly
+   like APPOINTMENT SCHEDULING — FUTURE below: do NOT say "Let me
+   check with [MA name] on that", do NOT route through the medical
+   assistant, and do NOT treat this as urgent or requiring office
+   intervention. Go straight to offering availability from the
+   injected weekly availability. Steps 1-4 below, including Step 2's
+   determination, apply ONLY when the patient has asked for paperwork
+   to be completed/signed WITHOUT explicitly requesting an appointment
+   (e.g. "I need a form filled out" with no mention of scheduling).
+   When the patient HAS explicitly asked for an appointment, Step 2's
+   question is ALREADY ANSWERED by the patient's own words — the
+   patient wants an appointment, so do NOT ask whether the provider
+   can complete the paperwork without one, do NOT ask whether it's
+   something to be done "during the visit" versus "a separate
+   request," and do NOT ask any other version of that same
+   without-an-appointment-vs-with-one question. The patient already
+   told you which one they want. THIS OVERRIDE APPLIES FOR THE ENTIRE
+   REST OF THE APPOINTMENT REQUEST, INCLUDING AFTER THE APPOINTMENT IS
+   BOOKED - not only up through offering availability. Once you have
+   booked the appointment, confirm it and ask "Is there anything else
+   I can help you with today?" exactly as you would for any other
+   FUTURE appointment reason, and STOP there. Do NOT append anything
+   from WORK NOTE's own conventions after booking - do NOT name or
+   mention the medical assistant, do NOT say the medical assistant
+   "will be in touch," do NOT promise a link will be sent, and do NOT
+   state a 72-business-hour (or any other) follow-up timeframe. Those
+   conventions belong ONLY to the standalone-paperwork path (Steps 1-4
+   below, patient did not ask for an appointment) and must never be
+   layered on top of a normal booked-appointment confirmation.
 1. Check the OFFICE_CURRENTLY_OPEN / OFFICE_CURRENTLY_CLOSED signal
    injected by the system for this turn BEFORE saying anything about
    reaching the medical assistant.
@@ -2824,17 +3157,47 @@ Contagious: offer virtual. Declines: callback, 24 hours.
 Pushes back: urgent care only.
 
 MEDICATION REFILLS:
-Collect: name, dosage, days remaining, pharmacy.
-State 72 business hours once only.
+0. If a CONTROLLED_SUBSTANCE_APPOINTMENT_REQUESTED or
+   MEDICATION_BRIDGE_FLOW_ACTIVE signal is injected for this turn,
+   this collection is being handled deterministically by Python - do
+   NOT ask for dosage, pharmacy, or bridge-request details yourself,
+   do NOT ask "do you have enough medication" yourself, and do NOT
+   state 72 business hours for this flow. Follow ONLY the exact
+   Python-authored question or confirmation for this turn.
+1. Otherwise, collect: name, dosage, days remaining, pharmacy.
+2. State 72 business hours once only.
 
 CONTROLLED SUBSTANCES:
-State last visit first always.
-Within window: collect refill info, send to provider. NO appointment.
-Do NOT say "if necessary we may need to schedule."
-Outside window: schedule appointment.
-Schedule 1: in-office only. Schedule 2/3: virtual or in-office.
-Then bridge refill info after appointment.
-Provider makes ALL decisions.
+0. FIRST check whether the patient has explicitly asked for an
+   APPOINTMENT (e.g. "I need an appointment", "schedule an
+   appointment") with this controlled substance as the stated REASON.
+   If so, this is a normal FUTURE appointment request, already
+   decided by the patient - do NOT ask whether they would prefer a
+   refill request forwarded instead, do NOT re-present a choice
+   between "refill request" or "appointment" (the patient already
+   chose appointment, do not reopen that decision), and do NOT apply
+   the last-visit-window logic in the steps below AT ALL, not even to
+   explain why an appointment is or isn't required. Specifically, do
+   NOT say anything resembling "Because it has been less than [X]
+   days since your last visit, I can forward your refill request to
+   [provider] for approval. Would you like me to do that?
+   Alternatively, if you would prefer to schedule an appointment..." -
+   that entire sentence pattern, in any wording or softened variant of
+   it, is exactly the reopened choice this step forbids. Go straight
+   to offering availability from the injected weekly availability and
+   proceed to scheduling, exactly like APPOINTMENT SCHEDULING —
+   FUTURE above. This override applies for the entire rest of the
+   appointment request, including after booking - do not layer any
+   of Steps 1+ below on top of the confirmation once booked. Steps 1+
+   below apply ONLY when the patient asks for a refill/renewal
+   WITHOUT explicitly requesting an appointment.
+1. State last visit first always.
+2. Within window: collect refill info, send to provider. NO appointment.
+   Do NOT say "if necessary we may need to schedule."
+3. Outside window: schedule appointment.
+4. Schedule 1: in-office only. Schedule 2/3: virtual or in-office.
+5. Then bridge refill info after appointment.
+6. Provider makes ALL decisions.
 
 SPECIALIST RECOMMENDATIONS:
 If patient asks for PCP recommendations for a specialist:
@@ -2912,6 +3275,7 @@ def home():
     global third_party_detected, dob_collected, pcp_collected
     global verbal_consent_requested, response_time_stated, office_hours_stated
     global urgent_symptoms_active, urgent_can_wait_asked
+    global acute_same_day_established
     global ma_availability_determined, current_ma_availability
     global caller_first_name, caller_last_name, patient_first_name
     global patient_last_name, caller_is_patient, pre_chart_complete
@@ -2949,6 +3313,13 @@ def home():
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
+    global generic_reschedule_pending
+    global controlled_substance_appt_pending, controlled_substance_appt_medication_word
+    global controlled_substance_appt_schedule, controlled_substance_bridge_awaiting_days
+    global controlled_substance_appt_day_name
+    global controlled_substance_bridge_awaiting_dosage, controlled_substance_bridge_dosage
+    global controlled_substance_bridge_awaiting_pharmacy
+    global controlled_substance_bridge_confirmed_insufficient
     global ma_request_reason_collected
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
@@ -2986,6 +3357,16 @@ def home():
     acute_reschedule_confirm_pending = False
     acute_cancel_confirm_pending = False
     acute_new_time_pending = False
+    generic_reschedule_pending = False
+    controlled_substance_appt_pending = False
+    controlled_substance_appt_medication_word = None
+    controlled_substance_appt_schedule = None
+    controlled_substance_bridge_awaiting_days = False
+    controlled_substance_appt_day_name = None
+    controlled_substance_bridge_awaiting_dosage = False
+    controlled_substance_bridge_dosage = None
+    controlled_substance_bridge_awaiting_pharmacy = False
+    controlled_substance_bridge_confirmed_insufficient = False
     ma_request_active = False
     ma_request_name = None
     ma_request_provider = None
@@ -3023,6 +3404,7 @@ def home():
     new_patient_appointment_selection = None
     urgent_symptoms_active = False
     urgent_can_wait_asked = False
+    acute_same_day_established = False
     ma_availability_determined = False
     current_ma_availability = None
     caller_first_name = None
@@ -3043,6 +3425,7 @@ def home():
     med_pro_referral_provider = None
     med_pro_referral_reason = None
     Sprint13.reset_state()
+    Sprint14.reset_state()
     conversation_history.clear()
     return render_template("index.html")
 
@@ -3070,6 +3453,13 @@ def chat():
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
+    global generic_reschedule_pending
+    global controlled_substance_appt_pending, controlled_substance_appt_medication_word
+    global controlled_substance_appt_schedule, controlled_substance_bridge_awaiting_days
+    global controlled_substance_appt_day_name
+    global controlled_substance_bridge_awaiting_dosage, controlled_substance_bridge_dosage
+    global controlled_substance_bridge_awaiting_pharmacy
+    global controlled_substance_bridge_confirmed_insufficient
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
     global ma_request_active, ma_request_name
@@ -3088,6 +3478,7 @@ def chat():
     global new_patient_member_number, new_patient_text_consent
     global new_patient_weekly_schedule, new_patient_appointment_selection
     global urgent_symptoms_active, urgent_can_wait_asked
+    global acute_same_day_established
     global ma_availability_determined, current_ma_availability
     global caller_first_name, caller_last_name, patient_first_name
     global patient_last_name, caller_is_patient, pre_chart_complete
@@ -3163,6 +3554,54 @@ def chat():
         ):
             Sprint13.phf_caller_type = "hospital_team"
 
+    # Capture same-day/acute urgency the moment it's ever stated, even if
+    # this turn gets intercepted by an earlier-return path (e.g. Sprint14's
+    # acute pivot handoff, which returns before the later is_same_day
+    # computation runs). Mirrors the Sprint13/Sprint14 intent-capture
+    # pattern directly below. Once set, stays True for the rest of the
+    # call (reset at Sprint14.reset_state() time) so a later message that
+    # doesn't repeat "today" (e.g. a symptom description that follows up
+    # on an already-stated same-day request) doesn't lose the urgency
+    # already established.
+    if (
+        any(word in message_lower for word in SAME_DAY_KEYWORDS)
+        and any(word in message_lower for word in SAME_DAY_ACTION_WORDS)
+    ):
+        acute_same_day_established = True
+
+    # Sprint 14: Capture wellness/MAW/CHA, refill-escalation, and
+    # lab-order-EHR intent the moment they're ever stated, even if this
+    # turn gets intercepted by an earlier-return path (e.g. still
+    # collecting caller name/DOB/PCP). Mirrors the Sprint13
+    # phf_intent_detected early-capture pattern directly above.
+    #
+    # Gated on "not wellness_flow_active" (previously missing here, and
+    # only partially present for wellness): without it, a message sent
+    # WHILE a flow is already active can still contain trigger words
+    # (e.g. "I would still like to schedule my annual physical" still
+    # contains "physical") and silently repopulate the *_intent_detected
+    # flag right after it was just cleared on consumption - reopening
+    # the exact reactivation bug fixed at the activation block below,
+    # since that flag isn't consumed again until the flow next goes
+    # idle (i.e. after the call has already moved on to closing).
+    if (
+        not Sprint14.wellness_intent_detected
+        and not Sprint14.wellness_flow_active
+    ):
+        _wellness_intent = Sprint14.detect_wellness_intent(message_lower)
+        if _wellness_intent:
+            Sprint14.wellness_intent_detected = _wellness_intent
+    if (
+        not Sprint14.wellness_flow_active
+        and Sprint14.detect_refill_escalation_intent(message_lower)
+    ):
+        Sprint14.refill_intent_detected = True
+    if (
+        not Sprint14.wellness_flow_active
+        and Sprint14.detect_lab_order_ehr_intent(message_lower)
+    ):
+        Sprint14.lab_order_intent_detected = True
+
     # --- Profanity check ---
     profanity_words = [
         "shit", "fuck", "fucking", "cunt", "bitch",
@@ -3199,7 +3638,8 @@ def chat():
     # of birth") rather than letting Sprint13 correctly ask for the
     # patient's first and last name.
     if (not is_medical_professional_caller and not Sprint13.phf_flow_active
-            and not Sprint13.phf_intent_detected):
+            and not Sprint13.phf_intent_detected
+            and not Sprint14.wellness_flow_active):
         if is_medical_professional_message(user_message, message_lower):
             is_medical_professional_caller = True
             pre_chart_complete = True
@@ -3304,6 +3744,9 @@ def chat():
             and Sprint13.phf_caller_type != "hospital_team"
             and not Sprint13.phf_intent_detected
             and not Sprint13.phf_inquiry_intent_detected
+            and not Sprint14.wellness_intent_detected
+            and not Sprint14.refill_intent_detected
+            and not Sprint14.lab_order_intent_detected
         ):
             chart_response = "Thank you for that. How can I help you today?"
             conversation_history.append(
@@ -3338,8 +3781,8 @@ def chat():
             else:
                 Sprint13.phf_stage = "who_is_calling"
         elif Sprint13.detect_phf_reschedule_intent(message_lower) or (
-            Sprint13.detect_generic_reschedule_intent(message_lower)
-            and Sprint13.get_stored_appointment_record(patient_first_name, patient_last_name)
+                Sprint13.detect_generic_reschedule_intent(message_lower)
+                and Sprint13.get_stored_appointment_record(patient_first_name, patient_last_name)
         ):
             Sprint13.phf_flow_active = True
             Sprint13.phf_reschedule_pending = True
@@ -3374,6 +3817,67 @@ def chat():
             )
             return jsonify({"response": phf_response})
 
+    # ── Sprint 14: Appointment lookup ("When is my annual physical?") ──
+    # Must run before wellness-intent activation below, per
+    # Sprint14.detect_appointment_lookup_intent()'s own docstring: a
+    # caller asking about an already-scheduled appointment should get
+    # the persisted record, not be routed into the scheduling flow.
+    # Gated the same way as the wellness activation block just below
+    # (pre-chart complete, no PHF or active wellness conversation) so
+    # it can't hijack an in-progress flow.
+    if (
+        pre_chart_complete and not Sprint13.phf_flow_active
+        and not Sprint14.wellness_flow_active
+        and Sprint14.detect_appointment_lookup_intent(message_lower)
+    ):
+        lookup_response = Sprint14.handle_appointment_lookup(message_lower)
+        conversation_history.append(
+            {"role": "user", "content": user_message}
+        )
+        conversation_history.append(
+            {"role": "assistant", "content": lookup_response}
+        )
+        return jsonify({"response": lookup_response})
+
+    # ── Sprint 14: Wellness / MAW / CHA / Refill / Lab-Order Workflow ──
+    # Activated only once pre-chart is complete and no PHF conversation
+    # is already in progress - mirrors the Sprint13 activation guard
+    # directly above. Kept fully isolated: this block never reads or
+    # writes any Sprint13.phf_* state, and runs (and can short-circuit
+    # via early return) before the generic appointment inquiry and
+    # generic reschedule/cancel blocks below, so an active wellness
+    # conversation can never be hijacked by those unrelated triggers.
+    if (
+        pre_chart_complete and not Sprint13.phf_flow_active
+        and not Sprint14.wellness_flow_active
+    ):
+        if Sprint14.wellness_intent_detected:
+            Sprint14.wellness_flow_active = True
+            Sprint14.wellness_requested_visit_type = Sprint14.wellness_intent_detected
+            Sprint14.wellness_intent_detected = None
+        elif Sprint14.refill_intent_detected:
+            Sprint14.wellness_flow_active = True
+            Sprint14.refill_escalation_active = True
+            Sprint14.refill_stage = "ask_medication"
+            Sprint14.refill_intent_detected = False
+        elif Sprint14.lab_order_intent_detected:
+            Sprint14.wellness_flow_active = True
+            Sprint14.lab_order_ehr_guidance_active = True
+            Sprint14.lab_order_intent_detected = False
+
+    if Sprint14.wellness_flow_active:
+        wellness_response = Sprint14.handle_wellness_flow(
+            user_message, message_lower
+        )
+        if wellness_response is not None:
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": wellness_response}
+            )
+            return jsonify({"response": wellness_response})
+
     # ─────────────────────────────────────────
     # Generic (non-PHF) appointment inquiry
     # ─────────────────────────────────────────
@@ -3386,6 +3890,7 @@ def chat():
     # interrupt an active PHF conversation).
     if (
         pre_chart_complete and not Sprint13.phf_flow_active
+        and not Sprint14.wellness_flow_active
         and not is_medical_professional_caller
         and detect_generic_appointment_inquiry_intent(message_lower)
     ):
@@ -3413,6 +3918,325 @@ def chat():
             {"role": "assistant", "content": generic_response}
         )
         return jsonify({"response": generic_response})
+
+    # ─────────────────────────────────────────
+    # Generic (non-PHF) appointment reschedule / cancel
+    # ─────────────────────────────────────────
+    # RT13/RT14 root cause: RESCHEDULE_ACUTE_VISIT_TRIGGERS and
+    # CANCEL_ACUTE_VISIT_TRIGGERS (e.g. "reschedule my appointment",
+    # "cancel my appointment") are generic phrasing, not acute-specific,
+    # but the acute-visit-management block further below has no gate on
+    # whether the patient actually has an acute visit - it unconditionally
+    # fabricates one via generate_existing_acute_appointment() the moment
+    # any of those phrases appear. A patient whose only appointment on
+    # file is a routine FUTURE one booked through generic scheduling
+    # would therefore have that phrase hijacked into the unrelated acute
+    # workflow, and their real generic_appointment_records entry would
+    # never be touched.
+    #
+    # This block runs first and is gated on an existing_generic_record
+    # actually being on file for this patient - mirroring the same
+    # gating pattern Sprint13 already uses for its own PHF reschedule
+    # detection (detect_generic_reschedule_intent() + a confirmed
+    # stored record, before generic phrasing is treated as PHF-specific).
+    # If no generic record exists, this block does nothing and the
+    # message falls through unchanged to the existing acute-visit logic
+    # - zero behavior change for every patient who doesn't have a
+    # generic appointment on file, i.e. zero regression risk to the
+    # already-passing acute-visit reschedule/cancel/query scenarios.
+    if (
+        pre_chart_complete and not Sprint13.phf_flow_active
+        and not Sprint14.wellness_flow_active
+        and not is_medical_professional_caller
+    ):
+        lookup_first = patient_first_name or caller_first_name
+        lookup_last = patient_last_name or caller_last_name
+        existing_generic_record = get_stored_generic_appointment_record(
+            lookup_first, lookup_last
+        )
+
+        # Resume a reschedule already in progress: the previous turn
+        # presented availability and asked for a new day/time, this
+        # turn is the patient's selection. Checked before re-detecting
+        # trigger phrases since the patient's reply here (e.g. "Tuesday
+        # at 2pm") won't itself contain "reschedule my appointment".
+        if generic_reschedule_pending and existing_generic_record:
+            extracted_new_time = _extract_day_time_from_reply(user_message)
+            chosen_new_time = extracted_new_time or user_message.strip()
+            store_generic_appointment_record(
+                lookup_first, lookup_last, chosen_new_time,
+                provider=existing_generic_record.get("provider")
+            )
+            generic_reschedule_pending = False
+            generic_response = (
+                f"Perfect, I've moved your appointment to "
+                f"{chosen_new_time}. Is there anything else I can help "
+                f"you with today?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": generic_response}
+            )
+            return jsonify({"response": generic_response})
+
+        if existing_generic_record and any(
+            trigger in message_lower for trigger in RESCHEDULE_ACUTE_VISIT_TRIGGERS
+        ):
+            schedule = generate_weekly_availability()
+            avail_lines = [
+                f"{day}: {', '.join(slots)}"
+                for day, slots in schedule.items() if slots
+            ]
+            avail_text = (
+                "; ".join(avail_lines) if avail_lines
+                else "no availability this week"
+            )
+            generic_reschedule_pending = True
+            generic_response = (
+                f"I can help you reschedule your appointment currently "
+                f"set for {existing_generic_record['appointment_day']}. "
+                f"Here is what we have available - {avail_text}. Which "
+                f"day and time works best for you?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": generic_response}
+            )
+            return jsonify({"response": generic_response})
+
+        if existing_generic_record and any(
+            trigger in message_lower for trigger in CANCEL_ACUTE_VISIT_TRIGGERS
+        ):
+            cancelled_day = existing_generic_record.get("appointment_day")
+            cancel_generic_appointment_record(lookup_first, lookup_last)
+            generic_response = (
+                f"Your appointment on {cancelled_day} has been "
+                f"cancelled. Is there anything else I can help you with "
+                f"today?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": generic_response}
+            )
+            return jsonify({"response": generic_response})
+
+    # ─────────────────────────────────────────
+    # Controlled-substance appointment bridge follow-up (Scenario 11/12)
+    # ─────────────────────────────────────────
+    # Deterministic Python interceptor - intentionally NOT delegated to
+    # the LLM. The bridge-need decision is a plain comparison (days of
+    # medication remaining vs. days until the already-booked
+    # appointment), not something requiring model judgment, and this
+    # same appointment path has already needed several prompt-
+    # compliance corrections this session. Placed ahead of the general
+    # conversation-closing block below so a bare number in the
+    # patient's reply is never mistaken for closing intent.
+    if controlled_substance_bridge_awaiting_dosage:
+        controlled_substance_bridge_dosage = user_message.strip()
+        controlled_substance_bridge_awaiting_dosage = False
+        controlled_substance_bridge_awaiting_pharmacy = True
+        pharmacy_response = "What pharmacy do you use?"
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append({"role": "assistant", "content": pharmacy_response})
+        return jsonify({"response": pharmacy_response})
+
+    if controlled_substance_bridge_awaiting_pharmacy:
+        controlled_substance_bridge_awaiting_pharmacy = False
+        controlled_substance_bridge_dosage = None
+        bridge_response = (
+            "I understand. I will send a bridge-request message to "
+            "your provider asking them to authorize enough medication "
+            "to hold you over until your appointment. Please allow up "
+            "to 24 business hours for this to be processed. Provider "
+            "approval is required, and bridge medication is not "
+            "guaranteed. Is there anything else I can help you with "
+            "today?"
+        )
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append({"role": "assistant", "content": bridge_response})
+        return jsonify({"response": bridge_response})
+
+    if controlled_substance_bridge_awaiting_days:
+        days_remaining = parse_days_remaining_from_reply(message_lower)
+        if days_remaining is not None:
+            controlled_substance_bridge_awaiting_days = False
+            if controlled_substance_bridge_confirmed_insufficient:
+                # Patient already explicitly declared insufficiency on
+                # the previous turn (see the decline branch below) -
+                # this day-count is purely informational for the
+                # bridge-request message, not a fresh sufficiency
+                # decision. Do NOT re-run the day-math comparison,
+                # which could otherwise contradict what the patient
+                # already told us directly.
+                controlled_substance_bridge_confirmed_insufficient = False
+                controlled_substance_appt_day_name = None
+                controlled_substance_bridge_awaiting_dosage = True
+                bridge_response = "What dosage do you currently take?"
+            else:
+                days_until_appt = None
+                if controlled_substance_appt_day_name:
+                    weekday_index = {
+                        "monday": 0, "tuesday": 1, "wednesday": 2,
+                        "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
+                    }.get(controlled_substance_appt_day_name.lower())
+                    if weekday_index is not None:
+                        today_index = datetime.now().weekday()
+                        days_until_appt = (weekday_index - today_index) % 7
+                        if days_until_appt == 0:
+                            days_until_appt = 7
+                controlled_substance_appt_day_name = None
+                if days_until_appt is not None and days_remaining < days_until_appt:
+                    # Bug fix: bridge is needed - collect Dosage, then
+                    # Pharmacy, BEFORE creating the bridge message
+                    # (this collection step was previously skipped
+                    # entirely).
+                    controlled_substance_bridge_awaiting_dosage = True
+                    bridge_response = "What dosage do you currently take?"
+                else:
+                    # Bug #2 fix: no preamble statement - go straight
+                    # to the closing question, since the patient
+                    # already knows they have enough medication.
+                    bridge_response = "Is there anything else I can help you with today?"
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": bridge_response}
+            )
+            return jsonify({"response": bridge_response})
+        elif patient_declines_sufficient_medication(message_lower):
+            # Scenario 11 regression fix: an explicit insufficiency
+            # statement - INCLUDING a negated sufficiency phrase like
+            # "I do NOT have enough medication to hold me over" - was
+            # previously misclassified by
+            # patient_confirms_sufficient_medication()'s naive
+            # substring match on "have enough", silently inverting the
+            # patient's answer and skipping the bridge workflow
+            # entirely. Checked BEFORE the sufficiency-confirmation
+            # branch below. The patient has already told us directly
+            # that supply is insufficient - no day-math comparison is
+            # needed to decide that; "days remaining" is now asked
+            # purely as an informational collection step for the
+            # bridge-request message (see
+            # controlled_substance_bridge_confirmed_insufficient
+            # above), matching the expected Scenario 11 sequence:
+            # days remaining -> dosage -> pharmacy -> bridge message.
+            controlled_substance_bridge_confirmed_insufficient = True
+            clarify_response = (
+                "How many days of medication do you currently have "
+                "remaining?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": clarify_response}
+            )
+            return jsonify({"response": clarify_response})
+        elif patient_confirms_sufficient_medication(message_lower):
+            # Bug #1 fix: a direct sufficiency affirmation ("I have
+            # enough alprazolam to hold me over") already fully answers
+            # the yes/no question Steve just asked - re-asking for an
+            # exact day count here contradicts what the patient just
+            # said. No bridge, no further collection.
+            # Bug #2 fix: no "No bridge needed." preamble - the patient
+            # already knows they have enough medication; go straight
+            # to the closing question.
+            controlled_substance_bridge_awaiting_days = False
+            controlled_substance_appt_day_name = None
+            bridge_response = "Is there anything else I can help you with today?"
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": bridge_response}
+            )
+            return jsonify({"response": bridge_response})
+        else:
+            clarify_response = (
+                "How many days of medication do you currently have "
+                "remaining?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": clarify_response}
+            )
+            return jsonify({"response": clarify_response})
+
+    # ─────────────────────────────────────────
+    # General conversation-closing detection
+    # ─────────────────────────────────────────
+    # RT13 conversation-closing defect: after Steve's own "anything else
+    # I can help you with today?" question, closing intent was being
+    # decided entirely by the AI - no Python detection exists for this
+    # general moment (unlike Sprint13's PHF "complete" stage and the
+    # new-patient flow's "complete" stage, which each have their own
+    # closing-phrase lists, but neither covers this general closing
+    # question, which is asked at the end of many different flows -
+    # generic scheduling, lab result inquiry, referral lookup, the
+    # generic reschedule/cancel block above, and more). The AI reliably
+    # closed on a bare "No" but was observed returning an EMPTY reply to
+    # "No. Thank you" - this is a model generation-reliability issue,
+    # not a Python string-matching bug, since no Python code was
+    # evaluating this particular reply at all before now. Moving this
+    # decision into deterministic Python matching (see
+    # is_conversation_closing_reply() above) removes that inconsistency
+    # from the picture entirely for this specific, narrow moment.
+    #
+    # Scoped narrowly to avoid interfering with flows that already have
+    # their own closing handling (PHF, new-patient), and matched against
+    # the FULL normalized message (not a substring) so a reply that
+    # merely starts with "no" but continues into a new request (e.g.
+    # "No, actually I have another question") correctly falls through
+    # unchanged instead of prematurely ending the call.
+
+    if (
+        pre_chart_complete and not Sprint13.phf_flow_active
+        and not is_medical_professional_caller
+        and not new_patient_flow_active
+    ):
+        last_assistant_offered_closing = False
+        for turn in reversed(conversation_history):
+            if turn.get("role") == "assistant":
+                last_assistant_lower = turn.get("content", "").lower()
+                if "anything else" in last_assistant_lower and "?" in last_assistant_lower:
+                    last_assistant_offered_closing = True
+                break
+
+        if last_assistant_offered_closing and is_conversation_closing_reply(message_lower):
+            closing_name = patient_first_name or caller_first_name
+            patient_expressed_thanks = "thank" in message_lower
+            if patient_expressed_thanks:
+                closing_response = (
+                    f"You're welcome, {closing_name}. Thank you for "
+                    f"calling Sykes Creek Primary Care. Have a great day!"
+                    if closing_name else
+                    "You're welcome. Thank you for calling Sykes Creek "
+                    "Primary Care. Have a great day!"
+                )
+            else:
+                closing_response = (
+                    f"Thank you for calling Sykes Creek Primary Care, "
+                    f"{closing_name}. Have a great day!"
+                    if closing_name else
+                    "Thank you for calling Sykes Creek Primary Care. "
+                    "Have a great day!"
+                )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": closing_response}
+            )
+            return jsonify({"response": closing_response})
 
     # Detect the patient announcing themselves mid-call after a third
     # party caller has already completed pre-chart. This is separate
@@ -3563,6 +4387,25 @@ def chat():
     caller_can_wait = any(
         phrase in message_lower for phrase in CAN_WAIT_PHRASES
     )
+
+    if (
+        not urgent_symptoms_active
+        and acute_same_day_established
+        and (caller_cannot_wait or caller_can_wait)
+    ):
+        # Root-cause fix: a chronic-condition (or any non-911-emergency)
+        # escalation that already established same-day urgency earlier in
+        # the call can still reach a "can this wait, or do you need help
+        # right now?" framing conversationally - but without ever tripping
+        # is_truly_urgent()'s emergency-keyword gate, urgent_symptoms_active
+        # never turned on, so the caller's direct cannot-wait/can-wait
+        # answer had no deterministic pipeline to land in and the AI
+        # improvised a response with no callback collection or
+        # high-priority message. This was already asked and just
+        # answered, so mark it answered rather than re-asking Phase 1.
+        urgent_symptoms_active = True
+        urgent_can_wait_asked = True
+
     caller_answered_wait_question = (
         not is_medical_professional_caller and
         urgent_symptoms_active and
@@ -3666,16 +4509,10 @@ def chat():
 
     controlled_substance_schedule = detect_controlled_substance(message_lower)
 
-    same_day_keywords = [
-        "today", "same day", "as soon as possible",
-        "this morning", "this afternoon", "asap"
-    ]
-    is_same_day = any(
-        word in message_lower for word in same_day_keywords
-    ) and any(
-        word in message_lower for word in
-        ["appointment", "come in", "be seen", "schedule", "slot", "get in"]
-    )
+    is_same_day = (
+        any(word in message_lower for word in SAME_DAY_KEYWORDS)
+        and any(word in message_lower for word in SAME_DAY_ACTION_WORDS)
+    ) or acute_same_day_established
 
     # ── Context injections ──
 
@@ -3692,6 +4529,16 @@ def chat():
         f"Do NOT ask 'Are you the patient or calling on behalf of "
         f"someone else?' if caller_is_patient is already True or False.\n"
     )
+    if caller_is_patient is True:
+        pre_chart_context += (
+            f"CRITICAL: caller_is_patient is True — this caller IS the "
+            f"patient and is already speaking with you directly right "
+            f"now. There is no third party. NEVER say 'I'll wait while "
+            f"you get {patient_first_name or 'the patient'} on the "
+            f"line' or any similar phrase asking them to put the "
+            f"patient on the phone. The VERBAL CONSENT TRANSITION "
+            f"section does NOT apply to this caller.\n"
+        )
 
     response_time_context = ""
     if response_time_stated:
@@ -4051,6 +4898,32 @@ def chat():
         and not is_medical_professional_caller
     )
 
+    # RT13 fix: after Steve asks "What is the reason for the
+    # appointment?" (per APPOINTMENT SCHEDULING - FUTURE), the patient's
+    # answer is very often *only* the reason itself (e.g. "I want to
+    # discuss being put on weight loss medication") - none of the
+    # keywords availability_context's outer gate below checks for
+    # ("appointment", "schedule", "available", "availability", "next
+    # week", "this week") typically appear in that reply. Without this,
+    # availability_context stays empty on exactly the turn the AI is
+    # instructed to present real availability, so it has nothing to
+    # draw from and either fabricates times or stalls. Mirrors the
+    # virtual_visit_recently_offered pattern above: scan Steve's own
+    # last reply rather than requiring a Python state flag, since this
+    # workflow (unlike PHF/new-patient scheduling) has no state machine
+    # to hook a flag into.
+    appointment_reason_just_requested = False
+    for turn in reversed(conversation_history):
+        if turn.get("role") == "assistant":
+            last_assistant_lower = turn.get("content", "").lower()
+            if (
+                "reason" in last_assistant_lower
+                and "appointment" in last_assistant_lower
+                and "?" in last_assistant_lower
+            ):
+                appointment_reason_just_requested = True
+            break
+
     availability_context = ""
     if (
         any(word in message_lower for word in [
@@ -4060,8 +4933,14 @@ def chat():
         or virtual_visit_accepted_now
         or same_day_virtual_clinic_declined_now
         or next_available_options_pending
+        or appointment_reason_just_requested
     ) and not is_medical_professional_caller:
-        if not is_same_day or virtual_visit_accepted_now or same_day_virtual_clinic_declined_now or next_available_options_pending:
+        if (
+            not is_same_day or virtual_visit_accepted_now
+            or same_day_virtual_clinic_declined_now
+            or next_available_options_pending
+            or appointment_reason_just_requested
+        ):
             forced_pcp_weekly = get_harness_override("STEVE_FORCE_PCP_WEEKLY_AVAILABLE")
             schedule = generate_weekly_availability(force_has_availability=forced_pcp_weekly)
             pcp_has_no_availability_this_week = not any(schedule.values())
@@ -4131,20 +5010,61 @@ def chat():
 
     if availability_context:
         _today = datetime.now()
+        _today_weekday_index = _today.weekday()  # 0=Monday ... 6=Sunday
+        # Root-cause fix: the LLM was previously asked to CALCULATE
+        # each weekday's actual calendar date itself from a natural-
+        # language hint ("skip today and earlier days... treat the
+        # rest as next week"). That is exactly what produced dates
+        # that don't match their stated weekday (e.g. "Monday,
+        # September 1" when September 1, 2026 is actually a Tuesday)
+        # and, more seriously, dates that fall in the past. Python now
+        # computes the exact next occurrence of every weekday name
+        # directly and hands it to the model as a literal lookup table
+        # - no arithmetic left for the model to get wrong. The formula
+        # below (delta = (idx - today_idx) % 7, pushed to +7 when zero)
+        # uniformly reproduces "skip today itself and any day already
+        # passed this week, otherwise use next week's occurrence" for
+        # every day of the week today could be, replacing the previous
+        # two-branch (weekday vs. weekend) special-casing with one
+        # formula that is correct for both.
+        _weekday_name_to_index = {
+            "Monday": 0, "Tuesday": 1, "Wednesday": 2,
+            "Thursday": 3, "Friday": 4,
+        }
+        _date_lines = []
+        for _day_name, _idx in _weekday_name_to_index.items():
+            _delta = (_idx - _today_weekday_index) % 7
+            if _delta == 0:
+                _delta = 7
+            _real_date = _today + timedelta(days=_delta)
+            _date_lines.append(
+                f"{_day_name} = {_real_date.strftime('%B %d, %Y')}"
+            )
+        _valid_days_note = (
+            "REAL CALENDAR DATES INJECTED BY SYSTEM — use these EXACT "
+            "dates whenever you state a date to the patient for any of "
+            "the weekday names in the availability above. Do NOT "
+            "calculate, guess, or adjust these dates yourself:\n"
+            + "\n".join(_date_lines) + "\n"
+            "Never state, offer, or confirm any date earlier than "
+            f"today's actual date ({_today.strftime('%B %d, %Y')}).\n"
+        )
         availability_context += (
             f"\nTODAY'S DATE INJECTED BY SYSTEM: Today is "
             f"{_today.strftime('%A, %B %d, %Y')}. Resolve any relative "
             f"date the patient uses (\"today\", \"tomorrow\", \"this "
             f"Monday\", \"next Monday\", etc.) against this actual date "
             f"before matching it to the weekly availability above.\n"
+            f"{_valid_days_note}"
         )
 
     same_day_context = ""
     if is_same_day and not is_medical_professional_caller:
         now = datetime.now()
         current_time_str = now.strftime("%I:%M %p")
-        office_open = is_office_open_today()
-        if not office_open:
+        office_open_today = is_office_open_today()
+        within_office_hours = is_within_office_hours()
+        if not office_open_today:
             next_monday = get_next_monday()
             covering_eligible = is_visit_eligible_for_covering_provider(
                 message_lower
@@ -4183,6 +5103,73 @@ def chat():
                     f"cannot wait until Monday I would recommend "
                     f"visiting your nearest urgent care center.'\n"
                     f"NEVER offer slots today. NEVER mention ER.\n"
+                )
+        elif not within_office_hours:
+            # RT12: Weekday, but before/after actual office hours (e.g.
+            # 5:17 AM). is_office_open_today() alone can't catch this -
+            # it only checks day of week, not time of day - which is why
+            # this branch exists as a distinct elif rather than folding
+            # into the "not office_open_today" branch above. No staff
+            # are reachable right now, so Steve must never claim to have
+            # checked with a medical assistant, provider, or availability.
+            if contagious_visit_active:
+                same_day_virtual_clinic_offer_pending = True
+                same_day_context = (
+                    f"OFFICE_CLOSED_CONTAGIOUS_SAME_DAY INJECTED BY SYSTEM:\n"
+                    f"It is currently outside office hours ({OFFICE_HOURS}). "
+                    f"No medical assistant, provider, or staff member is "
+                    f"reachable right now.\n"
+                    f"Say: 'I'm sorry, our office is currently closed so "
+                    f"I'm not able to check with a medical assistant or "
+                    f"provider right now. Since your symptoms sound "
+                    f"contagious, I can offer you our Same-Day Virtual "
+                    f"Clinic instead. You can reach them directly at "
+                    f"{SAME_DAY_VIRTUAL_CLINIC_PHONE_NUMBER}, available "
+                    f"{SAME_DAY_VIRTUAL_CLINIC_HOURS}. Would you like me "
+                    f"to transfer you there now?'\n"
+                    f"CRITICAL — DO NOT:\n"
+                    f"- Say a medical assistant was contacted or checked.\n"
+                    f"- Say a provider was contacted or checked.\n"
+                    f"- Say availability was checked.\n"
+                    f"- Say office staff were contacted.\n"
+                    f"- Say you received any real-time response from staff.\n"
+                    f"The office is closed right now — there is no one to "
+                    f"check with.\n"
+                )
+            else:
+                # Root-cause fix: this branch previously left "the next
+                # available appointment" undefined, so the AI guessed
+                # "tomorrow" even when it's a weekday call before 9 AM and
+                # the office actually reopens LATER THAT SAME DAY. Compute
+                # the real next-reopen moment instead of leaving it to be
+                # guessed.
+                if now.hour < 9:
+                    _next_reopen_label = f"today at 9:00 AM ({now.strftime('%A, %B %d')})"
+                else:
+                    _next_open_day = now + timedelta(days=1)
+                    while _next_open_day.weekday() >= 5:
+                        _next_open_day += timedelta(days=1)
+                    _next_reopen_label = (
+                        f"{_next_open_day.strftime('%A, %B %d')} at 9:00 AM"
+                    )
+                same_day_context = (
+                    f"OFFICE_CLOSED_TODAY INJECTED BY SYSTEM:\n"
+                    f"It is currently outside office hours ({OFFICE_HOURS}). "
+                    f"No staff are reachable right now. The office reopens "
+                    f"{_next_reopen_label} — do NOT say \"tomorrow\" unless "
+                    f"that is actually when the office reopens.\n"
+                    f"Say: 'I'm sorry but our office is currently closed. "
+                    f"We are open {OFFICE_HOURS}. Since you need to be seen "
+                    f"today, I'll create a high priority message for the "
+                    f"office so they can follow up with you as soon as "
+                    f"we reopen ({_next_reopen_label}). If this cannot wait "
+                    f"I would recommend visiting your nearest urgent care "
+                    f"center.'\n"
+                    f"Then obtain a good callback number and confirm a high "
+                    f"priority phone message has been created for follow-up.\n"
+                    f"NEVER offer slots today. NEVER mention ER. NEVER "
+                    f"claim to have checked with staff — the office is "
+                    f"closed.\n"
                 )
         else:
             available_slots = get_future_available_times()
@@ -4353,7 +5340,7 @@ def chat():
                 "virtual visit today", "virtual option",
             ]
         )
-        if virtual_clinic_requested:
+        if virtual_clinic_requested or patient_wants_to_proceed(message_lower):
             same_day_virtual_clinic_offer_pending = False
             same_day_virtual_clinic_context = (
                 "SAME_DAY_VIRTUAL_CLINIC INJECTED BY SYSTEM:\n"
@@ -4897,47 +5884,102 @@ def chat():
             "Do NOT share any results with the patient directly.\n"
         )
 
+    # Scenario 11/12 fix: the CONTROLLED_SUBSTANCE_INFO injection below
+    # and the CONTROLLED SUBSTANCES system-prompt section were both
+    # designed around a BARE refill request ("can I get a refill of my
+    # Xanax") where no appointment was ever mentioned - the last-visit
+    # window determines whether an appointment becomes necessary. When
+    # the patient has ALREADY explicitly asked for an appointment (with
+    # the controlled substance as the stated reason, e.g. after a
+    # wellness-flow medication pivot), that window-check framing is
+    # backwards: it produces "you are required to see [PCP] before we
+    # can process any refill requests" for a patient who never asked
+    # for a refill without an appointment in the first place. Same
+    # principle already applied to paperwork above - an explicit
+    # appointment request is never re-litigated through workflow-
+    # specific escalation logic built for the case where no
+    # appointment was requested.
+    patient_explicitly_requested_appointment_for_med = any(
+        phrase in message_lower for phrase in [
+            "schedule an appointment", "need an appointment",
+            "book an appointment", "want an appointment",
+            "get an appointment", "make an appointment",
+            "need to schedule", "want to schedule", "like to schedule",
+        ]
+    )
+
     controlled_substance_context = ""
     if controlled_substance_schedule and not is_medical_professional_caller:
-        last_visit_str, needs_appointment, days_since, over_12_months, window = \
-            generate_last_visit_date(controlled_substance_schedule)
-        if controlled_substance_schedule == 1:
-            schedule_name = "Schedule 1"
-            meds_example = "Oxycodone, Percocet, Morphine, Fentanyl"
-            virtual_option = "IN OFFICE ONLY — never offer virtual"
-        elif controlled_substance_schedule == 2:
-            schedule_name = "Schedule 2"
-            meds_example = "Vyvanse, Adderall, Focalin, Sunosi"
-            virtual_option = "Virtual OR in-office — patient's choice"
-        else:
-            schedule_name = "Schedule 3"
-            meds_example = "Xanax, Ativan, Zolpidem, Klonopin, etc."
-            virtual_option = "Virtual OR in-office — patient's choice"
-        if over_12_months:
-            appt_reason = "over 12 months — appointment required"
-        elif needs_appointment:
-            appt_reason = (
-                f"{days_since} days exceeds {window}-day window "
-                f"— appointment required"
+        if patient_explicitly_requested_appointment_for_med:
+            controlled_substance_appt_pending = True
+            controlled_substance_appt_medication_word = (
+                find_controlled_substance_word(message_lower) or "your medication"
+            )
+            controlled_substance_appt_schedule = controlled_substance_schedule
+            controlled_substance_context = (
+                "CONTROLLED_SUBSTANCE_APPOINTMENT_REQUESTED INJECTED BY "
+                "SYSTEM:\n"
+                "The patient has already explicitly asked for an "
+                "appointment, with this controlled substance as the "
+                "stated reason. Do NOT say anything about being "
+                "'required' to be seen before refill requests can be "
+                "processed, and do NOT apply the CONTROLLED SUBSTANCES "
+                "last-visit-window logic - that logic is for a bare "
+                "refill request with no appointment mentioned, which is "
+                "not what happened here. Treat this exactly like "
+                "APPOINTMENT SCHEDULING — FUTURE: offer availability "
+                "directly and proceed to scheduling.\n"
+                "MEDICATION_BRIDGE_FLOW_ACTIVE - CRITICAL: Once the "
+                "appointment is booked, confirm it and STOP - do not "
+                "ask about dosage, pharmacy, days of medication "
+                "remaining, or bridge-request details in this same "
+                "response or any response of your own. That entire "
+                "collection is handled deterministically by Python "
+                "immediately after booking - it will ask its own "
+                "follow-up question directly. Do NOT pre-empt it, do "
+                "NOT combine it with your booking confirmation, and do "
+                "NOT mention 72 business hours for this request.\n"
             )
         else:
-            appt_reason = (
-                f"{days_since} days within {window}-day window "
-                f"— NO appointment needed"
+            last_visit_str, needs_appointment, days_since, over_12_months, window = \
+                generate_last_visit_date(controlled_substance_schedule)
+            if controlled_substance_schedule == 1:
+                schedule_name = "Schedule 1"
+                meds_example = "Oxycodone, Percocet, Morphine, Fentanyl"
+                virtual_option = "IN OFFICE ONLY — never offer virtual"
+            elif controlled_substance_schedule == 2:
+                schedule_name = "Schedule 2"
+                meds_example = "Vyvanse, Adderall, Focalin, Sunosi"
+                virtual_option = "Virtual OR in-office — patient's choice"
+            else:
+                schedule_name = "Schedule 3"
+                meds_example = "Xanax, Ativan, Zolpidem, Klonopin, etc."
+                virtual_option = "Virtual OR in-office — patient's choice"
+            if over_12_months:
+                appt_reason = "over 12 months — appointment required"
+            elif needs_appointment:
+                appt_reason = (
+                    f"{days_since} days exceeds {window}-day window "
+                    f"— appointment required"
+                )
+            else:
+                appt_reason = (
+                    f"{days_since} days within {window}-day window "
+                    f"— NO appointment needed"
+                )
+            controlled_substance_context = (
+                f"CONTROLLED_SUBSTANCE_INFO INJECTED BY SYSTEM:\n"
+                f"Schedule: {schedule_name} ({meds_example})\n"
+                f"Last visit: {last_visit_str} ({days_since} days ago)\n"
+                f"Window: {window} days\n"
+                f"Appointment needed: "
+                f"{'YES' if needs_appointment else 'NO — DO NOT SUGGEST ONE'}\n"
+                f"Status: {appt_reason}\n"
+                f"Virtual if needed: {virtual_option}\n"
+                f"ALWAYS state last visit date first.\n"
+                f"IF NO appointment needed: collect refill info only. "
+                f"Do NOT mention appointments at all.\n"
             )
-        controlled_substance_context = (
-            f"CONTROLLED_SUBSTANCE_INFO INJECTED BY SYSTEM:\n"
-            f"Schedule: {schedule_name} ({meds_example})\n"
-            f"Last visit: {last_visit_str} ({days_since} days ago)\n"
-            f"Window: {window} days\n"
-            f"Appointment needed: "
-            f"{'YES' if needs_appointment else 'NO — DO NOT SUGGEST ONE'}\n"
-            f"Status: {appt_reason}\n"
-            f"Virtual if needed: {virtual_option}\n"
-            f"ALWAYS state last visit date first.\n"
-            f"IF NO appointment needed: collect refill info only. "
-            f"Do NOT mention appointments at all.\n"
-        )
 
     hipaa_context = ""
     if (third_party_detected and dob_collected and
@@ -4977,6 +6019,7 @@ def chat():
     conversation_history.append({"role": "user", "content": user_message})
 
     phf_context = Sprint13.build_context()
+    wellness_context = Sprint14.build_context()
 
     system_with_context = (
         system_prompt + "\n" +
@@ -5004,7 +6047,8 @@ def chat():
         controlled_substance_context + "\n" +
         urgent_context + "\n" +
         hipaa_context + "\n" +
-        phf_context
+        phf_context + "\n" +
+        wellness_context
     )
 
     messages = [{"role": "system", "content": system_with_context}] + \
@@ -5037,6 +6081,34 @@ def chat():
                 store_generic_appointment_record(
                     capture_first, capture_last, confirmed_generic_appt
                 )
+                # Scenario 11/12: if this booking was for a
+                # controlled-substance-reason appointment, append a
+                # deterministic Python-authored bridge question rather
+                # than relying on the LLM to remember to ask it - the
+                # bridge-need decision itself is a plain day-count
+                # comparison, not something requiring model judgment,
+                # and this same appointment path has already needed
+                # multiple prompt-compliance corrections this session.
+                if controlled_substance_appt_pending:
+                    day_match = re.search(
+                        r"\b(monday|tuesday|wednesday|thursday|friday|"
+                        r"saturday|sunday)\b",
+                        confirmed_generic_appt, re.IGNORECASE
+                    )
+                    controlled_substance_appt_day_name = (
+                        day_match.group(1).capitalize() if day_match else None
+                    )
+                    med_word = controlled_substance_appt_medication_word or "your medication"
+                    assistant_message = (
+                        assistant_message.rstrip()
+                        + f"\n\nDo you have enough {med_word} remaining "
+                        + "to hold you over until your appointment?"
+                    )
+                    conversation_history[-1]["content"] = assistant_message
+                    controlled_substance_bridge_awaiting_days = True
+                    controlled_substance_appt_pending = False
+                    controlled_substance_appt_medication_word = None
+                    controlled_substance_appt_schedule = None
         return jsonify({"response": assistant_message})
     except Exception as e:
         print(f"Groq API error: {e}")
