@@ -151,7 +151,7 @@ WELLNESS_TRIGGERS = [
     "annual wellness", "annual physical", "wellness visit", "wellness exam",
     "physical exam", "yearly checkup", "yearly check up", "annual checkup",
     "annual check up", "routine physical", "routine checkup",
-    "routine check up", "checkup", "check up", "physical",
+    "routine check up", "checkup", "check up", "physical", "wellness",
 ]
 
 MAW_TRIGGERS = [
@@ -230,17 +230,28 @@ def _mentions_running_out_of_medication(message_lower):
 
 
 TOO_FAR_OUT_ACUTE_TRIGGERS = [
-    "not feeling well", "sick", "in pain", "hurts", "fever",
+    "not feeling well", "sick", "in pain", "hurts", "hurt", "fever",
     "something is wrong", "need to be seen sooner because i'm sick",
     "symptoms", "cough", "cold", "sore throat", "headache",
     "earache", "ear ache", "nausea", "vomiting", "rash",
     "need an appointment today", "need to be seen today",
     "need to be seen sooner",
+    "fractured", "fracture", "broken", "injury", "injured",
+    "sprained", "cut", "bleeding", "swollen", "wound",
 ]
 
 TOO_FAR_OUT_CHRONIC_TRIGGERS = [
     "chronic", "ongoing condition", "keeps coming back",
     "my condition is getting worse", "long term issue", "long-term issue",
+]
+
+# Named chronic conditions - a patient naming their actual condition
+# ("my diabetes is acting up", "I need to discuss my diabetes") is
+# just as valid a chronic-reason signal as one of the generic phrases
+# above, and is how patients most commonly phrase this in practice.
+CHRONIC_CONDITION_NAME_TRIGGERS = [
+    "diabetes", "copd", "asthma", "blood pressure", "high blood pressure",
+    "hypertension", "arthritis", "thyroid",
 ]
 
 TOO_FAR_OUT_PAPERWORK_TRIGGERS = [
@@ -291,6 +302,43 @@ LAB_ORDER_CANNOT_LOCATE_TRIGGERS = [
     "where is my lab order", "missing lab order",
     "don't have my lab order", "doesn't have my lab order",
     "lab doesn't have my order", "lab doesn't have the order",
+]
+
+# Scenario 21: Priority Care Network labs can access lab orders directly
+# through the patient's chart, so no separate send is ever needed for
+# these locations. Each entry is a recognizable phrase/substring mapped
+# to the canonical display name. Checked in order - more specific
+# entries (e.g. "viera medical plaza") must be listed before shorter,
+# more general ones that could also match within them (e.g. "viera").
+PRIORITY_CARE_NETWORK_LABS = [
+    ("indialantic", "Indialantic office"),
+    ("eldron", "Eldron office"),
+    ("titusville", "Titusville Knox McRae office"),
+    ("knox mcrae", "Titusville Knox McRae office"),
+    ("gateway", "Gateway office"),
+    ("cancer institute", "Cancer Institute"),
+    ("cape canaveral", "Cape Canaveral Hospital"),
+    ("holmes regional", "Holmes Regional Medical Center"),
+    ("viera medical plaza", "Viera Medical Plaza"),
+    ("viera pcp", "Viera PCP office"),
+    ("priority care", "Priority Care urgent care clinic"),
+    ("adventure health", "Adventure Health urgent care clinic"),
+]
+
+# Noun phrases the patient might use for what's being sent, and verb/
+# framing phrases indicating they want it sent somewhere (or that a lab
+# is reporting it doesn't have the orders yet). Both an noun AND a verb
+# trigger must be present - this mirrors the same-day-request pattern
+# used elsewhere (SAME_DAY_KEYWORDS + SAME_DAY_ACTION_WORDS) to avoid a
+# bare "labs" or "send" alone causing false positives.
+LAB_SEND_NOUN_TRIGGERS = [
+    "blood work", "blood work orders", "blood and urine",
+    "blood work and urine", "urine order", "urine orders",
+    "labs", "lab work", "lab orders", "lab work orders",
+]
+LAB_SEND_VERB_TRIGGERS = [
+    "send", "sent", "don't have my", "doesn't have my",
+    "does not have my", "do not have my",
 ]
 
 REFILL_ESCALATION_TRIGGERS = [
@@ -411,6 +459,38 @@ def detect_lab_order_ehr_intent(message_lower):
     return any(t in message_lower for t in LAB_ORDER_CANNOT_LOCATE_TRIGGERS)
 
 
+def detect_lab_send_request_intent(message_lower):
+    """Scenario 21: patient wants lab orders sent to (or reports a lab
+    doesn't yet have) a specific destination - e.g. "I need my blood
+    work sent to Holmes Regional" or "The lab says they don't have my
+    orders." Separate from detect_lab_order_ehr_intent (Scenario 19/20's
+    "I can't find my lab order in the portal" trigger) - both can be
+    active in the same build without interfering with each other."""
+    return (
+        any(t in message_lower for t in LAB_SEND_NOUN_TRIGGERS)
+        and any(t in message_lower for t in LAB_SEND_VERB_TRIGGERS)
+    )
+
+
+def _extract_priority_network_lab(message_lower):
+    """Returns the canonical display name of a recognized Priority Care
+    Network location mentioned in the message, or None if no known
+    Priority Care Network location is named."""
+    for phrase, display_name in PRIORITY_CARE_NETWORK_LABS:
+        if re.search(r'\b' + re.escape(phrase) + r'\b', message_lower):
+            return display_name
+    return None
+
+
+# Common external lab brand names, recognized only to distinguish "the
+# patient named a specific non-Priority-Network lab" from "the patient
+# didn't name any lab at all" on the very first message - so a message
+# like "send my labs to Quest" continues straight into the existing
+# lab-order workflow instead of redundantly asking "which lab" for a
+# lab the patient already named.
+KNOWN_EXTERNAL_LAB_TRIGGERS = ["quest", "labcorp", "lab corp"]
+
+
 NOT_ELIGIBLE_ACCEPTANCE_TRIGGERS = [
     "i understand", "i'm aware", "im aware", "i am aware",
     "schedule it now", "schedule it anyway", "book it now",
@@ -525,9 +605,18 @@ def calculate_age_from_dob(dob_string):
 
 def generate_last_wellness_date():
     """Randomly simulates the patient's last wellness/physical visit
-    date. Wide random range so both "recently eligible" and "overdue"
-    patients occur in testing."""
-    days_since = random.randint(30, 500)
+    date. Weighted 70/30 toward already-eligible patients, matching
+    observed real-world call patterns: patients calling to schedule an
+    annual wellness visit are more often already past their 1-year-
+    and-1-day eligibility window than not yet eligible. Permanent
+    behavior change, not a temporary testing override."""
+    if random.random() < 0.70:
+        # Eligible bucket: more than 1 year + 1 day ago (367+ days).
+        # Upper bound wide enough to also cover "very overdue" callers.
+        days_since = random.randint(367, 730)
+    else:
+        # Not-yet-eligible bucket: within the last year (<= 366 days).
+        days_since = random.randint(30, 366)
     last_date = datetime.now() - timedelta(days=days_since)
     return last_date.strftime("%B %d, %Y"), days_since
 
@@ -882,7 +971,10 @@ def classify_too_far_out_reason(message_lower):
         return "medication_refill"
     if _contains_trigger(message_lower, TOO_FAR_OUT_ACUTE_TRIGGERS):
         return "acute"
-    if _contains_trigger(message_lower, TOO_FAR_OUT_CHRONIC_TRIGGERS):
+    if (
+        _contains_trigger(message_lower, TOO_FAR_OUT_CHRONIC_TRIGGERS)
+        or _contains_trigger(message_lower, CHRONIC_CONDITION_NAME_TRIGGERS)
+    ):
         return "chronic"
     if _contains_trigger(message_lower, TOO_FAR_OUT_PAPERWORK_TRIGGERS):
         return "paperwork"
@@ -1039,12 +1131,10 @@ def _execute_pivot_handoff(reason, message_lower=""):
         return None
 
     if reason == "acute":
-        return (
-            "I'm sorry to hear that. Since this sounds like "
-            "something more urgent, let's get you taken care of "
-            "sooner - can you tell me what symptoms you're "
-            "experiencing?"
-        )
+        # Let app.py's existing acute/urgent workflow handle this with
+        # full office-hours awareness, rather than intercepting with a
+        # hardcoded bridging question that bypasses after-hours logic.
+        return None
     if reason == "medication_refill":
         # Traced Scenario 11 defect: this branch always asked "which
         # medication" even when the drug name was already stated in
@@ -1647,17 +1737,14 @@ def handle_wellness_flow(message, message_lower):
             # (URGENT_SYMPTOM_TRIGGERS / same-day scheduling). This
             # module does not duplicate that logic - it hands the
             # conversation back by ending its own flow so app.py's
-            # existing acute/same-day detection can take over on the
-            # patient's next message describing their symptoms.
+            # existing acute/same-day detection can take over.
+            # Return None so app.py handles this turn directly with
+            # full office-hours awareness, rather than intercepting
+            # with a hardcoded bridging question.
             wellness_too_far_out_pending = False
             wellness_flow_active = False
             wellness_stage = "complete"
-            return (
-                "I'm sorry to hear that. Since this sounds like "
-                "something more urgent, let's get you taken care of "
-                "sooner - can you tell me what symptoms you're "
-                "experiencing?"
-            )
+            return None
 
         if reason == "chronic":
             wellness_too_far_out_pending = False
@@ -1962,9 +2049,56 @@ def _looks_like_fax_number(message):
 def _handle_lab_order_ehr_guidance(message, message_lower):
     global lab_order_ehr_stage, lab_order_uncomfortable_with_tech
     global lab_order_ehr_guidance_active, wellness_stage
+    global wellness_flow_active
     global lab_order_mailing_address, lab_order_fax_destination
 
     if lab_order_ehr_stage is None:
+        if detect_lab_send_request_intent(message_lower):
+            priority_lab = _extract_priority_network_lab(message_lower)
+            if priority_lab:
+                lab_order_ehr_guidance_active = False
+                lab_order_ehr_stage = None
+                wellness_stage = "complete"
+                wellness_flow_active = False
+                return (
+                    f"Because that lab is part of the Priority Care "
+                    f"Network, they can access your lab orders directly "
+                    f"through your chart. There is no need for us to "
+                    f"send the orders separately. Is there anything "
+                    f"else I can help you with today?"
+                )
+            if any(t in message_lower for t in KNOWN_EXTERNAL_LAB_TRIGGERS):
+                lab_order_ehr_stage = "ask_comfort"
+                return (
+                    "I can help you locate that. Are you comfortable "
+                    "checking MyChart, or would you prefer another "
+                    "option?"
+                )
+            lab_order_ehr_stage = "priority_network_ask_lab"
+            return "Which lab will you be using?"
+
+        lab_order_ehr_stage = "ask_comfort"
+        return (
+            "I can help you locate that. Are you comfortable checking "
+            "MyChart, or would you prefer another option?"
+        )
+
+    if lab_order_ehr_stage == "priority_network_ask_lab":
+        priority_lab = _extract_priority_network_lab(message_lower)
+        if priority_lab:
+            lab_order_ehr_guidance_active = False
+            lab_order_ehr_stage = None
+            wellness_stage = "complete"
+            wellness_flow_active = False
+            return (
+                f"Because that lab is part of the Priority Care "
+                f"Network, they can access your lab orders directly "
+                f"through your chart. There is no need for us to send "
+                f"the orders separately. Is there anything else I can "
+                f"help you with today?"
+            )
+        # Named a lab, just not one in the Priority Care Network -
+        # continue into the existing lab-order workflow unchanged.
         lab_order_ehr_stage = "ask_comfort"
         return (
             "I can help you locate that. Are you comfortable checking "
