@@ -17,7 +17,7 @@ import sys
 # duplicate. Must run before the Sprint13/Sprint14 imports below.
 sys.modules.setdefault("app", sys.modules[__name__])
 
-#os.environ["STEVE_FORCE_PCP_AVAILABLE"] = "false"
+# os.environ["STEVE_FORCE_PCP_AVAILABLE"] = "false"
 import re
 import random
 import secrets
@@ -84,6 +84,11 @@ new_patient_member_number = None
 new_patient_text_consent = None
 new_patient_weekly_schedule = None
 new_patient_appointment_selection = None
+new_patient_household_relation = None
+new_patient_household_stage = "primary"
+new_patient_household_second_time = None
+new_patient_household_primary_first_name = None
+new_patient_household_primary_address = None
 
 # Urgent symptoms state
 urgent_symptoms_active = False
@@ -105,6 +110,7 @@ current_ma_availability = None
 
 # Sprint 12: Acute visit nuances - contagious/virtual-refusal and UTI
 contagious_visit_active = False
+contagious_same_day_check_pending = False
 virtual_visit_offered = False
 provider_callin_offer_pending = False
 symptoms_pharmacy_pending = False
@@ -148,9 +154,12 @@ controlled_substance_appt_medication_word = None
 controlled_substance_appt_schedule = None
 controlled_substance_bridge_awaiting_days = False
 controlled_substance_appt_day_name = None
+controlled_substance_appt_date = None
 controlled_substance_bridge_awaiting_dosage = False
 controlled_substance_bridge_dosage = None
 controlled_substance_bridge_awaiting_pharmacy = False
+controlled_substance_bridge_awaiting_callback = False
+controlled_substance_bridge_callback_number = None
 controlled_substance_bridge_confirmed_insufficient = False
 
 # Pre-chart state
@@ -371,6 +380,32 @@ THIRD_PARTY_PHRASES = [
     "for my", "behalf of"
 ]
 
+# Bug fix: THIRD_PARTY_PHRASES fires on a bare mention like "my
+# husband" anywhere in the message, so a caller speaking in first-
+# person-plural about a SHARED situation ("my husband and I both have
+# new patient appointments", "we both have appointments with Dr.
+# Brooks") was misread as a third-party call requiring the spouse's
+# own verbal consent to discuss THEIR information - even though the
+# caller never asked Steve to look up or disclose anything specific
+# to the spouse. A genuine third-party call ("calling on behalf of my
+# husband", "can you check my husband's appointment?") has no such
+# joint "and I have/are" phrasing and is unaffected by this exclusion.
+_JOINT_APPOINTMENT_REFERENCE_PATTERN = re.compile(
+    r"\bmy\s+(?:husband|wife|spouse|son|daughter|partner)\b"
+    r"(?:\s+\w+){0,3}\s+and\s+(?:i|myself)\s+(?:both\s+)?"
+    r"(?:have|has|are|am|would\s+like\s+to|want\s+to|need\s+to)\b"
+    r"|\bwe\s+both\s+have\b"
+    r"|\bwe\s+are\s+(?:both\s+)?(?:already\s+)?scheduled\b"
+    # Bug fix: "my spouse and myself would like to cancel our new
+    # patient appointments" still fired the third-party consent
+    # workflow, since the pattern above only recognized "have/has/
+    # are/am" as the joint verb - not the "would like to"/"want to"/
+    # "need to" + action-verb phrasing a caller naturally uses when
+    # asking to cancel or reschedule on behalf of both of them.
+    r"|\bwe\s+(?:would\s+like\s+to|want\s+to|need\s+to)\b",
+    re.IGNORECASE
+)
+
 MEDICAL_PROFESSIONAL_KEYWORDS = [
     "this is the pharmacy", "pharmacy calling", "pharmacist calling",
     "i'm a pharmacist", "i am a pharmacist", "this is the pharmacist",
@@ -532,18 +567,118 @@ def is_truly_urgent(message_lower):
     return True
 
 
+# ─────────────────────────────────────────────
+# Office holiday rules
+# ─────────────────────────────────────────────
+# Applies to appointment availability, office-hours determination,
+# same-day evaluation, callback workflows, and "is the office open"
+# questions. A recognized holiday closure is treated exactly like a
+# weekend closure everywhere in this file - both are folded into the
+# is_office_open_today()/is_within_office_hours() primitives that
+# almost everything else already consults, rather than each caller
+# separately checking for holidays.
+
+_MONTH_LENGTHS = {
+    1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30,
+    7: 31, 8: 30, 9: 30, 10: 31, 11: 30, 12: 31,
+}
+
+
+def _is_leap_year(year):
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def _days_in_month(year, month):
+    if month == 2 and _is_leap_year(year):
+        return 29
+    return _MONTH_LENGTHS[month]
+
+
+def _nth_weekday_of_month(year, month, weekday, n):
+    """weekday: Monday=0 ... Sunday=6. n: 1-based occurrence (e.g. 3rd
+    Monday)."""
+    first_weekday = datetime(year, month, 1).weekday()
+    delta_days = (weekday - first_weekday) % 7
+    day = 1 + delta_days + (n - 1) * 7
+    return datetime(year, month, day).date()
+
+
+def _last_weekday_of_month(year, month, weekday):
+    last_day_num = _days_in_month(year, month)
+    last_weekday = datetime(year, month, last_day_num).weekday()
+    delta_days = (last_weekday - weekday) % 7
+    day = last_day_num - delta_days
+    return datetime(year, month, day).date()
+
+
+def _observed_fixed_holiday(year, month, day):
+    """Weekend-observance shift used for New Year's Day, Independence
+    Day, and Christmas Day: falls on Saturday -> observed the day
+    before; falls on Sunday -> observed the day after."""
+    d = datetime(year, month, day).date()
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _office_holidays_for_year(year):
+    """Returns {date: holiday_name} for the 7 recognized office
+    holidays in a given year, with weekend-observance shifting
+    already applied where it's part of that holiday's rule."""
+    return {
+        _observed_fixed_holiday(year, 1, 1): "New Year's Day",
+        _nth_weekday_of_month(year, 1, 0, 3): "Martin Luther King Jr. Day",
+        _last_weekday_of_month(year, 5, 0): "Memorial Day",
+        _observed_fixed_holiday(year, 7, 4): "Independence Day",
+        _nth_weekday_of_month(year, 9, 0, 1): "Labor Day",
+        _nth_weekday_of_month(year, 11, 3, 4): "Thanksgiving Day",
+        _observed_fixed_holiday(year, 12, 25): "Christmas Day",
+    }
+
+
+def _office_holidays_near(year):
+    """Merges the holiday maps for year-1, year, and year+1 - needed
+    because New Year's Day's Saturday-shift can land the observed
+    closure on December 31 of the PREVIOUS year (e.g. Jan 1, 2028 is
+    a Saturday, so Dec 31, 2027 is the recognized closure date)."""
+    merged = {}
+    for y in (year - 1, year, year + 1):
+        merged.update(_office_holidays_for_year(y))
+    return merged
+
+
+def is_recognized_office_holiday(check_date):
+    """check_date: a datetime.date. True if it falls on one of the 7
+    recognized office holidays, after weekend-observance shifting."""
+    return check_date in _office_holidays_near(check_date.year)
+
+
+def get_recognized_office_holiday_name(check_date):
+    """Returns the holiday name if check_date is a recognized office
+    holiday, else None."""
+    return _office_holidays_near(check_date.year).get(check_date)
+
+
 def is_office_open_today():
+    today = datetime.now().date()
+    if is_recognized_office_holiday(today):
+        return False
     return datetime.now().weekday() < 5
 
 
 def is_within_office_hours():
     """True only if it is currently within actual office hours: Monday
-    through Friday, 9:00 AM to 5:00 PM. Distinct from
-    is_office_open_today(), which only checks the day of week and
-    ignores time of day entirely - that gap is why a 5:17 AM weekday
-    call was treated as if the office were open."""
+    through Friday, 9:00 AM to 5:00 PM, and not a recognized office
+    holiday. Distinct from is_office_open_today(), which only checks
+    the day (weekend/holiday) and ignores time of day entirely - that
+    gap is why a 5:17 AM weekday call was treated as if the office
+    were open."""
     now = datetime.now()
     if now.weekday() >= 5:
+        return False
+    if is_recognized_office_holiday(now.date()):
         return False
     return 9 <= now.hour < 17
 
@@ -661,6 +796,40 @@ _GENERIC_APPT_CONFIRM_KEYWORDS = [
     "we have you down", "put you down for",
 ]
 
+_MONTH_NAME_TO_NUM = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+    "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
+    "november": 11, "december": 12,
+}
+
+# Title abbreviations whose period does not end a sentence - used by
+# _find_real_sentence_end() below so a name like "Dr. Michael Brooks"
+# isn't mistaken for the end of the confirmation sentence.
+_TITLE_ABBREVIATIONS = ("dr", "mr", "mrs", "ms", "st", "jr", "sr")
+
+
+def _find_real_sentence_end(text, start):
+    """Find the end of the sentence beginning at/after `start`,
+    skipping a period that is actually a title abbreviation (e.g.
+    "Dr.") rather than a genuine sentence end. Returns an index into
+    `text`, or None if no sentence-ending punctuation is found."""
+    pos = start
+    while True:
+        match = re.search(r"[.!\n]", text[pos:])
+        if not match:
+            return None
+        end = pos + match.end()
+        preceding_word = re.search(
+            r"([A-Za-z]+)$", text[pos:pos + match.start()]
+        )
+        if (
+                preceding_word
+                and preceding_word.group(1).lower() in _TITLE_ABBREVIATIONS
+        ):
+            pos = end
+            continue
+        return end
+
 
 def _extract_generic_appointment_confirmation(assistant_text):
     """Best-effort extraction of a confirmed generic appointment's
@@ -728,13 +897,17 @@ def detect_generic_appointment_inquiry_intent(message_lower):
     return any(t in message_lower for t in GENERIC_APPOINTMENT_INQUIRY_TRIGGERS)
 
 
-def get_next_monday():
-    today = datetime.now()
-    days_until_monday = (7 - today.weekday()) % 7
-    if days_until_monday == 0:
-        days_until_monday = 7
-    next_monday = today + timedelta(days=days_until_monday)
-    return next_monday.strftime("%A, %B %d")
+def get_next_business_day():
+    """Returns the next day the office is actually open - skips
+    Saturday, Sunday, AND any recognized office holiday (e.g. if
+    Monday itself is Labor Day, this returns Tuesday)."""
+    candidate = datetime.now() + timedelta(days=1)
+    while (
+            candidate.weekday() >= 5
+            or is_recognized_office_holiday(candidate.date())
+    ):
+        candidate += timedelta(days=1)
+    return candidate.strftime("%A, %B %d")
 
 
 def detect_dob_in_message(message):
@@ -778,8 +951,8 @@ def detect_nurse_ma_request(message_lower):
 
 def detect_lab_order_pickup(message_lower):
     return any(
-trigger in message_lower for trigger in LAB_ORDER_PICKUP_TRIGGERS
-)
+        trigger in message_lower for trigger in LAB_ORDER_PICKUP_TRIGGERS
+    )
 
 
 def detect_controlled_substance(message_lower):
@@ -858,6 +1031,22 @@ _NEGATION_BEFORE_ENOUGH_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Bug fix: a direct one-word reply to the yes/no question "Do you have
+# enough X remaining to hold you over until your appointment?" (e.g.
+# a bare "No") previously matched neither the phrase lists above nor
+# below, since those only look for "enough"/insufficiency wording
+# specifically. That silently fell through to a generic re-ask
+# instead of registering as an answer at all. Anchored to the whole
+# message (not a substring search) so it only fires on a genuinely
+# bare answer, never on "no" or "yes" appearing inside a longer
+# sentence (e.g. "I don't know" must not match).
+_BARE_NEGATIVE_REPLY_PATTERN = re.compile(
+    r"^\s*(no|nope|nah|not really)\s*[.!]?\s*$", re.IGNORECASE
+)
+_BARE_AFFIRMATIVE_REPLY_PATTERN = re.compile(
+    r"^\s*(yes|yeah|yep|yup|sure)\s*[.!]?\s*$", re.IGNORECASE
+)
+
 _INSUFFICIENT_MEDICATION_PHRASES = [
     "not enough", "won't be enough", "will not be enough",
     "wouldn't be enough", "would not be enough", "insufficient",
@@ -878,6 +1067,8 @@ def patient_declines_sufficient_medication(message_lower):
     bridge-request workflow was skipped entirely."""
     if _NEGATION_BEFORE_ENOUGH_PATTERN.search(message_lower):
         return True
+    if _BARE_NEGATIVE_REPLY_PATTERN.match(message_lower):
+        return True
     return any(p in message_lower for p in _INSUFFICIENT_MEDICATION_PHRASES)
 
 
@@ -890,6 +1081,8 @@ def patient_confirms_sufficient_medication(message_lower):
     patient_declines_sufficient_medication() first - this function's
     own phrase list is a positive-only substring match and does not
     itself detect negation (e.g. 'do not have enough')."""
+    if _BARE_AFFIRMATIVE_REPLY_PATTERN.match(message_lower):
+        return True
     return any(p in message_lower for p in _SUFFICIENT_MEDICATION_PHRASES)
 
 
@@ -956,6 +1149,18 @@ CANCEL_ACUTE_VISIT_TRIGGERS = [
     "cancel it", "cancel this", "like to cancel",
 ]
 
+# Bug fix: distinguishes explicit per-person ownership language
+# ("my appointment is X" vs. "his/her/their appointment is Y") in a
+# household cancellation request, so each stored appointment record
+# can be cancelled under its correct owner instead of both being
+# collapsed into whichever name patient_first_name happened to hold.
+_MY_APPOINTMENT_OWNERSHIP_PATTERN = re.compile(
+    r"\bmy\s+appointment\b", re.IGNORECASE
+)
+_SPOUSE_APPOINTMENT_OWNERSHIP_PATTERN = re.compile(
+    r"\b(?:his|her|their)\s+appointment\b", re.IGNORECASE
+)
+
 QUERY_ACUTE_VISIT_TRIGGERS = [
     "when is my appointment", "when is my acute visit",
     "when my acute visit is", "what is my appointment",
@@ -976,6 +1181,7 @@ def generate_existing_acute_appointment():
     day = random.choice(DAYS_OF_WEEK)
     time = random.choice(AVAILABLE_TIMES)
     return day, time
+
 
 # Visit reasons for which the covering provider is NEVER eligible,
 # regardless of availability. Plain "follow up" is excluded here on
@@ -1024,20 +1230,20 @@ def is_visit_eligible_for_covering_provider(message_lower):
     provider.
     """
     if any(
-        phrase in message_lower
-        for phrase in COVERING_PROVIDER_POST_ACUTE_FOLLOWUP_TRIGGERS
+            phrase in message_lower
+            for phrase in COVERING_PROVIDER_POST_ACUTE_FOLLOWUP_TRIGGERS
     ):
         return True
     if any(
-        phrase in message_lower
-        for phrase in COVERING_PROVIDER_INELIGIBLE_VISIT_TRIGGERS
+            phrase in message_lower
+            for phrase in COVERING_PROVIDER_INELIGIBLE_VISIT_TRIGGERS
     ):
         return False
     return True
 
 
 def covering_provider_has_more_immediate_availability(
-    pcp_soonest_days, covering_soonest_days
+        pcp_soonest_days, covering_soonest_days
 ):
     """
     Returns True if the covering provider (Elizabeth Horowitz, NP) has a
@@ -1182,7 +1388,7 @@ ACCEPTED_COMMERCIAL_INSURANCE = [
     "united", "united healthcare", "unitedhealthcare",
     "health first", "health first health plans",
     "cigna", "blue cross", "bcbs",
-    "florida blue", "anthem"
+    "florida blue", "anthem", "aetna", "humana",
 ]
 
 NEW_PATIENT_TRIGGERS = [
@@ -1195,9 +1401,172 @@ NEW_PATIENT_TRIGGERS = [
     "establish my child", "establish my son", "establish my daughter"
 ]
 
+# Bug fix: "new patient" is a bare substring in NEW_PATIENT_TRIGGERS,
+# so a caller STATING they already have a new-patient appointment
+# ("my spouse and I have new patient appointments with Dr. Brooks")
+# was misread as a REQUEST for one, dropping Steve into new-patient
+# intake instead of existing-appointment handling. Mirrors the
+# pcp_statement_pattern exclusion below for the same class of problem
+# (a statement about an existing fact, not a request).
+_EXISTING_NEW_PATIENT_APPOINTMENT_PATTERN = re.compile(
+    r"\b(?:have|has|had|got)\s+(?:a\s+)?new[\s-]patient\s+appointments?\b"
+    r"|\bnew[\s-]patient\s+appointments?\s+(?:already\s+)?(?:scheduled|booked|set)\b"
+    r"|\b(?:are|is|am)\s+(?:already\s+)?scheduled\s+as\s+new\s+patients?\b"
+    r"|\balready\s+(?:have|has|had)\s+(?:a\s+)?new[\s-]patient\s+appointments?\b"
+    # Bug fix: a caller asking to CANCEL/reschedule/move/change an
+    # EXISTING new-patient appointment ("would like to cancel our new
+    # patient appointments") still references that appointment using
+    # the phrase "new patient appointments" - the alternatives above
+    # only covered "have/has/had/got" and "already scheduled" phrasing,
+    # so this cancellation-of-an-existing-appointment case fell
+    # through and was misread as a fresh new-patient REQUEST instead.
+    r"|\b(?:cancel|reschedule|change|move)\s+(?:our|my|the)\s+new[\s-]patient\s+appointments?\b",
+    re.IGNORECASE
+)
+
 MEDICAID_TRIGGERS = [
     "medicaid", "medi-caid", "medi caid"
 ]
+
+# Sprint 15 enhancement: recognizes when a caller is registering
+# themselves AND a spouse as new patients in the same call, so the
+# household's second appointment request isn't silently dropped once
+# the caller's own registration completes.
+_HOUSEHOLD_RELATION_PATTERN = re.compile(
+    r"\b(?:myself|me)\s+and\s+my\s+(husband|wife|spouse)\b"
+    r"|\bmy\s+(husband|wife|spouse)\s+and\s+(?:myself|me|i)\b",
+    re.IGNORECASE
+)
+
+
+def detect_new_patient_household_relation(message_lower):
+    """Returns 'husband', 'wife', or 'spouse' if the message indicates
+    the caller is registering for themselves AND a spouse (e.g.
+    "myself and my husband", "husband and wife", "both of us", "me
+    and my husband"), else None."""
+    match = _HOUSEHOLD_RELATION_PATTERN.search(message_lower)
+    if match:
+        return (match.group(1) or match.group(2)).lower()
+    if "husband and wife" in message_lower or "wife and husband" in message_lower:
+        return "spouse"
+    if "both of us" in message_lower:
+        return "spouse"
+    return None
+
+
+_DAY_NAME_PATTERN = re.compile(
+    r"\b(monday|tuesday|wednesday|thursday|friday)\b", re.IGNORECASE
+)
+# Bug fix: the previous single pattern (\d{1,2}(?::\d{2})?\s*(?:am|pm))
+# only matched a time WITH a colon (e.g. "2:30 PM") or a bare hour
+# (e.g. "3 PM") - a compact time with no colon, like "230PM" (a common
+# way "2:30 PM" gets typed/transcribed), matched neither: \d{1,2} caps
+# at 2 digits so it could only consume "23" or "2", and neither is
+# immediately followed by "am"/"pm" in "230PM", so the whole match
+# failed. That silently made the day/time extraction fail and fall
+# back to storing the entire raw sentence. Checked in priority order
+# so a colon time is never misread by the compact pattern, and a
+# compact time is never truncated to just its leading hour digit(s)
+# by the hour-only pattern.
+_TIME_COLON_PATTERN = re.compile(
+    r"\b(\d{1,2}):(\d{2})\s*(am|pm)\b", re.IGNORECASE
+)
+_TIME_COMPACT_PATTERN = re.compile(
+    r"\b(\d{1,2})(\d{2})\s*(am|pm)\b", re.IGNORECASE
+)
+_TIME_HOUR_ONLY_PATTERN = re.compile(
+    r"\b(\d{1,2})\s*(am|pm)\b", re.IGNORECASE
+)
+_HOUSEHOLD_SECOND_APPT_PATTERN = re.compile(
+    r"\b(?:schedule|book)\s+my\s+(husband|wife|spouse)\b", re.IGNORECASE
+)
+
+
+def _find_time_in_text(text):
+    """Finds a time expression in free text and returns it normalized
+    as 'H:MM AM/PM'. Handles "2:30 PM" (colon), "230PM" (compact, no
+    colon or space), and "3 PM" (hour only, minutes default to :00)."""
+    for pattern in (_TIME_COLON_PATTERN, _TIME_COMPACT_PATTERN):
+        match = pattern.search(text)
+        if match:
+            hour, minute, meridiem = match.groups()
+            return f"{hour}:{minute} {meridiem.upper()}"
+    match = _TIME_HOUR_ONLY_PATTERN.search(text)
+    if match:
+        hour, meridiem = match.groups()
+        return f"{hour}:00 {meridiem.upper()}"
+    return None
+
+
+def _extract_slot_from_text(text, fallback_day=None):
+    """Pulls a 'Weekday H:MM AM/PM' slot out of free text. Falls back
+    to fallback_day if no weekday name is found in this specific
+    segment (needed for phrasing like "...for 2:00 PM that same
+    day", which refers back to a day named earlier in the message)."""
+    day_match = _DAY_NAME_PATTERN.search(text)
+    day_name = day_match.group(1).capitalize() if day_match else fallback_day
+    time_str = _find_time_in_text(text)
+    if not (day_name and time_str):
+        return None
+    return f"{day_name} {time_str}"
+
+
+def extract_household_scheduling(message, message_lower):
+    """Bug fix: the appointment_time stage previously stored the
+    entire raw sentence as the appointment slot instead of parsing it
+    (e.g. "I'd like to take this Thursday at 1:30 PM and please
+    schedule my husband for 2:00 PM that same day" was saved
+    verbatim). Parses out a primary slot and, if the message also
+    asks to schedule a spouse, a second slot for them. Returns
+    (primary_slot, second_relation, second_slot) - the latter two are
+    None if no second scheduling request is found. Falls back to the
+    raw message for primary_slot if no day/time pair can be found at
+    all, so an unrecognized format still gets something reasonable."""
+    second_match = _HOUSEHOLD_SECOND_APPT_PATTERN.search(message_lower)
+    if second_match:
+        primary_text = message[:second_match.start()]
+        second_text = message[second_match.start():]
+    else:
+        primary_text = message
+        second_text = ""
+
+    primary_slot = _extract_slot_from_text(primary_text) or message.strip()
+
+    second_relation = None
+    second_slot = None
+    if second_match:
+        second_relation = second_match.group(1).lower()
+        primary_day_match = _DAY_NAME_PATTERN.search(primary_text)
+        primary_day_name = (
+            primary_day_match.group(1).capitalize() if primary_day_match else None
+        )
+        second_slot = _extract_slot_from_text(second_text, fallback_day=primary_day_name)
+
+    return primary_slot, second_relation, second_slot
+
+
+def _household_pronoun_possessive(relation):
+    """Returns the possessive pronoun to use when asking about the
+    second household member's own information during a household
+    registration pass (e.g. "Could I get his date of birth?") -
+    avoids the ambiguous "your", which can be misread as still
+    referring to the caller who just finished their own registration."""
+    if relation == "husband":
+        return "his"
+    if relation == "wife":
+        return "her"
+    return "their"
+
+
+def _household_object_pronoun(relation):
+    """Object-case counterpart to _household_pronoun_possessive - "him"
+    for husband, "her" for wife, "them" for spouse/unspecified."""
+    if relation == "husband":
+        return "him"
+    if relation == "wife":
+        return "her"
+    return "them"
+
 
 MARKETPLACE_TRIGGERS = [
     "marketplace", "obamacare", "aca plan", "aca insurance",
@@ -1251,8 +1620,8 @@ def determine_eligible_minor_providers(provider_availability):
     """
     return [
         provider for provider in MINOR_ELIGIBLE_PROVIDERS
-if provider_availability.get(provider, False)
-]
+        if provider_availability.get(provider, False)
+    ]
 
 
 def detect_insurance_name(message_lower):
@@ -1261,6 +1630,35 @@ def detect_insurance_name(message_lower):
         if ins in message_lower:
             return ins
     return None
+
+
+# Bug fix: previously only matched "through my employer"/"through an
+# employer"/"employer"/"through work"/"work insurance" - so a patient
+# saying their insurance is through a SPOUSE's job/company (e.g.
+# "through my husband's work", "through my wife's company", "through
+# my spouse's job") wasn't recognized as employer-sponsored at all,
+# and got asked a clarifying question the answer to which they'd
+# already given. "employer" alone already covers "my husband's
+# employer" / "my wife's employer" as a substring; the word-boundary
+# check below adds "work", "job", and "company" the same way, without
+# false-matching inside an unrelated word like "network".
+_EMPLOYER_SPONSORED_WORD_PATTERN = re.compile(
+    r"\b(work|job|company)\b", re.IGNORECASE
+)
+
+
+def is_employer_sponsored_insurance_phrasing(message_lower):
+    """True if the message describes employer-sponsored insurance,
+    including insurance obtained through a spouse's employer, job,
+    work, or company."""
+    if any(
+            phrase in message_lower for phrase in [
+                "through my employer", "through an employer", "employer",
+                "through work", "work insurance",
+            ]
+    ):
+        return True
+    return bool(_EMPLOYER_SPONSORED_WORD_PATTERN.search(message_lower))
 
 
 def generate_referral_lookup():
@@ -1288,7 +1686,7 @@ def generate_referral_lookup():
         # Ensure name doesn't repeat by using a fresh random each time
         specialist_name = f"Dr. {first} {last}"
         # Area code always 321 per business rule
-        phone = f"321-{random.randint(100,999)}-{random.randint(1000,9999)}"
+        phone = f"321-{random.randint(100, 999)}-{random.randint(1000, 9999)}"
         return True, specialist_name, phone
     return False, None, None
 
@@ -1333,7 +1731,7 @@ def get_ma_availability():
 def generate_referral_details(patient_pcp=None):
     days_ago = random.randint(1, 30)
     referral_date = (
-        datetime.now() - timedelta(days=days_ago)
+            datetime.now() - timedelta(days=days_ago)
     ).strftime("%B %d, %Y")
     sending_provider = patient_pcp if patient_pcp else random.choice(PROVIDERS)
     reasons = [
@@ -1364,6 +1762,7 @@ def generate_last_visit_date(schedule_num):
     over_12_months = days_since > 365
     needs_appointment = days_since > window or over_12_months
     return last_visit_str, needs_appointment, days_since, over_12_months, window
+
 
 def generate_weekly_availability(force_has_availability=None):
     weekly_schedule = {}
@@ -1550,8 +1949,8 @@ def detect_self_pay_intent(message_lower):
         ]
     )
     return (
-        any(phrase in message_lower for phrase in self_pay_phrases)
-        or knows_not_accepted
+            any(phrase in message_lower for phrase in self_pay_phrases)
+            or knows_not_accepted
     )
 
 
@@ -1649,7 +2048,7 @@ def handle_med_pro_collection(message, message_lower):
         med_pro_referral_looked_up = True
         if med_pro_referral_status == "FOUND":
             med_pro_referral_date, med_pro_referral_provider, \
-            med_pro_referral_reason = generate_referral_details(
+                med_pro_referral_reason = generate_referral_details(
                 patient_pcp=med_pro_patient_pcp
             )
             med_pro_collection_complete = True
@@ -1664,7 +2063,7 @@ def handle_med_pro_collection(message, message_lower):
             f"Is that the referral you are calling about?"
         )
     else:
-        med_pro_collection_complete = True # Mark complete even if not found to allow follow up
+        med_pro_collection_complete = True  # Mark complete even if not found to allow follow up
         return (
             f"One moment while I pull up {patient_full}'s chart. "
             f"(pause) I'm sorry but I was not able to locate a "
@@ -1675,6 +2074,136 @@ def handle_med_pro_collection(message, message_lower):
             f"follow up with you. May I get your fax number and "
             f"best callback number?"
         )
+
+
+def _new_patient_after_consent_response():
+    """Shared completion logic that runs once text-message consent has
+    been determined - either answered directly, or recorded as
+    declined because the second household member wasn't available to
+    answer themselves (see the household_consent_availability stage).
+    Extracted out of the text_consent stage so both paths share it
+    instead of duplicating the appointment-availability logic."""
+    global new_patient_demographics_stage, new_patient_household_stage
+    global new_patient_appointment_selection, new_patient_weekly_schedule
+    global caller_first_name, new_patient_first_name, new_patient_offered_provider
+    global new_patient_household_second_time, new_patient_household_primary_first_name
+    global new_patient_household_relation, new_patient_last_name
+    if (
+            new_patient_household_stage == "secondary"
+            and new_patient_household_second_time
+    ):
+        # Household fix: the time for this household member was
+        # already captured from the original combined scheduling
+        # request (e.g. "...and please schedule my husband for 2:00
+        # PM that same day") - don't present availability and ask
+        # again, just confirm it.
+        new_patient_appointment_selection = new_patient_household_second_time
+        new_patient_demographics_stage = "complete"
+        new_patient_household_stage = "done"
+        # Bug fix: this shortcut confirms the second household
+        # member's appointment directly (skipping the appointment_time
+        # stage entirely), so it needs its own
+        # store_generic_appointment_record() call - the one in the
+        # appointment_time stage never runs for this path.
+        store_generic_appointment_record(
+            new_patient_first_name, new_patient_last_name,
+            new_patient_appointment_selection,
+            provider=new_patient_offered_provider,
+        )
+        address_name = (
+                caller_first_name or new_patient_household_primary_first_name
+        )
+        return (
+            f"Thank you. I have your {new_patient_household_relation} "
+            f"scheduled with {new_patient_offered_provider} for "
+            f"{new_patient_appointment_selection}. You're both all "
+            f"set. Is there anything else I can help you with today?"
+        )
+    new_patient_demographics_stage = "appointment_time"
+    schedule = generate_weekly_availability()
+    # Bug fix (holiday): this workflow calls generate_weekly_availability()
+    # directly and builds its own availability text in Python,
+    # entirely bypassing the availability_context/same_day_context
+    # holiday filtering used by standard scheduling. That existing
+    # filtering works by computing each weekday name's real
+    # calendar date and checking it against the holiday calendar -
+    # mirrored here rather than changed, since generate_weekly_
+    # availability() itself only knows weekday names, not real
+    # dates, and has no way to know which real date a name like
+    # "Monday" resolves to this week.
+    _new_patient_weekday_to_index = {
+        "Monday": 0, "Tuesday": 1, "Wednesday": 2,
+        "Thursday": 3, "Friday": 4,
+    }
+    _new_patient_today = datetime.now()
+    _new_patient_today_index = _new_patient_today.weekday()
+    for _np_day_name, _np_idx in _new_patient_weekday_to_index.items():
+        if _np_day_name not in schedule:
+            continue
+        if _np_idx == _new_patient_today_index:
+            # Bug fix (same-day): new-patient appointments should
+            # never be offered same-day. The spoken response only
+            # ever states a bare weekday name with no date attached
+            # (unlike wellness scheduling, which states a real date),
+            # so if today happens to be, say, Monday, presenting
+            # "Monday: ..." reads as a same-day offer to the caller
+            # even if it were silently resolved to next Monday
+            # internally - exclude today's own weekday entirely
+            # rather than resolve-and-relabel it.
+            schedule[_np_day_name] = []
+            continue
+        _np_delta = (_np_idx - _new_patient_today_index) % 7
+        _np_real_date = (
+                _new_patient_today + timedelta(days=_np_delta)
+        ).date()
+        if is_recognized_office_holiday(_np_real_date):
+            schedule[_np_day_name] = []
+    available_days = [
+        day for day, slots in schedule.items() if slots
+    ]
+    new_patient_weekly_schedule = schedule
+    if available_days:
+        lines = []
+        for day in available_days:
+            slots_str = ", ".join(schedule[day])
+            lines.append(f"{day}: {slots_str}")
+        availability_text = "; ".join(lines)
+        return (
+            f"Great, now let's get an appointment on the books. "
+            f"Here is what we have available this week - "
+            f"{availability_text}. Which day and time works "
+            f"best for you?"
+        )
+    else:
+        new_patient_demographics_stage = "complete"
+        address_name = caller_first_name if caller_first_name else new_patient_first_name
+        return (
+            f"Thank you, {address_name}. I have everything I "
+            f"need to get {new_patient_first_name} set up as a "
+            f"new patient with {new_patient_offered_provider}. "
+            f"We do not have any availability this week, so "
+            f"someone from our office will follow up with you "
+            f"directly to find the best time. Is there anything "
+            f"else I can help you with today?"
+        )
+
+
+def _household_consent_availability_question(relation):
+    """Bug fix: previously the consent question was always addressed
+    to the caller ("do we have YOUR consent to text HIM"), even for a
+    second adult household member - meaning Sarah would be giving SMS
+    consent on Sam's behalf. Consent is now asked of the second person
+    directly whenever they're available on the call."""
+    reflexive = (
+        "himself" if relation == "husband"
+        else "herself" if relation == "wife"
+        else "themselves"
+    )
+    return (
+        f"For the last question, I would need your {relation} to "
+        f"provide consent {reflexive}. Is your {relation} available?"
+    )
+
 
 def handle_new_patient_flow(message, message_lower):
     global new_patient_flow_active, new_patient_requested_provider
@@ -1690,6 +2219,9 @@ def handle_new_patient_flow(message, message_lower):
     global new_patient_street_address, new_patient_email, new_patient_phone
     global new_patient_member_number, new_patient_text_consent
     global new_patient_weekly_schedule, new_patient_appointment_selection
+    global new_patient_household_relation, new_patient_household_stage
+    global new_patient_household_second_time, new_patient_household_primary_first_name
+    global new_patient_household_primary_address
 
     print(f"DEBUG STAGE_ENTRY: message={message_lower!r} "
           f"insurance_type={new_patient_insurance_type!r} "
@@ -1698,15 +2230,33 @@ def handle_new_patient_flow(message, message_lower):
           f"accepting_checked={new_patient_accepting_checked!r} "
           f"offered_provider={new_patient_offered_provider!r}")
 
+    # Bug fix: a caller often states their own name in the very same
+    # message that also identifies them as a new patient (e.g. "This
+    # is Sarah Smith. I'm not a patient yet. I'm looking to schedule
+    # new patient appointments for myself and my spouse..."). Unlike
+    # determine_pre_chart_response() (which never runs for this flow -
+    # new_patient_flow_active short-circuits it entirely), nothing in
+    # handle_new_patient_flow() itself ever looked at a message for a
+    # name until the "name" demographics stage is reached, many turns
+    # later - so a name stated up front was silently discarded, and
+    # the "name" stage re-asked for something already given. Captures
+    # it opportunistically, once, the first time it appears in any
+    # turn's message; the "name" stage skip logic just below uses it.
+    if new_patient_first_name is None:
+        _early_name = extract_names_from_message(message)
+        if _early_name["caller_first"] and _early_name["caller_last"]:
+            new_patient_first_name = _early_name["caller_first"]
+            new_patient_last_name = _early_name["caller_last"]
+
     if detect_self_pay_intent(message_lower):
         new_patient_self_pay_intent = True
 
     if (
-        new_patient_self_pay_intent
-        and not new_patient_requested_provider
-        and not new_patient_accepting_checked
-        and new_patient_insurance_type is None
-        and not new_patient_insurance_collected
+            new_patient_self_pay_intent
+            and not new_patient_requested_provider
+            and not new_patient_accepting_checked
+            and new_patient_insurance_type is None
+            and not new_patient_insurance_collected
     ):
         new_patient_insurance_type = "self_pay_quoted"
         new_patient_insurance_accepted = False
@@ -1752,15 +2302,15 @@ def handle_new_patient_flow(message, message_lower):
     # availability questions first only to be denied afterward. Deny it
     # and quote self-pay immediately, per Don's spec.
     if (
-        new_patient_insurance_type is None
-        and not new_patient_insurance_collected
-        and any(t in message_lower for t in MEDICAID_TRIGGERS)
+            new_patient_insurance_type is None
+            and not new_patient_insurance_collected
+            and any(t in message_lower for t in MEDICAID_TRIGGERS)
     ):
         new_patient_insurance_type = "medicaid_denied"
         new_patient_insurance_collected = False
         return (
-            "I'm sorry but we do not accept Medicaid at this practice. "
-            "I apologize for the inconvenience. " + self_pay_cost_quote_message()
+                "I'm sorry but we do not accept Medicaid at this practice. "
+                "I apologize for the inconvenience. " + self_pay_cost_quote_message()
         )
 
     # Resolve the self-pay follow-up here, before STAGE 1 below gets a
@@ -1769,9 +2319,9 @@ def handle_new_patient_flow(message, message_lower):
     # chosen; STAGE 3B further below still handles the case where
     # Medicaid comes up after a provider has already been selected.
     if (
-        new_patient_insurance_type == "medicaid_denied"
-        and not new_patient_insurance_collected
-        and not new_patient_requested_provider
+            new_patient_insurance_type == "medicaid_denied"
+            and not new_patient_insurance_collected
+            and not new_patient_requested_provider
     ):
         if patient_wants_to_proceed(message_lower):
             new_patient_insurance_collected = True
@@ -1964,13 +2514,13 @@ def handle_new_patient_flow(message, message_lower):
         if any(t in message_lower for t in MEDICARE_ADVANTAGE_TRIGGERS):
             new_patient_insurance_type = "medicare_advantage"
             hf_confirmed = (
-                "health first" in message_lower
-                and not any(
-                    p in message_lower for p in [
-                        "not health first", "isn't health first",
-                        "is not health first", "no it is not", "no it's not",
-                    ]
-                )
+                    "health first" in message_lower
+                    and not any(
+                p in message_lower for p in [
+                    "not health first", "isn't health first",
+                    "is not health first", "no it is not", "no it's not",
+                ]
+            )
             )
             non_hf_ma = any(
                 marker in message_lower for marker in NON_HF_MEDICARE_ADVANTAGE_MARKERS
@@ -2002,16 +2552,8 @@ def handle_new_patient_flow(message, message_lower):
         if commercial_match and new_patient_insurance_type is None:
             new_patient_insurance_name = commercial_match
             if (
-                "commercial" in message_lower
-                or any(
-                    phrase in message_lower for phrase in [
-                        "through my employer",
-                        "through an employer",
-                        "employer",
-                        "through work",
-                        "work insurance",
-                    ]
-                )
+                    "commercial" in message_lower
+                    or is_employer_sponsored_insurance_phrasing(message_lower)
             ):
                 new_patient_insurance_type = "commercial"
                 new_patient_insurance_collected = True
@@ -2199,17 +2741,10 @@ def handle_new_patient_flow(message, message_lower):
         # random fallback behavior.
         new_patient_insurance_type = "commercial"
         new_patient_insurance_collected = True
-        employer_plan = any(
-            phrase in message_lower for phrase in [
-                "through my employer",
-                "through an employer",
-                "employer",
-                "through work",
-            ]
-        )
+        employer_plan = is_employer_sponsored_insurance_phrasing(message_lower)
         known_name_match = (
-            new_patient_insurance_name and
-            detect_insurance_name(new_patient_insurance_name.lower())
+                new_patient_insurance_name and
+                detect_insurance_name(new_patient_insurance_name.lower())
         )
         if employer_plan or known_name_match:
             new_patient_insurance_accepted = True
@@ -2260,13 +2795,13 @@ def handle_new_patient_flow(message, message_lower):
 
     if new_patient_insurance_type == "medicare_advantage" and not new_patient_insurance_collected:
         hf_confirmed = (
-            "health first" in message_lower
-            and not any(
-                p in message_lower for p in [
-                    "not health first", "isn't health first",
-                    "is not health first", "no it is not", "no it's not",
-                ]
-            )
+                "health first" in message_lower
+                and not any(
+            p in message_lower for p in [
+                "not health first", "isn't health first",
+                "is not health first", "no it is not", "no it's not",
+            ]
+        )
         )
         non_hf_ma = any(
             marker in message_lower for marker in NON_HF_MEDICARE_ADVANTAGE_MARKERS
@@ -2325,7 +2860,18 @@ def handle_new_patient_flow(message, message_lower):
     # ---- STAGE 5: Demographics collection (only if insurance accepted) ----
     if new_patient_insurance_accepted and new_patient_insurance_collected:
         if new_patient_demographics_stage is None:
-            new_patient_demographics_stage = "name"
+            if (
+                    not new_patient_is_minor
+                    and new_patient_first_name and new_patient_last_name
+            ):
+                # Bug fix: the caller's name was already captured
+                # earlier in this call (see the opportunistic capture
+                # at the top of this function) - skip the redundant
+                # name question entirely and continue straight to
+                # asking for DOB.
+                new_patient_demographics_stage = "dob"
+            else:
+                new_patient_demographics_stage = "name"
 
         if new_patient_demographics_stage == "name":
             extracted_first, extracted_last = aggressive_name_extraction(message)
@@ -2343,6 +2889,9 @@ def handle_new_patient_flow(message, message_lower):
                         "Thank you. Could I get the patient's date of "
                         "birth?"
                     )
+                if new_patient_household_stage == "secondary":
+                    poss = _household_pronoun_possessive(new_patient_household_relation)
+                    return f"Thank you. Could I get {poss} date of birth?"
                 return "Thank you. Could I get your date of birth?"
             if new_patient_is_minor:
                 return (
@@ -2358,12 +2907,39 @@ def handle_new_patient_flow(message, message_lower):
                 # call (caller) before continuing with address collection.
                 # For adult patients, the caller is the patient — name already collected.
                 if not new_patient_is_minor and new_patient_first_name and new_patient_last_name:
-                    caller_first_name = new_patient_first_name
-                    caller_last_name = new_patient_last_name
+                    # Household fix: don't overwrite the caller's own
+                    # identity with the second household member's name
+                    # while registering them later in the same call.
+                    if new_patient_household_stage != "secondary":
+                        caller_first_name = new_patient_first_name
+                        caller_last_name = new_patient_last_name
+                    if (
+                            new_patient_household_stage == "secondary"
+                            and new_patient_household_primary_address
+                    ):
+                        # Enhancement: most husband/wife new-patient
+                        # scheduling shares one household address -
+                        # ask once instead of unconditionally making
+                        # the caller repeat street/city/state/ZIP that
+                        # was already collected earlier in the same
+                        # call.
+                        new_patient_demographics_stage = "household_same_address"
+                        pronoun_subj = (
+                            "he" if new_patient_household_relation == "husband"
+                            else "she" if new_patient_household_relation == "wife"
+                            else "they"
+                        )
+                        return f"Does {pronoun_subj} live at the same address as you?"
                     new_patient_demographics_stage = "address"
+                    if new_patient_household_stage == "secondary":
+                        poss = _household_pronoun_possessive(new_patient_household_relation)
+                        return f"Thank you. Could I get {poss} street address?"
                     return "Thank you. Could I get your street address?"
                 new_patient_demographics_stage = "caller"
                 return "Thank you. Who am I speaking with today?"
+            if new_patient_household_stage == "secondary":
+                poss = _household_pronoun_possessive(new_patient_household_relation)
+                return f"Could I get {poss} date of birth?"
             return "Could I get your date of birth?"
 
         if new_patient_demographics_stage == "caller":
@@ -2384,115 +2960,221 @@ def handle_new_patient_flow(message, message_lower):
             new_patient_demographics_stage = "address"
             return "Thank you. Could I get your street address?"
 
+        if new_patient_demographics_stage == "household_same_address":
+            if patient_wants_to_decline(message_lower):
+                new_patient_demographics_stage = "address"
+                poss = _household_pronoun_possessive(new_patient_household_relation)
+                return f"Thank you. Could I get {poss} street address?"
+            if patient_wants_to_proceed(message_lower):
+                new_patient_street_address = new_patient_household_primary_address
+                new_patient_demographics_stage = "phone"
+                obj = _household_object_pronoun(new_patient_household_relation)
+                return f"Thank you. What is the best number to reach {obj} at?"
+            pronoun_subj = (
+                "he" if new_patient_household_relation == "husband"
+                else "she" if new_patient_household_relation == "wife"
+                else "they"
+            )
+            return f"Does {pronoun_subj} live at the same address as you?"
+
         if new_patient_demographics_stage == "address":
             new_patient_street_address = message.strip()
             new_patient_demographics_stage = "phone"
+            if new_patient_household_stage == "secondary":
+                obj = _household_object_pronoun(new_patient_household_relation)
+                return f"Thank you. What is the best number to reach {obj} at?"
             return "Thank you. What is the best number to reach you?"
 
         if new_patient_demographics_stage == "phone":
             new_patient_phone = message.strip()
             new_patient_demographics_stage = "email"
+            if new_patient_household_stage == "secondary":
+                poss = _household_pronoun_possessive(new_patient_household_relation)
+                return f"Thank you. Could I get {poss} email address?"
             return "Thank you. Could I get your email address?"
 
         if new_patient_demographics_stage == "email":
             new_patient_email = message.strip()
             if (
-                new_patient_insurance_type == "self_pay_quoted"
-                or new_patient_self_pay_intent
+                    new_patient_insurance_type == "self_pay_quoted"
+                    or new_patient_self_pay_intent
             ):
+                if new_patient_household_stage == "secondary":
+                    new_patient_demographics_stage = "household_consent_availability"
+                    return _household_consent_availability_question(
+                        new_patient_household_relation
+                    )
                 new_patient_demographics_stage = "text_consent"
                 return (
                     "Last question - do we have your consent to text you "
                     "at the number you provided?"
                 )
             new_patient_demographics_stage = "member_number"
+            if new_patient_household_stage == "secondary":
+                poss = _household_pronoun_possessive(new_patient_household_relation)
+                return (
+                    f"Thank you. Could I get the member number for "
+                    f"{poss} insurance?"
+                )
             return (
                 "Thank you. Could I get the member number for your insurance?"
             )
 
         if new_patient_demographics_stage == "member_number":
             if (
-                new_patient_insurance_type == "self_pay_quoted"
-                or new_patient_self_pay_intent
+                    new_patient_insurance_type == "self_pay_quoted"
+                    or new_patient_self_pay_intent
             ):
+                if new_patient_household_stage == "secondary":
+                    new_patient_demographics_stage = "household_consent_availability"
+                    return _household_consent_availability_question(
+                        new_patient_household_relation
+                    )
                 new_patient_demographics_stage = "text_consent"
                 return (
                     "Last question - do we have your consent to text you "
                     "at the number you provided?"
                 )
             new_patient_member_number = message.strip()
+            if new_patient_household_stage == "secondary":
+                new_patient_demographics_stage = "household_consent_availability"
+                return _household_consent_availability_question(
+                    new_patient_household_relation
+                )
             new_patient_demographics_stage = "text_consent"
             return (
                 "Last question - do we have your consent to text you "
                 "at the number you provided?"
             )
 
+        if new_patient_demographics_stage == "household_consent_availability":
+            # Bug fix: previously Sarah (the caller) was asked to give
+            # SMS consent on Sam's behalf, even though he's a separate
+            # adult patient. Ask whether he's available to consent
+            # himself first, matching how consent works for the
+            # primary caller.
+            if patient_wants_to_decline(message_lower):
+                # Not available - record consent as declined but
+                # continue scheduling; consent can be updated later,
+                # same as any other patient who hasn't given consent.
+                new_patient_text_consent = False
+                return _new_patient_after_consent_response()
+            if patient_wants_to_proceed(message_lower):
+                # Bug fix: "Yes" here only confirms the husband is
+                # available in the room - it is Sarah speaking, not a
+                # change of speaker. Explicitly request the transfer
+                # and wait for identity confirmation before treating
+                # any answer as Sam's own.
+                new_patient_demographics_stage = "household_speaker_transfer"
+                full_name = f"{new_patient_first_name} {new_patient_last_name}".strip()
+                return f"Please put {full_name} on the line. I'll wait."
+            return _household_consent_availability_question(
+                new_patient_household_relation
+            )
+
+        if new_patient_demographics_stage == "household_speaker_transfer":
+            # Bug fix: only once the new speaker's identity is
+            # confirmed does Steve treat further answers as coming
+            # from the second patient rather than the caller.
+            identity_confirmed = bool(
+                new_patient_first_name
+                and new_patient_first_name.lower() in message_lower
+            )
+            if identity_confirmed:
+                new_patient_demographics_stage = "text_consent"
+                return (
+                    "Do we have your consent to text you at the number "
+                    "provided?"
+                )
+            full_name = f"{new_patient_first_name} {new_patient_last_name}".strip()
+            return (
+                f"I just want to make sure I'm speaking with "
+                f"{full_name} before continuing. Could you confirm "
+                f"that for me?"
+            )
+
         if new_patient_demographics_stage == "text_consent":
             new_patient_text_consent = any(
                 phrase in message_lower for phrase in proceed_phrases
             )
-            new_patient_demographics_stage = "appointment_time"
-            schedule = generate_weekly_availability()
-            available_days = [
-                day for day, slots in schedule.items() if slots
-            ]
-            new_patient_weekly_schedule = schedule
-            if available_days:
-                lines = []
-                for day in available_days:
-                    slots_str = ", ".join(schedule[day])
-                    lines.append(f"{day}: {slots_str}")
-                availability_text = "; ".join(lines)
-                return (
-                    f"Great, now let's get an appointment on the books. "
-                    f"Here is what we have available this week - "
-                    f"{availability_text}. Which day and time works "
-                    f"best for you?"
-                )
-            else:
-                new_patient_demographics_stage = "complete"
-                address_name = caller_first_name if caller_first_name else new_patient_first_name
-                return (
-                    f"Thank you, {address_name}. I have everything I "
-                    f"need to get {new_patient_first_name} set up as a "
-                    f"new patient with {new_patient_offered_provider}. "
-                    f"We do not have any availability this week, so "
-                    f"someone from our office will follow up with you "
-                    f"directly to find the best time. Is there anything "
-                    f"else I can help you with today?"
-                )
+            return _new_patient_after_consent_response()
 
         if new_patient_demographics_stage == "appointment_time":
-            new_patient_appointment_selection = message.strip()
-            if new_patient_appointment_selection.lower().endswith(" works perfectly"):
-                new_patient_appointment_selection = (
-                    new_patient_appointment_selection[:-len(" works perfectly")]
-                    .rstrip()
-                )
+            primary_slot, second_relation, second_slot = extract_household_scheduling(
+                message, message_lower
+            )
+            new_patient_appointment_selection = primary_slot
             new_patient_demographics_stage = "complete"
+            # Bug fix: this workflow builds its own confirmation text
+            # in Python and returns immediately, so it never reached
+            # the Groq-response-driven store_generic_appointment_record()
+            # call that ordinary (wellness/acute) bookings go through -
+            # new-patient appointments were only ever spoken aloud,
+            # never persisted, so a later "when is my appointment?"
+            # lookup (which reads from that same store) found nothing.
+            store_generic_appointment_record(
+                new_patient_first_name, new_patient_last_name,
+                new_patient_appointment_selection,
+                provider=new_patient_offered_provider,
+            )
             address_name = caller_first_name if caller_first_name else new_patient_first_name
-            return (
+            confirmation = (
                 f"Thank you, {address_name}. I have you all set. "
                 f"You are scheduled with "
                 f"{new_patient_offered_provider} for "
-                f"{new_patient_appointment_selection}. Is there "
-                f"anything else I can help you with today?"
+                f"{new_patient_appointment_selection}."
             )
+            if (
+                    new_patient_household_relation
+                    and second_relation
+                    and new_patient_household_stage == "primary"
+            ):
+                # Bug fix: previously this workflow only ever tracked
+                # a single patient, so a combined request like "...and
+                # please schedule my husband for 2:00 PM" was silently
+                # dropped once the caller's own appointment was
+                # booked. Pivot into registering the second household
+                # member using the exact same demographics sequence
+                # (unchanged), instead of closing the call.
+                new_patient_household_second_time = second_slot
+                new_patient_household_primary_first_name = new_patient_first_name
+                new_patient_household_primary_address = new_patient_street_address
+                new_patient_household_stage = "secondary"
+                new_patient_first_name = None
+                new_patient_last_name = None
+                new_patient_dob = None
+                new_patient_is_minor = None
+                new_patient_street_address = None
+                new_patient_phone = None
+                new_patient_email = None
+                new_patient_member_number = None
+                new_patient_text_consent = None
+                new_patient_demographics_stage = "name"
+                relation_label = new_patient_household_relation
+                poss = _household_pronoun_possessive(relation_label)
+                return (
+                        confirmation + f" I can schedule your {relation_label} "
+                                       f"for {new_patient_household_second_time} to "
+                                       f"establish as a new patient as well, but I would "
+                                       f"need to get {poss} information first. Can I get "
+                                       f"your {relation_label}'s first and last name?"
+                )
+            return confirmation + " Is there anything else I can help you with today?"
 
     if new_patient_demographics_stage == "complete":
         if any(
-            phrase in message_lower for phrase in [
-                "that will be all",
-                "that's all",
-                "that's it",
-                "nothing else",
-                "no i'm good",
-                "no i'm all set",
-                "i'm good",
-                "i'm all set",
-                "all set",
-                "that will do",
-            ]
+                phrase in message_lower for phrase in [
+                    "that will be all",
+                    "that's all",
+                    "that's it",
+                    "nothing else",
+                    "no i'm good",
+                    "no i'm all set",
+                    "i'm good",
+                    "i'm all set",
+                    "all set",
+                    "that will do",
+                ]
         ):
             new_patient_flow_active = False
             return (
@@ -2562,9 +3244,9 @@ def extract_names_from_message(message):
             # dedicated patient self-announce check in the /chat route
             # is responsible for that scenario instead.
             is_patient_self_announce = (
-                patient_first_name and patient_last_name and
-                matched_first.lower() == patient_first_name.lower() and
-                matched_last.lower() == patient_last_name.lower()
+                    patient_first_name and patient_last_name and
+                    matched_first.lower() == patient_first_name.lower() and
+                    matched_last.lower() == patient_last_name.lower()
             )
             if not is_patient_self_announce:
                 result["caller_first"] = matched_first
@@ -2645,13 +3327,19 @@ def determine_pre_chart_response(message, message_lower):
         # rest of pre-chart collection (DOB/PCP order, re-asking for a
         # name already given) instead of following a deterministic order.
         if (
-            extracted["caller_first"]
-            and caller_is_patient is None
-            and not any(phrase in message_lower for phrase in THIRD_PARTY_PHRASES)
+                extracted["caller_first"]
+                and caller_is_patient is None
+                and (
+                not any(phrase in message_lower for phrase in THIRD_PARTY_PHRASES)
+                or _JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower)
+        )
         ):
             caller_is_patient = True
 
-    if any(phrase in message_lower for phrase in THIRD_PARTY_PHRASES):
+    if (
+            any(phrase in message_lower for phrase in THIRD_PARTY_PHRASES)
+            and not _JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower)
+    ):
         caller_is_patient = False
         third_party_detected = True
         if detect_dob_in_message(message):
@@ -2798,12 +3486,12 @@ def determine_pre_chart_response(message, message_lower):
         )
 
     pre_chart_complete = True
-    
+
     # If PHF workflow is active, let Sprint13 handle the response
     # but still allow this function to extract names/DOB into globals
     if Sprint13.phf_flow_active:
         return None
-    
+
     return None
 
 
@@ -3052,43 +3740,37 @@ WORK NOTE / PAPERWORK REQUESTS:
 When the stated reason for the visit is a work note, school note, FMLA
 form, or other documentation to be signed or completed, this is a
 documentation request — handle it separately from a routine
-appointment request.
-0. FIRST check whether the patient has explicitly asked for an
-   APPOINTMENT (e.g. "I need to schedule an appointment", "I need an
-   appointment so my provider can...") with paperwork stated as the
-   REASON for that appointment. If so, this is a normal FUTURE
-   appointment request with paperwork as the reason — treat it exactly
-   like APPOINTMENT SCHEDULING — FUTURE below: do NOT say "Let me
-   check with [MA name] on that", do NOT route through the medical
-   assistant, and do NOT treat this as urgent or requiring office
-   intervention. Go straight to offering availability from the
-   injected weekly availability. Steps 1-4 below, including Step 2's
-   determination, apply ONLY when the patient has asked for paperwork
-   to be completed/signed WITHOUT explicitly requesting an appointment
-   (e.g. "I need a form filled out" with no mention of scheduling).
-   When the patient HAS explicitly asked for an appointment, Step 2's
-   question is ALREADY ANSWERED by the patient's own words — the
-   patient wants an appointment, so do NOT ask whether the provider
-   can complete the paperwork without one, do NOT ask whether it's
-   something to be done "during the visit" versus "a separate
-   request," and do NOT ask any other version of that same
-   without-an-appointment-vs-with-one question. The patient already
-   told you which one they want. THIS OVERRIDE APPLIES FOR THE ENTIRE
-   REST OF THE APPOINTMENT REQUEST, INCLUDING AFTER THE APPOINTMENT IS
-   BOOKED - not only up through offering availability. Once you have
-   booked the appointment, confirm it and ask "Is there anything else
-   I can help you with today?" exactly as you would for any other
-   FUTURE appointment reason, and STOP there. Do NOT append anything
-   from WORK NOTE's own conventions after booking - do NOT name or
-   mention the medical assistant, do NOT say the medical assistant
-   "will be in touch," do NOT promise a link will be sent, and do NOT
-   state a 72-business-hour (or any other) follow-up timeframe. Those
-   conventions belong ONLY to the standalone-paperwork path (Steps 1-4
-   below, patient did not ask for an appointment) and must never be
-   layered on top of a normal booked-appointment confirmation.
-1. Check the OFFICE_CURRENTLY_OPEN / OFFICE_CURRENTLY_CLOSED signal
-   injected by the system for this turn BEFORE saying anything about
-   reaching the medical assistant.
+appointment request, UNLESS the patient has explicitly asked to
+schedule an appointment (paperwork stated only as the reason for that
+appointment, e.g. "I need to schedule an appointment for my provider
+to fill out paperwork"). In that case, skip everything below for this
+entire request — including after the appointment is booked — and
+follow APPOINTMENT SCHEDULING — FUTURE instead, using paperwork as
+the already-known reason: go straight to offering availability, book
+it, and confirm normally once booked. No medical assistant routing,
+no urgency framing, no promised follow-up timeframe, and no
+"without an appointment" question — the patient already answered
+that by asking for one.
+
+Standalone paperwork request (patient did NOT ask for an appointment):
+0. If the patient's message already makes an appointment likely
+   necessary - a stated deadline plus a signature/fill-out
+   requirement, or the patient directly asking whether an appointment
+   is needed - skip the medical assistant determination in Step 1 and
+   go straight to checking PROVIDER appointment availability: the
+   patient's PCP first, then the covering provider if the PCP has
+   nothing suitable. Checking generated calendar availability requires
+   no live person, so it is NOT affected by current office hours and
+   should always be attempted before falling back to a phone message.
+   Only create a phone message and request a callback number (per
+   Step 1's OFFICE_CURRENTLY_CLOSED branch) if NEITHER provider has
+   availability that fits the stated deadline.
+1. Otherwise - the request is genuinely ambiguous about whether an
+   appointment is needed at all (e.g. "I just need a form filled
+   out," no deadline or signature context given) - check the
+   OFFICE_CURRENTLY_OPEN / OFFICE_CURRENTLY_CLOSED signal injected by
+   the system for this turn BEFORE saying anything about reaching the
+   medical assistant.
    - If OFFICE_CURRENTLY_CLOSED: do NOT claim to have reached, or to be
      connecting the patient with, the medical assistant, and do NOT
      attempt a warm transfer. Instead, create an urgent phone message
@@ -3267,7 +3949,7 @@ When a patient or hospital transition team calls to schedule a post-hospital fol
 
 # ─────────────────────────────────────────────
 # Routes
-                                                    # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
 
 @app.route("/")
 def home():
@@ -3298,9 +3980,12 @@ def home():
     global new_patient_street_address, new_patient_email, new_patient_phone
     global new_patient_member_number, new_patient_text_consent
     global new_patient_weekly_schedule, new_patient_appointment_selection
+    global new_patient_household_relation, new_patient_household_stage
+    global new_patient_household_second_time, new_patient_household_primary_first_name
+    global new_patient_household_primary_address
     global lab_result_fax_active
     global lab_result_inquiry_active
-    global contagious_visit_active
+    global contagious_visit_active, contagious_same_day_check_pending
     global virtual_visit_offered
     global provider_callin_offer_pending
     global symptoms_pharmacy_pending
@@ -3316,9 +4001,10 @@ def home():
     global generic_reschedule_pending
     global controlled_substance_appt_pending, controlled_substance_appt_medication_word
     global controlled_substance_appt_schedule, controlled_substance_bridge_awaiting_days
-    global controlled_substance_appt_day_name
+    global controlled_substance_appt_day_name, controlled_substance_appt_date
     global controlled_substance_bridge_awaiting_dosage, controlled_substance_bridge_dosage
     global controlled_substance_bridge_awaiting_pharmacy
+    global controlled_substance_bridge_awaiting_callback, controlled_substance_bridge_callback_number
     global controlled_substance_bridge_confirmed_insufficient
     global ma_request_reason_collected
     global referral_lookup_done, referral_lookup_result
@@ -3337,6 +4023,7 @@ def home():
     lab_result_fax_active = False
     lab_result_inquiry_active = False
     contagious_visit_active = False
+    contagious_same_day_check_pending = False
     virtual_visit_offered = False
     provider_callin_offer_pending = False
     symptoms_pharmacy_pending = False
@@ -3363,9 +4050,12 @@ def home():
     controlled_substance_appt_schedule = None
     controlled_substance_bridge_awaiting_days = False
     controlled_substance_appt_day_name = None
+    controlled_substance_appt_date = None
     controlled_substance_bridge_awaiting_dosage = False
     controlled_substance_bridge_dosage = None
     controlled_substance_bridge_awaiting_pharmacy = False
+    controlled_substance_bridge_awaiting_callback = False
+    controlled_substance_bridge_callback_number = None
     controlled_substance_bridge_confirmed_insufficient = False
     ma_request_active = False
     ma_request_name = None
@@ -3402,6 +4092,11 @@ def home():
     new_patient_text_consent = None
     new_patient_weekly_schedule = None
     new_patient_appointment_selection = None
+    new_patient_household_relation = None
+    new_patient_household_stage = "primary"
+    new_patient_household_second_time = None
+    new_patient_household_primary_first_name = None
+    new_patient_household_primary_address = None
     urgent_symptoms_active = False
     urgent_can_wait_asked = False
     acute_same_day_established = False
@@ -3437,7 +4132,7 @@ def chat():
     global pcp_collected, verbal_consent_requested, response_time_stated
     global office_hours_stated, lab_result_fax_active
     global lab_result_inquiry_active
-    global contagious_visit_active
+    global contagious_visit_active, contagious_same_day_check_pending
     global virtual_visit_offered
     global provider_callin_offer_pending
     global symptoms_pharmacy_pending
@@ -3456,9 +4151,10 @@ def chat():
     global generic_reschedule_pending
     global controlled_substance_appt_pending, controlled_substance_appt_medication_word
     global controlled_substance_appt_schedule, controlled_substance_bridge_awaiting_days
-    global controlled_substance_appt_day_name
+    global controlled_substance_appt_day_name, controlled_substance_appt_date
     global controlled_substance_bridge_awaiting_dosage, controlled_substance_bridge_dosage
     global controlled_substance_bridge_awaiting_pharmacy
+    global controlled_substance_bridge_awaiting_callback, controlled_substance_bridge_callback_number
     global controlled_substance_bridge_confirmed_insufficient
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
@@ -3477,6 +4173,9 @@ def chat():
     global new_patient_street_address, new_patient_email, new_patient_phone
     global new_patient_member_number, new_patient_text_consent
     global new_patient_weekly_schedule, new_patient_appointment_selection
+    global new_patient_household_relation, new_patient_household_stage
+    global new_patient_household_second_time, new_patient_household_primary_first_name
+    global new_patient_household_primary_address
     global urgent_symptoms_active, urgent_can_wait_asked
     global acute_same_day_established
     global ma_availability_determined, current_ma_availability
@@ -3549,8 +4248,8 @@ def chat():
 
     if not Sprint13.phf_caller_type:
         if "hospital" in message_lower and (
-            "transition" in message_lower or "team" in message_lower
-            or "calling from" in message_lower
+                "transition" in message_lower or "team" in message_lower
+                or "calling from" in message_lower
         ):
             Sprint13.phf_caller_type = "hospital_team"
 
@@ -3564,8 +4263,8 @@ def chat():
     # on an already-stated same-day request) doesn't lose the urgency
     # already established.
     if (
-        any(word in message_lower for word in SAME_DAY_KEYWORDS)
-        and any(word in message_lower for word in SAME_DAY_ACTION_WORDS)
+            any(word in message_lower for word in SAME_DAY_KEYWORDS)
+            and any(word in message_lower for word in SAME_DAY_ACTION_WORDS)
     ):
         acute_same_day_established = True
 
@@ -3585,20 +4284,23 @@ def chat():
     # since that flag isn't consumed again until the flow next goes
     # idle (i.e. after the call has already moved on to closing).
     if (
-        not Sprint14.wellness_intent_detected
-        and not Sprint14.wellness_flow_active
+            not Sprint14.wellness_intent_detected
+            and not Sprint14.wellness_flow_active
     ):
         _wellness_intent = Sprint14.detect_wellness_intent(message_lower)
         if _wellness_intent:
             Sprint14.wellness_intent_detected = _wellness_intent
     if (
-        not Sprint14.wellness_flow_active
-        and Sprint14.detect_refill_escalation_intent(message_lower)
+            not Sprint14.wellness_flow_active
+            and Sprint14.detect_refill_escalation_intent(message_lower)
     ):
         Sprint14.refill_intent_detected = True
     if (
-        not Sprint14.wellness_flow_active
-        and Sprint14.detect_lab_order_ehr_intent(message_lower)
+            not Sprint14.wellness_flow_active
+            and (
+            Sprint14.detect_lab_order_ehr_intent(message_lower)
+            or Sprint14.detect_lab_send_request_intent(message_lower)
+    )
     ):
         Sprint14.lab_order_intent_detected = True
 
@@ -3615,14 +4317,14 @@ def chat():
         profanity_count += 1
         if profanity_count == 1:
             warning = ("I am here to help you today, however if the abusive "
-            "language continues I will need to terminate this call.")
+                       "language continues I will need to terminate this call.")
             return jsonify({"response": warning})
         elif profanity_count >= 2:
             profanity_count = 0
             conversation_history.clear()
             termination = ("I am terminating this call due to the abusive "
-            "language. Please call back when you are ready to "
-            "speak respectfully. Goodbye.")
+                           "language. Please call back when you are ready to "
+                           "speak respectfully. Goodbye.")
             return jsonify({"response": termination, "terminated": True})
 
         # --- Medical professional intercept ---
@@ -3686,17 +4388,28 @@ def chat():
             message_lower
         )
         ambiguous_new_patient_phrases = ["is dr.", "is doctor", "does dr.", "does doctor"]
-        unambiguous_match = any(
-            trigger in message_lower for trigger in NEW_PATIENT_TRIGGERS
-            if trigger not in ambiguous_new_patient_phrases
+        existing_new_patient_appt_statement = bool(
+            _EXISTING_NEW_PATIENT_APPOINTMENT_PATTERN.search(message_lower)
+        )
+        unambiguous_match = (
+                any(
+                    trigger in message_lower for trigger in NEW_PATIENT_TRIGGERS
+                    if trigger not in ambiguous_new_patient_phrases
+                )
+                and not existing_new_patient_appt_statement
         )
         ambiguous_match = (
-            any(trigger in message_lower for trigger in ambiguous_new_patient_phrases)
-            and not pcp_statement_pattern
-            and not (pre_chart_complete and caller_is_patient)
+                any(trigger in message_lower for trigger in ambiguous_new_patient_phrases)
+                and not pcp_statement_pattern
+                and not (pre_chart_complete and caller_is_patient)
+                and not existing_new_patient_appt_statement
         )
         if unambiguous_match or ambiguous_match:
             new_patient_flow_active = True
+            if new_patient_household_relation is None:
+                new_patient_household_relation = detect_new_patient_household_relation(
+                    message_lower
+                )
             if any(phrase in message_lower for phrase in [
                 "not a patient", "i'm not a patient", "i am not a patient",
                 "new patient", "become a patient",
@@ -3704,7 +4417,12 @@ def chat():
                 caller_is_patient = False
                 pre_chart_complete = True
 
-    if new_patient_flow_active:
+    if ( new_patient_flow_active
+        and not any(
+                trigger in message_lower
+                for trigger in CANCEL_ACUTE_VISIT_TRIGGERS
+            )
+    ):
         new_patient_response = handle_new_patient_flow(
             user_message, message_lower
         )
@@ -3740,13 +4458,28 @@ def chat():
         # preempting it when identification completes in the same
         # message that also expressed the PHF intent.
         if (
-            pre_chart_complete and not third_party_detected
-            and Sprint13.phf_caller_type != "hospital_team"
-            and not Sprint13.phf_intent_detected
-            and not Sprint13.phf_inquiry_intent_detected
-            and not Sprint14.wellness_intent_detected
-            and not Sprint14.refill_intent_detected
-            and not Sprint14.lab_order_intent_detected
+                pre_chart_complete and not third_party_detected
+                and Sprint13.phf_caller_type != "hospital_team"
+                and not Sprint13.phf_intent_detected
+                and not Sprint13.phf_inquiry_intent_detected
+                and not Sprint14.wellness_intent_detected
+                and not Sprint14.refill_intent_detected
+                and not Sprint14.lab_order_intent_detected
+                # Bug fix: this shortcut fires the moment pre-chart
+                # collection completes, without checking whether the
+                # SAME message that completed it also expressed explicit
+                # appointment-management intent (e.g. "...with Dr. Brooks
+                # and we'd like to reschedule our appointments") - that
+                # intent was silently discarded in favor of a generic
+                # "how can I help you today?" handoff. Mirrors the
+                # existing PHF/wellness/refill/lab-order guards just above.
+                and not any(
+            trigger in message_lower for trigger in (
+                    RESCHEDULE_ACUTE_VISIT_TRIGGERS
+                    + CANCEL_ACUTE_VISIT_TRIGGERS
+                    + QUERY_ACUTE_VISIT_TRIGGERS
+            )
+        )
         ):
             chart_response = "Thank you for that. How can I help you today?"
             conversation_history.append(
@@ -3789,7 +4522,10 @@ def chat():
         elif Sprint13.detect_phf_cancel_intent(message_lower):
             Sprint13.phf_flow_active = True
             Sprint13.phf_cancel_pending = True
-        elif Sprint13.detect_phf_inquiry_intent(message_lower) or Sprint13.phf_inquiry_intent_detected:
+        elif Sprint13.detect_phf_inquiry_intent(message_lower) or Sprint13.phf_inquiry_intent_detected or (
+                detect_generic_appointment_inquiry_intent(message_lower)
+                and Sprint13.get_stored_appointment_record(patient_first_name, patient_last_name)
+        ):
             Sprint13.phf_flow_active = True
             Sprint13.phf_inquiry_pending = True
             Sprint13.phf_inquiry_intent_detected = False
@@ -3826,9 +4562,9 @@ def chat():
     # (pre-chart complete, no PHF or active wellness conversation) so
     # it can't hijack an in-progress flow.
     if (
-        pre_chart_complete and not Sprint13.phf_flow_active
-        and not Sprint14.wellness_flow_active
-        and Sprint14.detect_appointment_lookup_intent(message_lower)
+            pre_chart_complete and not Sprint13.phf_flow_active
+            and not Sprint14.wellness_flow_active
+            and Sprint14.detect_appointment_lookup_intent(message_lower)
     ):
         lookup_response = Sprint14.handle_appointment_lookup(message_lower)
         conversation_history.append(
@@ -3848,8 +4584,8 @@ def chat():
     # generic reschedule/cancel blocks below, so an active wellness
     # conversation can never be hijacked by those unrelated triggers.
     if (
-        pre_chart_complete and not Sprint13.phf_flow_active
-        and not Sprint14.wellness_flow_active
+            pre_chart_complete and not Sprint13.phf_flow_active
+            and not Sprint14.wellness_flow_active
     ):
         if Sprint14.wellness_intent_detected:
             Sprint14.wellness_flow_active = True
@@ -3889,10 +4625,10 @@ def chat():
     # to look up the store) and not Sprint13.phf_flow_active (don't
     # interrupt an active PHF conversation).
     if (
-        pre_chart_complete and not Sprint13.phf_flow_active
-        and not Sprint14.wellness_flow_active
-        and not is_medical_professional_caller
-        and detect_generic_appointment_inquiry_intent(message_lower)
+            pre_chart_complete and not Sprint13.phf_flow_active
+            and not Sprint14.wellness_flow_active
+            and not is_medical_professional_caller
+            and detect_generic_appointment_inquiry_intent(message_lower)
     ):
         lookup_first = patient_first_name or caller_first_name
         lookup_last = patient_last_name or caller_last_name
@@ -3945,9 +4681,9 @@ def chat():
     # generic appointment on file, i.e. zero regression risk to the
     # already-passing acute-visit reschedule/cancel/query scenarios.
     if (
-        pre_chart_complete and not Sprint13.phf_flow_active
-        and not Sprint14.wellness_flow_active
-        and not is_medical_professional_caller
+            pre_chart_complete and not Sprint13.phf_flow_active
+            and not Sprint14.wellness_flow_active
+            and not is_medical_professional_caller
     ):
         lookup_first = patient_first_name or caller_first_name
         lookup_last = patient_last_name or caller_last_name
@@ -3982,7 +4718,7 @@ def chat():
             return jsonify({"response": generic_response})
 
         if existing_generic_record and any(
-            trigger in message_lower for trigger in RESCHEDULE_ACUTE_VISIT_TRIGGERS
+                trigger in message_lower for trigger in RESCHEDULE_ACUTE_VISIT_TRIGGERS
         ):
             schedule = generate_weekly_availability()
             avail_lines = [
@@ -4008,23 +4744,107 @@ def chat():
             )
             return jsonify({"response": generic_response})
 
-        if existing_generic_record and any(
-            trigger in message_lower for trigger in CANCEL_ACUTE_VISIT_TRIGGERS
+        if any(
+                trigger in message_lower for trigger in CANCEL_ACUTE_VISIT_TRIGGERS
         ):
-            cancelled_day = existing_generic_record.get("appointment_day")
-            cancel_generic_appointment_record(lookup_first, lookup_last)
-            generic_response = (
-                f"Your appointment on {cancelled_day} has been "
-                f"cancelled. Is there anything else I can help you with "
-                f"today?"
+            # Bug fix: lookup_first/lookup_last default to
+            # patient_first_name ahead of caller_first_name (see the
+            # RT13/RT14 comment above), and patient_first_name can get
+            # set to a SPOUSE's name mentioned earlier in this very
+            # message (e.g. "Sam Smith ... who is my spouse"). That
+            # silently resolved "cancel our appointments" to only the
+            # spouse's own stored record, mislabeled in the response
+            # as "your appointment." When the message explicitly
+            # states ownership for BOTH ("my appointment is X" and
+            # "his appointment is Y"), cancel each under its correctly
+            # attributed owner instead of defaulting to whichever name
+            # patient_first_name happened to hold.
+            mentions_my_appointment = bool(
+                _MY_APPOINTMENT_OWNERSHIP_PATTERN.search(message_lower)
             )
-            conversation_history.append(
-                {"role": "user", "content": user_message}
+            spouse_appt_match = _SPOUSE_APPOINTMENT_OWNERSHIP_PATTERN.search(
+                message_lower
             )
-            conversation_history.append(
-                {"role": "assistant", "content": generic_response}
-            )
-            return jsonify({"response": generic_response})
+            if (
+                    mentions_my_appointment and spouse_appt_match
+                    and caller_first_name and caller_last_name
+                    and patient_first_name and patient_last_name
+                    and (caller_first_name, caller_last_name)
+                    != (patient_first_name, patient_last_name)
+            ):
+                caller_record = get_stored_generic_appointment_record(
+                    caller_first_name, caller_last_name
+                )
+                spouse_record = get_stored_generic_appointment_record(
+                    patient_first_name, patient_last_name
+                )
+                caller_time = (
+                    caller_record.get("appointment_day") if caller_record else None
+                )
+                spouse_time = (
+                    spouse_record.get("appointment_day") if spouse_record else None
+                )
+                if not caller_time or not spouse_time:
+                    # Bug fix: no separate store_generic_appointment_
+                    # record() call happened for these appointments in
+                    # this session (e.g. the caller is cancelling
+                    # purely from what they just said), so fall back
+                    # to the day/time stated in THIS message rather
+                    # than asking the caller to repeat information
+                    # they already gave.
+                    my_part = message[:spouse_appt_match.start()]
+                    spouse_part = message[spouse_appt_match.start():]
+                    my_day_match = _DAY_NAME_PATTERN.search(my_part)
+                    my_day_name = (
+                        my_day_match.group(1).capitalize() if my_day_match else None
+                    )
+                    if not caller_time:
+                        caller_time = _extract_slot_from_text(my_part)
+                    if not spouse_time:
+                        spouse_time = _extract_slot_from_text(
+                            spouse_part, fallback_day=my_day_name
+                        )
+                cancelled_parts = []
+                if caller_time:
+                    cancel_generic_appointment_record(
+                        caller_first_name, caller_last_name
+                    )
+                    cancelled_parts.append(f"your appointment on {caller_time}")
+                if spouse_time:
+                    cancel_generic_appointment_record(
+                        patient_first_name, patient_last_name
+                    )
+                    cancelled_parts.append(
+                        f"{patient_first_name}'s appointment on {spouse_time}"
+                    )
+                if cancelled_parts:
+                    generic_response = (
+                        f"I've cancelled {' and '.join(cancelled_parts)}. "
+                        f"Is there anything else I can help you with "
+                        f"today?"
+                    )
+                    conversation_history.append(
+                        {"role": "user", "content": user_message}
+                    )
+                    conversation_history.append(
+                        {"role": "assistant", "content": generic_response}
+                    )
+                    return jsonify({"response": generic_response})
+            if existing_generic_record:
+                cancelled_day = existing_generic_record.get("appointment_day")
+                cancel_generic_appointment_record(lookup_first, lookup_last)
+                generic_response = (
+                    f"Your appointment on {cancelled_day} has been "
+                    f"cancelled. Is there anything else I can help you with "
+                    f"today?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": generic_response}
+                )
+                return jsonify({"response": generic_response})
 
     # ─────────────────────────────────────────
     # Controlled-substance appointment bridge follow-up (Scenario 11/12)
@@ -4048,7 +4868,23 @@ def chat():
 
     if controlled_substance_bridge_awaiting_pharmacy:
         controlled_substance_bridge_awaiting_pharmacy = False
+        # Bug #3 fix: previously this step went straight to the final
+        # bridge message with no callback number collected, even though
+        # the bridge request is sent to the provider as a message - the
+        # same kind of high-priority phone message this system already
+        # collects a callback number for elsewhere. Ask for it before
+        # creating the message rather than after.
+        controlled_substance_bridge_awaiting_callback = True
+        callback_response = "What is the best callback number to reach you at?"
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append({"role": "assistant", "content": callback_response})
+        return jsonify({"response": callback_response})
+
+    if controlled_substance_bridge_awaiting_callback:
+        controlled_substance_bridge_awaiting_callback = False
+        controlled_substance_bridge_callback_number = user_message.strip()
         controlled_substance_bridge_dosage = None
+        controlled_substance_bridge_callback_number = None
         bridge_response = (
             "I understand. I will send a bridge-request message to "
             "your provider asking them to authorize enough medication "
@@ -4076,11 +4912,25 @@ def chat():
                 # already told us directly.
                 controlled_substance_bridge_confirmed_insufficient = False
                 controlled_substance_appt_day_name = None
+                controlled_substance_appt_date = None
                 controlled_substance_bridge_awaiting_dosage = True
                 bridge_response = "What dosage do you currently take?"
             else:
                 days_until_appt = None
-                if controlled_substance_appt_day_name:
+                if controlled_substance_appt_date:
+                    # Bug fix: the appointment's actual confirmed date
+                    # (captured at booking time) gives an exact day
+                    # count. Preferred over the weekday-name guess
+                    # below, which assumes the appointment is within
+                    # the next 6 days and silently produces a wrong
+                    # (too-small) count for anything booked further
+                    # out - e.g. a 25-day-out appointment was
+                    # previously computed as 3 days away, which
+                    # incorrectly skipped the bridge request entirely.
+                    days_until_appt = (
+                            controlled_substance_appt_date - datetime.now().date()
+                    ).days
+                elif controlled_substance_appt_day_name:
                     weekday_index = {
                         "monday": 0, "tuesday": 1, "wednesday": 2,
                         "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
@@ -4091,6 +4941,7 @@ def chat():
                         if days_until_appt == 0:
                             days_until_appt = 7
                 controlled_substance_appt_day_name = None
+                controlled_substance_appt_date = None
                 if days_until_appt is not None and days_remaining < days_until_appt:
                     # Bug fix: bridge is needed - collect Dosage, then
                     # Pharmacy, BEFORE creating the bridge message
@@ -4150,6 +5001,7 @@ def chat():
             # to the closing question.
             controlled_substance_bridge_awaiting_days = False
             controlled_substance_appt_day_name = None
+            controlled_substance_appt_date = None
             bridge_response = "Is there anything else I can help you with today?"
             conversation_history.append(
                 {"role": "user", "content": user_message}
@@ -4199,9 +5051,9 @@ def chat():
     # unchanged instead of prematurely ending the call.
 
     if (
-        pre_chart_complete and not Sprint13.phf_flow_active
-        and not is_medical_professional_caller
-        and not new_patient_flow_active
+            pre_chart_complete and not Sprint13.phf_flow_active
+            and not is_medical_professional_caller
+            and not new_patient_flow_active
     ):
         last_assistant_offered_closing = False
         for turn in reversed(conversation_history):
@@ -4348,10 +5200,10 @@ def chat():
     # --- New patient workflow: block LLM from improvising scheduling ---
     if new_patient_flow_active:
         if any(
-            phrase in message_lower for phrase in [
-                "no", "not right now", "no thank you", "not interested",
-                "don't think so", "do not think so",
-            ]
+                phrase in message_lower for phrase in [
+                    "no", "not right now", "no thank you", "not interested",
+                    "don't think so", "do not think so",
+                ]
         ):
             new_patient_flow_active = False
             farewell = "Have a great day."
@@ -4389,9 +5241,9 @@ def chat():
     )
 
     if (
-        not urgent_symptoms_active
-        and acute_same_day_established
-        and (caller_cannot_wait or caller_can_wait)
+            not urgent_symptoms_active
+            and acute_same_day_established
+            and (caller_cannot_wait or caller_can_wait)
     ):
         # Root-cause fix: a chronic-condition (or any non-911-emergency)
         # escalation that already established same-day urgency earlier in
@@ -4407,28 +5259,28 @@ def chat():
         urgent_can_wait_asked = True
 
     caller_answered_wait_question = (
-        not is_medical_professional_caller and
-        urgent_symptoms_active and
-        urgent_can_wait_asked and
-        (caller_cannot_wait or caller_can_wait)
+            not is_medical_professional_caller and
+            urgent_symptoms_active and
+            urgent_can_wait_asked and
+            (caller_cannot_wait or caller_can_wait)
     )
 
     lab_work_detected = (
-        any(trigger in message_lower for trigger in LAB_WORK_TRIGGERS)
-        and not lab_order_pickup
+            any(trigger in message_lower for trigger in LAB_WORK_TRIGGERS)
+            and not lab_order_pickup
     )
 
     hipaa_gate_conditions_met = (
-        third_party_detected and dob_collected and pcp_collected
-        and not is_medical_professional_caller and not caller_is_patient
+            third_party_detected and dob_collected and pcp_collected
+            and not is_medical_professional_caller and not caller_is_patient
     )
     early_hipaa_status = get_hipaa_status() if hipaa_gate_conditions_met else None
     hipaa_cleared_for_disclosure = (
-        caller_is_patient or early_hipaa_status == "ON_HIPAA"
+            caller_is_patient or early_hipaa_status == "ON_HIPAA"
     )
     lab_result_inquiry_detected = (
-        lab_result_inquiry_active and
-        (not third_party_detected or caller_is_patient or hipaa_cleared_for_disclosure)
+            lab_result_inquiry_active and
+            (not third_party_detected or caller_is_patient or hipaa_cleared_for_disclosure)
     )
 
     referral_lookup_triggers = [
@@ -4509,10 +5361,38 @@ def chat():
 
     controlled_substance_schedule = detect_controlled_substance(message_lower)
 
+    # Bug fix: after a contagious patient accepts a virtual visit, Steve
+    # was skipping straight to presenting FUTURE virtual availability
+    # without ever asking whether they need to be seen today. Mirrors
+    # the deterministic yes/no pattern already used for the bridge-
+    # medication questions above, so this decision doesn't depend on
+    # the LLM remembering to ask it. Placed here (rather than at the
+    # point the "virtual visit accepted" injection is built, further
+    # below) so a "yes, today" answer can set acute_same_day_established
+    # BEFORE is_same_day is computed just below, letting the existing,
+    # unmodified same-day / office-hours / covering-provider logic
+    # handle everything else exactly as it already does for any other
+    # same-day request.
+    contagious_present_future_availability = False
+    contagious_same_day_check_just_answered = False
+    if contagious_same_day_check_pending:
+        contagious_same_day_check_pending = False
+        contagious_same_day_check_just_answered = True
+        if _BARE_NEGATIVE_REPLY_PATTERN.match(message_lower) or any(
+                w in message_lower for w in ["wait", "future", "later", "can wait"]
+        ):
+            contagious_present_future_availability = True
+        else:
+            # Covers a bare "yes"/"today" reply and any other answer
+            # that isn't clearly "I can wait" - defaults to treating
+            # ambiguous replies as needing to be seen today, which is
+            # the safer direction for a contagious/urgent complaint.
+            acute_same_day_established = True
+
     is_same_day = (
-        any(word in message_lower for word in SAME_DAY_KEYWORDS)
-        and any(word in message_lower for word in SAME_DAY_ACTION_WORDS)
-    ) or acute_same_day_established
+                          any(word in message_lower for word in SAME_DAY_KEYWORDS)
+                          and any(word in message_lower for word in SAME_DAY_ACTION_WORDS)
+                  ) or acute_same_day_established
 
     # ── Context injections ──
 
@@ -4581,12 +5461,37 @@ def chat():
             f"({OFFICE_HOURS}). Staff, including medical assistants, are "
             "NOT reachable right now. Do NOT say a staff member is "
             "available, reached, or being connected. Do NOT attempt a "
-            "warm transfer. This applies to same-day/immediate needs "
-            "and MA reachability ONLY - it does NOT prevent offering or "
-            "booking a FUTURE appointment. A routine future appointment "
-            "request should still be offered availability and scheduled "
-            "normally regardless of current office hours.\n"
+            "warm transfer. This blocks any REAL-TIME staff consultation "
+            "right now - regardless of whether the underlying request is "
+            "same-day or a future matter (e.g. paperwork due weeks from "
+            "now still cannot be checked with staff live while the "
+            "office is closed). It does NOT block offering or booking "
+            "FUTURE appointment availability, since that requires no "
+            "live staff contact and can proceed normally at any hour.\n"
         )
+
+    # Bug fix: the LLM's only anchor for "what is today's real date"
+    # was the TODAY'S DATE line buried inside availability_context,
+    # which is gated on scheduling-keyword triggers. A message about
+    # an EXISTING appointment (e.g. cancelling one, with no scheduling
+    # keywords) got no date grounding at all, so the LLM invented one -
+    # in one observed case, incorrectly stating a Wednesday was Labor
+    # Day when Labor Day was actually the Monday the call took place
+    # on. Computed unconditionally, like office_hours_context above,
+    # so every turn has an accurate anchor regardless of topic.
+    _todays_holiday_name = get_recognized_office_holiday_name(
+        datetime.now().date()
+    )
+    todays_date_context = (
+            f"TODAY'S ACTUAL DATE INJECTED BY SYSTEM: Today is "
+            f"{datetime.now().strftime('%A, %B %d, %Y')}"
+            + (f" ({_todays_holiday_name}).\n" if _todays_holiday_name else ".\n")
+            + "Resolve any relative date the caller uses (\"today\", "
+              "\"this Wednesday\", \"next Monday\", etc.) against this "
+              "actual date. Never state or assume a different date is "
+              "today, and never guess which date is a holiday - only the "
+              "date above (if a holiday name is shown) is one.\n"
+    )
 
     medical_professional_context = ""
     if is_medical_professional_caller:
@@ -4610,11 +5515,47 @@ def chat():
     # Nurse/MA context — Bug 5 fixed
     nurse_ma_context = ""
     if nurse_ma_requested or ma_name_requested or (ma_request_active and not is_medical_professional_caller):
-        ma_avail = get_ma_availability()
+        nurse_ma_office_closed = not is_office_open_today()
+        if nurse_ma_office_closed:
+            # Holiday-closure fix: mirrors office-closed same-day
+            # handling - do not proceed with the MA-availability
+            # simulation/routing below (which would otherwise say
+            # "let me see if [MA] is available" / "connect you now")
+            # when no staff are actually present, whether that's
+            # because of a weekend or a recognized holiday.
+            holiday_name_today = get_recognized_office_holiday_name(
+                datetime.now().date()
+            )
+            if holiday_name_today:
+                nurse_ma_context = (
+                    f"NURSE_MA_OFFICE_CLOSED_HOLIDAY INJECTED BY SYSTEM:\n"
+                    f"Today is {holiday_name_today}, a recognized office "
+                    f"holiday. No staff are reachable.\n"
+                    f"Say EXACTLY: 'Our office is currently closed in "
+                    f"observance of {holiday_name_today}.'\n"
+                    f"Do NOT say you will check on or connect to a nurse "
+                    f"or medical assistant. Do NOT offer a callback "
+                    f"today.\n"
+                )
+            else:
+                nurse_ma_context = (
+                    f"NURSE_MA_OFFICE_CLOSED_WEEKEND INJECTED BY SYSTEM:\n"
+                    f"Today is a weekend. No staff are reachable.\n"
+                    f"Say: 'I'm sorry, our office is closed today. We "
+                    f"are open {OFFICE_HOURS}.'\n"
+                    f"Do NOT say you will check on or connect to a nurse "
+                    f"or medical assistant. Do NOT offer a callback "
+                    f"today.\n"
+                )
+            ma_avail = False
+        else:
+            ma_avail = get_ma_availability()
         # Use persistent state if available, otherwise use current detection
         effective_ma_name = ma_request_name if ma_request_name else ma_name_requested
         effective_ma_provider = ma_request_provider if ma_request_provider else ma_provider
-        if effective_ma_name and effective_ma_provider:
+        if nurse_ma_office_closed:
+            pass
+        elif effective_ma_name and effective_ma_provider:
             # Patient asked by name — they already know who it is
             if ma_request_reason_collected:
                 # Reason already given - now complete the routing
@@ -4851,51 +5792,51 @@ def chat():
             if turn.get("role") == "assistant":
                 last_assistant_lower = turn.get("content", "").lower()
                 if "virtual visit" in last_assistant_lower and (
-                    "would you" in last_assistant_lower
-                    or "willing" in last_assistant_lower
-                    or "?" in last_assistant_lower
+                        "would you" in last_assistant_lower
+                        or "willing" in last_assistant_lower
+                        or "?" in last_assistant_lower
                 ):
                     virtual_visit_recently_offered = True
                 break
 
     virtual_visit_accepted_now = (
-        virtual_visit_recently_offered
-        and patient_wants_to_proceed(message_lower)
-        and not is_medical_professional_caller
+            virtual_visit_recently_offered
+            and patient_wants_to_proceed(message_lower)
+            and not is_medical_professional_caller
     )
 
     # Sprint 12: patient just accepted checking with Catherine about
     # Elizabeth Horowitz (the covering provider) after their own PCP's
     # MA declined a same-day visit.
     covering_provider_check_accepted_now = (
-        covering_provider_offer_pending
-        and patient_wants_to_proceed(message_lower)
-        and not is_medical_professional_caller
+            covering_provider_offer_pending
+            and patient_wants_to_proceed(message_lower)
+            and not is_medical_professional_caller
     )
 
     covering_provider_check_declined_now = (
-        covering_provider_offer_pending
-        and patient_wants_to_decline(message_lower)
-        and not is_medical_professional_caller
+            covering_provider_offer_pending
+            and patient_wants_to_decline(message_lower)
+            and not is_medical_professional_caller
     )
 
     # Sprint 12: patient just answered whether the provider calling in a
     # medication (instead of an office visit) works for them.
     provider_callin_accepted_now = (
-        provider_callin_offer_pending
-        and patient_wants_to_proceed(message_lower)
-        and not is_medical_professional_caller
+            provider_callin_offer_pending
+            and patient_wants_to_proceed(message_lower)
+            and not is_medical_professional_caller
     )
     provider_callin_declined_now = (
-        provider_callin_offer_pending
-        and patient_wants_to_decline(message_lower)
-        and not is_medical_professional_caller
+            provider_callin_offer_pending
+            and patient_wants_to_decline(message_lower)
+            and not is_medical_professional_caller
     )
 
     same_day_virtual_clinic_declined_now = (
-        same_day_virtual_clinic_offer_pending
-        and patient_wants_to_decline(message_lower)
-        and not is_medical_professional_caller
+            same_day_virtual_clinic_offer_pending
+            and patient_wants_to_decline(message_lower)
+            and not is_medical_professional_caller
     )
 
     # RT13 fix: after Steve asks "What is the reason for the
@@ -4917,29 +5858,31 @@ def chat():
         if turn.get("role") == "assistant":
             last_assistant_lower = turn.get("content", "").lower()
             if (
-                "reason" in last_assistant_lower
-                and "appointment" in last_assistant_lower
-                and "?" in last_assistant_lower
+                    "reason" in last_assistant_lower
+                    and "appointment" in last_assistant_lower
+                    and "?" in last_assistant_lower
             ):
                 appointment_reason_just_requested = True
             break
 
     availability_context = ""
     if (
-        any(word in message_lower for word in [
-            "appointment", "schedule", "available", "availability",
-            "next week", "this week"
-        ])
-        or virtual_visit_accepted_now
-        or same_day_virtual_clinic_declined_now
-        or next_available_options_pending
-        or appointment_reason_just_requested
-    ) and not is_medical_professional_caller:
-        if (
-            not is_same_day or virtual_visit_accepted_now
+            any(word in message_lower for word in [
+                "appointment", "schedule", "available", "availability",
+                "next week", "this week"
+            ])
+            or virtual_visit_accepted_now
             or same_day_virtual_clinic_declined_now
             or next_available_options_pending
             or appointment_reason_just_requested
+            or controlled_substance_schedule
+            or controlled_substance_appt_pending
+    ) and not is_medical_professional_caller:
+        if (
+                not is_same_day or virtual_visit_accepted_now
+                or same_day_virtual_clinic_declined_now
+                or next_available_options_pending
+                or appointment_reason_just_requested
         ):
             forced_pcp_weekly = get_harness_override("STEVE_FORCE_PCP_WEEKLY_AVAILABLE")
             schedule = generate_weekly_availability(force_has_availability=forced_pcp_weekly)
@@ -4950,7 +5893,8 @@ def chat():
                 )
                 if covering_eligible_week:
                     forced_covering_weekly = get_harness_override("STEVE_FORCE_COVERING_WEEKLY_AVAILABLE")
-                    covering_weekly_schedule = generate_weekly_availability(force_has_availability=forced_covering_weekly)
+                    covering_weekly_schedule = generate_weekly_availability(
+                        force_has_availability=forced_covering_weekly)
                     covering_has_availability = any(
                         covering_weekly_schedule.values()
                     )
@@ -5032,23 +5976,45 @@ def chat():
             "Thursday": 3, "Friday": 4,
         }
         _date_lines = []
+        _holiday_days = []
         for _day_name, _idx in _weekday_name_to_index.items():
             _delta = (_idx - _today_weekday_index) % 7
             if _delta == 0:
                 _delta = 7
             _real_date = _today + timedelta(days=_delta)
-            _date_lines.append(
-                f"{_day_name} = {_real_date.strftime('%B %d, %Y')}"
-            )
+            _holiday_name = get_recognized_office_holiday_name(_real_date.date())
+            if _holiday_name:
+                # Bug fix: a computed weekday date can land on a
+                # recognized holiday (e.g. "Monday" resolving to Labor
+                # Day) - that date must never be offered as an
+                # available slot, regardless of what the simulated
+                # weekly schedule above says for that day name.
+                _date_lines.append(
+                    f"{_day_name} = {_real_date.strftime('%B %d, %Y')} "
+                    f"— OFFICE HOLIDAY ({_holiday_name}), NOT AVAILABLE"
+                )
+                _holiday_days.append(_day_name)
+            else:
+                _date_lines.append(
+                    f"{_day_name} = {_real_date.strftime('%B %d, %Y')}"
+                )
         _valid_days_note = (
-            "REAL CALENDAR DATES INJECTED BY SYSTEM — use these EXACT "
-            "dates whenever you state a date to the patient for any of "
-            "the weekday names in the availability above. Do NOT "
-            "calculate, guess, or adjust these dates yourself:\n"
-            + "\n".join(_date_lines) + "\n"
-            "Never state, offer, or confirm any date earlier than "
-            f"today's actual date ({_today.strftime('%B %d, %Y')}).\n"
+                "REAL CALENDAR DATES INJECTED BY SYSTEM — use these EXACT "
+                "dates whenever you state a date to the patient for any of "
+                "the weekday names in the availability above. Do NOT "
+                "calculate, guess, or adjust these dates yourself:\n"
+                + "\n".join(_date_lines) + "\n"
+                                           "Never state, offer, or confirm any date earlier than "
+                                           f"today's actual date ({_today.strftime('%B %d, %Y')}).\n"
         )
+        if _holiday_days:
+            _valid_days_note += (
+                    "The office is closed on any day marked OFFICE HOLIDAY "
+                    "above, regardless of what slots the availability list "
+                    "shows for that day name - do NOT offer, confirm, or "
+                    "mention any time on " + ", ".join(_holiday_days) + " "
+                                                                        "this week.\n"
+            )
         availability_context += (
             f"\nTODAY'S DATE INJECTED BY SYSTEM: Today is "
             f"{_today.strftime('%A, %B %d, %Y')}. Resolve any relative "
@@ -5065,45 +6031,106 @@ def chat():
         office_open_today = is_office_open_today()
         within_office_hours = is_within_office_hours()
         if not office_open_today:
-            next_monday = get_next_monday()
-            covering_eligible = is_visit_eligible_for_covering_provider(
-                message_lower
+            next_monday = get_next_business_day()
+            holiday_name_today = get_recognized_office_holiday_name(
+                datetime.now().date()
             )
-            covering_provider_visit_eligible = covering_eligible
-            if covering_eligible:
-                covering_provider_offer_pending = True
+            if holiday_name_today:
+                # Holiday closures get a distinct, simpler message than
+                # a plain weekend closure - no covering-provider or
+                # virtual-clinic offer, matching the required examples
+                # exactly ("Our office is currently closed in
+                # observance of Labor Day. We will reopen on the next
+                # business day."). NEVER imply staff, PCP, or covering
+                # provider availability on a recognized holiday.
                 same_day_context = (
-                    f"OFFICE_CLOSED_TODAY INJECTED BY SYSTEM:\n"
-                    f"Today is a weekend. Office is CLOSED for your "
-                    f"provider.\n"
-                    f"Next available day: {next_monday}\n"
-                    f"Say: 'I'm sorry but we don't have any same-day "
-                    f"appointments available today with your provider. "
-                    f"I can look to see if the covering provider "
-                    f"{COVERING_PROVIDER_CREDENTIAL} "
-                    f"{COVERING_PROVIDER_BARE_NAME} has any same-day "
-                    f"availability. Alternatively, if you're in need of "
-                    f"immediate attention, I can recommend that you "
-                    f"visit an urgent care center. Would you like me to "
-                    f"see if {COVERING_PROVIDER_BARE_NAME} has any "
-                    f"availability to see you today?'\n"
-                    f"Do NOT mention {next_monday} yet unless the "
-                    f"patient declines checking the covering provider.\n"
-                    f"NEVER offer slots today for the patient's own PCP. "
-                    f"NEVER mention ER.\n"
+                    f"OFFICE_CLOSED_HOLIDAY INJECTED BY SYSTEM:\n"
+                    f"Today is {holiday_name_today}, a recognized office "
+                    f"holiday. Office is CLOSED.\n"
+                    f"Next business day: {next_monday}\n"
+                    f"Say EXACTLY: 'Our office is currently closed in "
+                    f"observance of {holiday_name_today}. We will reopen "
+                    f"on the next business day.'\n"
+                    f"NEVER offer slots today. NEVER mention the covering "
+                    f"provider or medical assistant as available or "
+                    f"checkable today. NEVER mention ER. NEVER imply "
+                    f"staff are reachable today.\n"
                 )
+            elif contagious_visit_active:
+                # Bug fix: the office is fully closed (weekend) - no
+                # provider, PCP or covering, can actually be checked
+                # for in-office same-day availability. The previous
+                # wording ("I can look to see if the covering provider
+                # has any same-day availability") implied in-office
+                # coverage that cannot exist while the office itself is
+                # closed. Mirrors the already-correct weekday-outside-
+                # hours contagious branch below (OFFICE_CLOSED_
+                # CONTAGIOUS_SAME_DAY), which redirects straight to the
+                # Same-Day Virtual Clinic instead of implying any
+                # provider could be checked.
+                same_day_virtual_clinic_offer_pending = True
+                same_day_context = (
+                    f"OFFICE_CLOSED_CONTAGIOUS_SAME_DAY INJECTED BY SYSTEM:\n"
+                    f"Today is a weekend. Office is CLOSED - no medical "
+                    f"assistant, provider, or staff member is reachable "
+                    f"right now.\n"
+                    f"Say: 'I'm sorry, our office is closed today so "
+                    f"I'm not able to check with a medical assistant or "
+                    f"provider right now. Since your symptoms sound "
+                    f"contagious, I can offer you our Same-Day Virtual "
+                    f"Clinic instead. You can reach them directly at "
+                    f"{SAME_DAY_VIRTUAL_CLINIC_PHONE_NUMBER}, available "
+                    f"{SAME_DAY_VIRTUAL_CLINIC_HOURS}. Would you like me "
+                    f"to transfer you there now?'\n"
+                    f"CRITICAL — DO NOT:\n"
+                    f"- Say a medical assistant was contacted or checked.\n"
+                    f"- Say a provider (including the covering provider) "
+                    f"was contacted or checked.\n"
+                    f"- Say availability was checked.\n"
+                    f"- Say office staff were contacted.\n"
+                    f"The office is closed right now — there is no one "
+                    f"to check with.\n"
+                )
+                covering_provider_visit_eligible = False
             else:
-                same_day_context = (
-                    f"OFFICE_CLOSED_TODAY INJECTED BY SYSTEM:\n"
-                    f"Today is a weekend. Office is CLOSED.\n"
-                    f"Next available day: {next_monday}\n"
-                    f"Say: 'I'm sorry but our office is closed today. "
-                    f"We are open Monday through Friday. I would be "
-                    f"happy to schedule you for {next_monday}. If this "
-                    f"cannot wait until Monday I would recommend "
-                    f"visiting your nearest urgent care center.'\n"
-                    f"NEVER offer slots today. NEVER mention ER.\n"
+                covering_eligible = is_visit_eligible_for_covering_provider(
+                    message_lower
                 )
+                covering_provider_visit_eligible = covering_eligible
+                if covering_eligible:
+                    covering_provider_offer_pending = True
+                    same_day_context = (
+                        f"OFFICE_CLOSED_TODAY INJECTED BY SYSTEM:\n"
+                        f"Today is a weekend. Office is CLOSED for your "
+                        f"provider.\n"
+                        f"Next available day: {next_monday}\n"
+                        f"Say: 'I'm sorry but we don't have any same-day "
+                        f"appointments available today with your provider. "
+                        f"I can look to see if the covering provider "
+                        f"{COVERING_PROVIDER_CREDENTIAL} "
+                        f"{COVERING_PROVIDER_BARE_NAME} has any same-day "
+                        f"availability. Alternatively, if you're in need of "
+                        f"immediate attention, I can recommend that you "
+                        f"visit an urgent care center. Would you like me to "
+                        f"see if {COVERING_PROVIDER_BARE_NAME} has any "
+                        f"availability to see you today?'\n"
+                        f"Do NOT mention {next_monday} yet unless the "
+                        f"patient declines checking the covering provider.\n"
+                        f"NEVER offer slots today for the patient's own PCP. "
+                        f"NEVER mention ER.\n"
+                    )
+                else:
+                    same_day_context = (
+                        f"OFFICE_CLOSED_TODAY INJECTED BY SYSTEM:\n"
+                        f"Today is a weekend. Office is CLOSED.\n"
+                        f"Next available day: {next_monday}\n"
+                        f"Say: 'I'm sorry but our office is closed today. "
+                        f"We are open Monday through Friday. I would be "
+                        f"happy to schedule you for {next_monday}. If this "
+                        f"cannot wait until Monday I would recommend "
+                        f"visiting your nearest urgent care center.'\n"
+                        f"NEVER offer slots today. NEVER mention ER.\n"
+                    )
         elif not within_office_hours:
             # RT12: Weekday, but before/after actual office hours (e.g.
             # 5:17 AM). is_office_open_today() alone can't catch this -
@@ -5435,12 +6462,12 @@ def chat():
 
     acute_visit_management_context = ""
     if (
-        pre_chart_complete
-        and caller_is_patient
-        and not is_medical_professional_caller
-        and not acute_reschedule_confirm_was_pending
-        and not acute_cancel_confirm_was_pending
-        and not acute_new_time_was_pending
+            pre_chart_complete
+            and caller_is_patient
+            and not is_medical_professional_caller
+            and not acute_reschedule_confirm_was_pending
+            and not acute_cancel_confirm_was_pending
+            and not acute_new_time_was_pending
     ):
         reschedule_requested = any(
             trigger in message_lower for trigger in RESCHEDULE_ACUTE_VISIT_TRIGGERS
@@ -5611,9 +6638,9 @@ def chat():
                     "office to call you back to go over the results with you.'\n"
                     "Do NOT offer to discuss results yourself.\n"
                     "Do NOT share any details of the results.\n"
-                "Do NOT mention any staff member name.\n"
-                "Steve is NOT a medical professional.\n"
-            )
+                    "Do NOT mention any staff member name.\n"
+                    "Steve is NOT a medical professional.\n"
+                )
         else:
             lab_result_inquiry_context = (
                 "LAB_RESULT_INQUIRY INJECTED BY SYSTEM:\n"
@@ -5697,9 +6724,9 @@ def chat():
             "I can have someone from our clinical team call you back to "
             "answer those questions. May I get a good callback number for you?'\n"
             "Get callback number.\n"
-                "Do NOT mention any staff member name.\n"
-                "Steve is NOT a medical professional.\n"
-            )
+            "Do NOT mention any staff member name.\n"
+            "Steve is NOT a medical professional.\n"
+        )
 
     # Sprint 12: contagious symptom + virtual visit refusal
     # (contagious_visit_active is captured earlier, at the very top of
@@ -5710,9 +6737,9 @@ def chat():
 
     contagious_virtual_refusal_context = ""
     if (
-        contagious_visit_active
-        and virtual_refusal_detected
-        and not is_medical_professional_caller
+            contagious_visit_active
+            and virtual_refusal_detected
+            and not is_medical_professional_caller
     ):
         callin_decision = get_provider_callin_decision()
         contagious_virtual_refusal_context = (
@@ -5745,7 +6772,30 @@ def chat():
         )
         virtual_visit_offered = False
         provider_callin_offer_pending = (callin_decision == "AGREES")
-    elif virtual_visit_accepted_now:
+    elif virtual_visit_accepted_now and not contagious_same_day_check_just_answered:
+        # Bug fix: previously jumped straight to presenting FUTURE
+        # virtual availability the moment the patient accepted a
+        # virtual visit, with no check for same-day urgency. Ask the
+        # missing decision-point question instead; contagious_same_day_
+        # check_pending (handled near is_same_day above) picks up the
+        # patient's answer on the next turn. The "not
+        # contagious_same_day_check_just_answered" guard prevents this
+        # from re-firing on that very next turn - a patient answering
+        # "Yes" to the new question can otherwise also satisfy
+        # virtual_visit_accepted_now's own (separate) detection and
+        # re-ask the same question instead of proceeding.
+        contagious_same_day_check_pending = True
+        contagious_virtual_refusal_context = (
+            "VIRTUAL_VISIT_ACCEPTED INJECTED BY SYSTEM:\n"
+            "The patient just agreed to a virtual visit for their "
+            "contagious complaint. Before presenting any availability, "
+            "ask EXACTLY: 'Do you need to be seen today, or would a "
+            "future virtual visit work for you?' Do NOT present any "
+            "times or say you will check with the medical assistant "
+            "yet - wait for their answer to this question first.\n"
+        )
+        virtual_visit_offered = False
+    elif contagious_present_future_availability:
         contagious_virtual_refusal_context = (
             "VIRTUAL_VISIT_ACCEPTED INJECTED BY SYSTEM:\n"
             "The patient just agreed to a virtual visit for their "
@@ -5797,10 +6847,10 @@ def chat():
             "ask that you bring a face covering.'\n"
         )
     elif (
-        contagious_visit_active
-        and not virtual_visit_offered
-        and not provider_callin_offer_pending
-        and not is_medical_professional_caller
+            contagious_visit_active
+            and not virtual_visit_offered
+            and not provider_callin_offer_pending
+            and not is_medical_professional_caller
     ):
         contagious_virtual_refusal_context = (
             "CONTAGIOUS_OFFER_VIRTUAL INJECTED BY SYSTEM:\n"
@@ -5815,8 +6865,8 @@ def chat():
 
     # Sprint 12: UTI + demanding antibiotic without being seen
     if not is_medical_professional_caller and (
-        any(trigger in message_lower for trigger in UTI_TRIGGERS)
-        and any(trigger in message_lower for trigger in ANTIBIOTIC_DEMAND_TRIGGERS)
+            any(trigger in message_lower for trigger in UTI_TRIGGERS)
+            and any(trigger in message_lower for trigger in ANTIBIOTIC_DEMAND_TRIGGERS)
     ):
         uti_antibiotic_demand_active = True
 
@@ -5913,7 +6963,7 @@ def chat():
         if patient_explicitly_requested_appointment_for_med:
             controlled_substance_appt_pending = True
             controlled_substance_appt_medication_word = (
-                find_controlled_substance_word(message_lower) or "your medication"
+                    find_controlled_substance_word(message_lower) or "your medication"
             )
             controlled_substance_appt_schedule = controlled_substance_schedule
             controlled_substance_context = (
@@ -5980,6 +7030,39 @@ def chat():
                 f"IF NO appointment needed: collect refill info only. "
                 f"Do NOT mention appointments at all.\n"
             )
+            if needs_appointment:
+                # Root cause fix (Bug #1/#2/#4): this branch determined
+                # an appointment was required from the last-visit window
+                # (patient never explicitly asked for one - e.g. a bare
+                # "I need a refill" request) but never set
+                # controlled_substance_appt_pending or told the LLM to
+                # stop after booking. Only the explicit-request branch
+                # above did that, so once the LLM booked this appointment
+                # on its own initiative, the deterministic bridge
+                # follow-up (day-count -> dosage -> pharmacy -> callback
+                # -> bridge message, with its correct 24-business-hour
+                # wording) never engaged, and the LLM freelanced its own
+                # incomplete version instead. Mirrors the explicit-
+                # request branch's pending flag and STOP instruction so
+                # both paths hand off to the same deterministic flow.
+                controlled_substance_appt_pending = True
+                controlled_substance_appt_medication_word = (
+                        find_controlled_substance_word(message_lower) or "your medication"
+                )
+                controlled_substance_appt_schedule = controlled_substance_schedule
+                controlled_substance_context += (
+                    "MEDICATION_BRIDGE_FLOW_ACTIVE - CRITICAL: Once the "
+                    "appointment is booked, confirm it and STOP - do not "
+                    "ask about dosage, pharmacy, days of medication "
+                    "remaining, or bridge-request details in this same "
+                    "response or any response of your own. That entire "
+                    "collection is handled deterministically by Python "
+                    "immediately after booking - it will ask its own "
+                    "follow-up question directly. Do NOT pre-empt it, do "
+                    "NOT combine it with your booking confirmation, and "
+                    "do NOT mention 72 business hours for this "
+                    "request.\n"
+                )
 
     hipaa_context = ""
     if (third_party_detected and dob_collected and
@@ -6022,43 +7105,45 @@ def chat():
     wellness_context = Sprint14.build_context()
 
     system_with_context = (
-        system_prompt + "\n" +
-        pre_chart_context + "\n" +
-        response_time_context + "\n" +
-        office_hours_context + "\n" +
-        medical_professional_context + "\n" +
-        pcp_context + "\n" +
-        nurse_ma_context + "\n" +
-        lab_order_fax_to_facility_context + "\n" +
-        lab_order_pickup_context + "\n" +
-        patient_presence_context + "\n" +
-        lab_work_context + "\n" +
-        lab_result_inquiry_context + "\n" +
-        lab_result_fax_outside_context + "\n" +
-        referral_lookup_context + "\n" +
-        medication_inquiry_context + "\n" +
-        contagious_virtual_refusal_context + "\n" +
-        uti_antibiotic_demand_context + "\n" +
-        same_day_context + "\n" +
-        covering_provider_context + "\n" +
-        same_day_virtual_clinic_context + "\n" +
-        acute_visit_management_context + "\n" +
-        availability_context + "\n" +
-        controlled_substance_context + "\n" +
-        urgent_context + "\n" +
-        hipaa_context + "\n" +
-        phf_context + "\n" +
-        wellness_context
+            system_prompt + "\n" +
+            pre_chart_context + "\n" +
+            response_time_context + "\n" +
+            office_hours_context + "\n" +
+            todays_date_context + "\n" +
+            medical_professional_context + "\n" +
+            pcp_context + "\n" +
+            nurse_ma_context + "\n" +
+            lab_order_fax_to_facility_context + "\n" +
+            lab_order_pickup_context + "\n" +
+            patient_presence_context + "\n" +
+            lab_work_context + "\n" +
+            lab_result_inquiry_context + "\n" +
+            lab_result_fax_outside_context + "\n" +
+            referral_lookup_context + "\n" +
+            medication_inquiry_context + "\n" +
+            contagious_virtual_refusal_context + "\n" +
+            uti_antibiotic_demand_context + "\n" +
+            same_day_context + "\n" +
+            covering_provider_context + "\n" +
+            same_day_virtual_clinic_context + "\n" +
+            acute_visit_management_context + "\n" +
+            availability_context + "\n" +
+            controlled_substance_context + "\n" +
+            urgent_context + "\n" +
+            hipaa_context + "\n" +
+            phf_context + "\n" +
+            wellness_context
     )
 
     messages = [{"role": "system", "content": system_with_context}] + \
-        conversation_history
+               conversation_history
 
     try:
         response = client.chat.completions.create(
             model="qwen/qwen3.6-27b",
             messages=messages,
-            reasoning_effort="none"
+            reasoning_effort="none",
+            max_completion_tokens=900
         )
         assistant_message = response.choices[0].message.content
         conversation_history.append(
@@ -6069,8 +7154,8 @@ def chat():
         if check_office_hours_stated(assistant_message):
             office_hours_stated = True
         if (
-            pre_chart_complete and not is_medical_professional_caller
-            and not Sprint13.phf_flow_active
+                pre_chart_complete and not is_medical_professional_caller
+                and not Sprint13.phf_flow_active
         ):
             confirmed_generic_appt = _extract_generic_appointment_confirmation(
                 assistant_message
@@ -6098,11 +7183,59 @@ def chat():
                     controlled_substance_appt_day_name = (
                         day_match.group(1).capitalize() if day_match else None
                     )
+                    # Bug fix: capture the actual confirmed calendar
+                    # date too (not just the weekday name), so the
+                    # bridge day-math below can use an exact day count
+                    # instead of a weekday-name guess that silently
+                    # breaks for anything booked more than 6 days out.
+                    month_match = re.search(
+                        r"\b(january|february|march|april|may|june|july|"
+                        r"august|september|october|november|december)\s+"
+                        r"(\d{1,2})\b",
+                        assistant_message, re.IGNORECASE
+                    )
+                    controlled_substance_appt_date = None
+                    if month_match:
+                        _month_num = _MONTH_NAME_TO_NUM[month_match.group(1).lower()]
+                        _day_num = int(month_match.group(2))
+                        _today = datetime.now()
+                        try:
+                            _candidate = datetime(_today.year, _month_num, _day_num).date()
+                            if _candidate < _today.date() - timedelta(days=60):
+                                _candidate = datetime(_today.year + 1, _month_num, _day_num).date()
+                            controlled_substance_appt_date = _candidate
+                        except ValueError:
+                            controlled_substance_appt_date = None
                     med_word = controlled_substance_appt_medication_word or "your medication"
+                    # Bug fix: MEDICATION_BRIDGE_FLOW_ACTIVE tells the LLM
+                    # to stop right after confirming the booking, but it
+                    # does not always comply - it has been observed
+                    # tacking on further freelanced sentences in the same
+                    # response (a backwards "we'll call you" callback
+                    # claim, a forbidden "72 business hours" mention, a
+                    # premature "anything else?"). Simply appending the
+                    # deterministic question after that leaves it stuck
+                    # at the end, after the freelanced closing, producing
+                    # a garbled close-then-reopen order. Instead, cut the
+                    # response back to the end of the sentence that
+                    # actually confirms the day/time, discarding
+                    # anything the LLM added after it, then append the
+                    # deterministic question directly after the
+                    # confirmation.
+                    confirm_time_match = re.search(
+                        r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
+                        assistant_message, re.IGNORECASE
+                    )
+                    if confirm_time_match:
+                        cutoff = _find_real_sentence_end(
+                            assistant_message, confirm_time_match.end()
+                        )
+                        if cutoff is not None:
+                            assistant_message = assistant_message[:cutoff].rstrip()
                     assistant_message = (
-                        assistant_message.rstrip()
-                        + f"\n\nDo you have enough {med_word} remaining "
-                        + "to hold you over until your appointment?"
+                            assistant_message.rstrip()
+                            + f"\n\nDo you have enough {med_word} remaining "
+                            + "to hold you over until your appointment?"
                     )
                     conversation_history[-1]["content"] = assistant_message
                     controlled_substance_bridge_awaiting_days = True
@@ -6113,6 +7246,7 @@ def chat():
     except Exception as e:
         print(f"Groq API error: {e}")
         return jsonify({"response": f"Error: {str(e)}"})
+
 
 if __name__ == "__main__":
     app.run(debug=True)
