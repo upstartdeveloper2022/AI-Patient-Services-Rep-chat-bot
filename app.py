@@ -138,6 +138,30 @@ acute_new_time_pending = False
 # pending flags above, scoped to routine future appointments stored in
 # generic_appointment_records instead of the simulated acute visit.
 generic_reschedule_pending = False
+generic_joint_cancel_pending = False
+# Spouse leg of a generic reschedule: the caller asked to move a
+# spouse's appointment too, but the office cannot pull up/change the
+# spouse's record without first collecting their first and last name
+# and date of birth. The caller's own slot is stored immediately; the
+# spouse's slot is held here until that identity is collected on a
+# later turn.
+generic_spouse_reschedule_pending = False
+generic_spouse_reschedule_slot = None
+generic_spouse_reschedule_relation = None
+
+# Established-couple routine six-month follow-up workflow.
+couple_followup_flow_active = False
+couple_followup_previous_visit_date = None
+couple_followup_available_pairs = None
+individual_six_month_followup_active = False
+individual_six_month_followup_previous_visit_date = None
+individual_six_month_followup_days_since = None
+individual_six_month_followup_eligible = None
+individual_six_month_followup_spouse_stage = None
+individual_six_month_followup_spouse_slot = None
+individual_six_month_followup_spouse_relation = None
+individual_six_month_followup_spouse_first_name = None
+individual_six_month_followup_spouse_last_name = None
 
 # Controlled-substance appointment bridge follow-up (Scenario 11/12).
 # Set when a patient explicitly requests an appointment with a named
@@ -393,7 +417,7 @@ THIRD_PARTY_PHRASES = [
 _JOINT_APPOINTMENT_REFERENCE_PATTERN = re.compile(
     r"\bmy\s+(?:husband|wife|spouse|son|daughter|partner)\b"
     r"(?:\s+\w+){0,3}\s+and\s+(?:i|myself)\s+(?:both\s+)?"
-    r"(?:have|has|are|am|would\s+like\s+to|want\s+to|need\s+to)\b"
+    r"(?:have|has|are|am|would\s+like\s+to|want\s+to|need|need\s+to)\b"
     r"|\bwe\s+both\s+have\b"
     r"|\bwe\s+are\s+(?:both\s+)?(?:already\s+)?scheduled\b"
     # Bug fix: "my spouse and myself would like to cancel our new
@@ -796,6 +820,25 @@ _GENERIC_APPT_CONFIRM_KEYWORDS = [
     "we have you down", "put you down for",
 ]
 
+# Availability-offer markers: when the AI is presenting a menu of open
+# slots (rather than confirming a single booking) the text is NOT a
+# confirmation, even though it can contain words like "scheduled"
+# alongside a weekday and a time. Capturing such a listing as a
+# "confirmed" appointment would store a phantom record and prematurely
+# close flows - e.g. the six-month follow-up eligibility message offers
+# "scheduled" availability, and the false "Monday @ 9:00 AM" capture
+# deactivated individual_six_month_followup_active before the
+# deterministic spouse scheduler could engage.
+_GENERIC_APPT_AVAILABILITY_OFFER_PATTERN = re.compile(
+    r"which\s+of\s+these|"
+    r"which\s+(?:day|time|one|date|option)\s+(?:works|work|would|is\s+best)|"
+    r"no\s+availability\b|"
+    r"here(?:'s| is)?\s+(?:your\s+|our\s+|the\s+)?availability|"
+    r"available\s+(?:times|slots|days?)\b|"
+    r"(?:times?|slots?|days?)\s+(?:are|is)\s+available",
+    re.IGNORECASE,
+)
+
 _MONTH_NAME_TO_NUM = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
     "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
@@ -839,6 +882,13 @@ def _extract_generic_appointment_confirmation(assistant_text):
     day/time in passing (e.g. listing availability options, not yet
     confirming one)."""
     text_lower = assistant_text.lower()
+    if _GENERIC_APPT_AVAILABILITY_OFFER_PATTERN.search(text_lower):
+        return None
+    distinct_days = sum(
+        1 for day in _GENERIC_APPT_DAY_NAMES if day in text_lower
+    )
+    if distinct_days >= 2:
+        return None
     if not any(day in text_lower for day in _GENERIC_APPT_DAY_NAMES):
         return None
     if not any(kw in text_lower for kw in _GENERIC_APPT_CONFIRM_KEYWORDS):
@@ -1478,7 +1528,19 @@ _TIME_HOUR_ONLY_PATTERN = re.compile(
     r"\b(\d{1,2})\s*(am|pm)\b", re.IGNORECASE
 )
 _HOUSEHOLD_SECOND_APPT_PATTERN = re.compile(
-    r"\b(?:schedule|book)\s+my\s+(husband|wife|spouse)\b", re.IGNORECASE
+    r"\b(?:schedule|book)\s+my\s+(husband|wife|spouse)\b"
+    r"|\band\s+my\s+(husband|wife|spouse)\b", re.IGNORECASE
+)
+# Bug fix: the household pattern above needs a word boundary before
+# "schedule", so it never matches "Please REschedule my wife for..." -
+# and the generic reschedule reply handler had no spouse handling at
+# all, so a request to move a spouse's appointment in the same message
+# was silently dropped. This pattern recognizes the reschedule
+# phrasing and is used to split the caller's own pick from the
+# spouse's pick.
+_SPOUSE_RESCHEDULE_PATTERN = re.compile(
+    r"\b(?:schedule|book|reschedule)\s+my\s+(husband|wife|spouse)\b"
+    r"|\band\s+my\s+(husband|wife|spouse)\b", re.IGNORECASE
 )
 
 
@@ -1511,6 +1573,84 @@ def _extract_slot_from_text(text, fallback_day=None):
     return f"{day_name} {time_str}"
 
 
+def _parse_calendar_date_from_text(text):
+    """Extracts a concrete calendar date from text (e.g. the stored
+    slot string 'September 30, 2026 @ 9:00 AM' or a reply like
+    'October 5 at 9AM') as a datetime.date, or None. Year defaults to
+    the current year (rolled forward when that resolves clearly into
+    the past). Shared by _extract_calendar_date_slot_from_text()
+    (scheduling) and the generic reschedule flow, which must never
+    offer rescheduled slots earlier than the stored calendar-dated
+    appointment."""
+    date_match = re.search(
+        r"\b(january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\s+(\d{1,2})"
+        r"(?:st|nd|rd|th)?(?:,?\s+(\d{2,4}))?\b",
+        text, re.IGNORECASE
+    )
+    if not date_match:
+        return None
+    month_num = _MONTH_NAME_TO_NUM[date_match.group(1).lower()]
+    day_num = int(date_match.group(2))
+    year_str = date_match.group(3)
+    if year_str:
+        year = int(year_str)
+        if year < 100:
+            year += 2000
+    else:
+        year = datetime.now().year
+    try:
+        candidate = datetime(year, month_num, day_num).date()
+    except ValueError:
+        return None
+    if candidate < datetime.now().date() - timedelta(days=60):
+        year += 1
+        try:
+            candidate = datetime(year, month_num, day_num).date()
+        except ValueError:
+            return None
+    return candidate
+
+
+def _next_monday_on_or_after(reference_date):
+    """First Monday on or after a reference date. Monday has
+    weekday() == 0, so (0 - weekday) % 7 is 0 for a reference date
+    that is already a Monday (returned unchanged), 1 for a Sunday
+    (next day), and so on."""
+    return reference_date + timedelta(days=(0 - reference_date.weekday()) % 7)
+
+
+def _calendar_slot_from_date(reference_date, time_str):
+    """Joins a concrete date and a normalized time string into a
+    calendar slot (e.g. date(2026, 10, 5) + '1:00 PM' ->
+    'October 05, 2026 @ 1:00 PM'). Shared by the calendar-slot parser
+    and the reschedule reply handler (which builds a spouse's slot as
+    the caller's picked date + the spouse's time)."""
+    return (
+        f"{reference_date.strftime('%B')} "
+        f"{reference_date.strftime('%d')}, {reference_date.year} @ {time_str}"
+    )
+
+
+def _extract_calendar_date_slot_from_text(text):
+    """Parses a concrete calendar date + time (e.g. 'October 5th at 9AM')
+    into a slot string. The individual six-month follow-up flow offers
+    appointments as calendar dates ('Monday, October 05, 2026') - never
+    weekday names - so a caller naturally picks by date and
+    _extract_slot_from_text (weekday-based) finds nothing, silently
+    dropping the caller's own booking in the household-scheduling
+    machine. Handles 'Month D', 'Month Dth', 'Month D, YYYY', and
+    'Month D YYYY', defaulting the year to the current year (rolled
+    forward when that resolves clearly into the past). Returns None if
+    no month/date or time is found, mirroring _extract_slot_from_text's
+    contract."""
+    time_str = _find_time_in_text(text)
+    candidate = _parse_calendar_date_from_text(text)
+    if not time_str or candidate is None:
+        return None
+    return _calendar_slot_from_date(candidate, time_str)
+
+
 def extract_household_scheduling(message, message_lower):
     """Bug fix: the appointment_time stage previously stored the
     entire raw sentence as the appointment slot instead of parsing it
@@ -1535,7 +1675,7 @@ def extract_household_scheduling(message, message_lower):
     second_relation = None
     second_slot = None
     if second_match:
-        second_relation = second_match.group(1).lower()
+        second_relation = (second_match.group(1) or second_match.group(2)).lower()
         primary_day_match = _DAY_NAME_PATTERN.search(primary_text)
         primary_day_name = (
             primary_day_match.group(1).capitalize() if primary_day_match else None
@@ -1762,6 +1902,96 @@ def generate_last_visit_date(schedule_num):
     over_12_months = days_since > 365
     needs_appointment = days_since > window or over_12_months
     return last_visit_str, needs_appointment, days_since, over_12_months, window
+
+
+def is_six_month_followup_request(message_lower):
+    return any(
+        phrase in message_lower for phrase in [
+            "6 month follow up", "6-month follow up",
+            "six month follow up", "six-month follow up",
+            "6 month follow-up", "6-month follow-up",
+            "six month follow-up", "six-month follow-up",
+        ]
+    )
+
+
+def is_couple_six_month_followup_request(message_lower):
+    return (
+        bool(_JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower))
+        and is_six_month_followup_request(message_lower)
+    )
+
+
+def generate_couple_followup_previous_visit_date():
+    """Generate one shared prior visit that makes both spouses eligible
+    for their routine six-month follow-up."""
+    return (datetime.now() - timedelta(days=random.randint(180, 365))).strftime(
+        "%B %d, %Y"
+    )
+
+
+def generate_couple_followup_availability():
+    """Return routine follow-up slots as adjacent spouse appointment pairs."""
+    pairs = []
+    for day in random.sample(DAYS_OF_WEEK, 4):
+        for index, first_time in enumerate(AVAILABLE_TIMES[:-1]):
+            first_dt = datetime.strptime(first_time, "%I:%M %p")
+            second_time = AVAILABLE_TIMES[index + 1]
+            second_dt = datetime.strptime(second_time, "%I:%M %p")
+            if (second_dt - first_dt).seconds == 30 * 60:
+                pairs.append((day, first_time, second_time))
+                break
+    return pairs
+
+
+def handle_couple_six_month_followup_flow(message):
+    global couple_followup_flow_active, couple_followup_previous_visit_date
+    global couple_followup_available_pairs
+    global individual_six_month_followup_active
+    global individual_six_month_followup_previous_visit_date
+    global individual_six_month_followup_days_since
+    global individual_six_month_followup_eligible
+    global individual_six_month_followup_spouse_stage
+    global individual_six_month_followup_spouse_slot
+    global individual_six_month_followup_spouse_relation
+    global individual_six_month_followup_spouse_first_name
+    global individual_six_month_followup_spouse_last_name
+
+    if couple_followup_previous_visit_date is None:
+        couple_followup_previous_visit_date = generate_couple_followup_previous_visit_date()
+    if couple_followup_available_pairs is None:
+        couple_followup_available_pairs = generate_couple_followup_availability()
+        choices = "; ".join(
+            f"{day}: {first_time} and {second_time}"
+            for day, first_time, second_time in couple_followup_available_pairs
+        )
+        return (
+            f"Your shared previous appointment was on "
+            f"{couple_followup_previous_visit_date}, so you are both due "
+            f"for a six-month follow-up. I can schedule you back-to-back: "
+            f"{choices}. Which day and starting time works best?"
+        )
+
+    selected_slot = _extract_slot_from_text(message)
+    if selected_slot:
+        for day, first_time, second_time in couple_followup_available_pairs:
+            if selected_slot == f"{day} {first_time}":
+                store_generic_appointment_record(
+                    caller_first_name, caller_last_name,
+                    f"{day} {first_time}",
+                )
+                store_generic_appointment_record(
+                    patient_first_name, patient_last_name,
+                    f"{day} {second_time}",
+                )
+                couple_followup_flow_active = False
+                return (
+                    f"Based on your shared previous appointment on "
+                    f"{couple_followup_previous_visit_date}, I have you "
+                    f"scheduled for {day} {first_time} and "
+                    f"{patient_first_name} scheduled for {day} {second_time}."
+                )
+    return "Please choose one of the offered days and starting times."
 
 
 def generate_weekly_availability(force_has_availability=None):
@@ -2564,6 +2794,9 @@ def handle_new_patient_flow(message, message_lower):
                         "get the first and last name of the patient we "
                         "will be scheduling the appointment for?"
                     )
+                if new_patient_first_name and new_patient_last_name:
+                    new_patient_demographics_stage = "dob"
+                    return "We do accept that insurance. Could I get your date of birth?"
                 return (
                     "Great news, we do accept that insurance. Could I get "
                     "your first and last name to get started?"
@@ -2924,12 +3157,10 @@ def handle_new_patient_flow(message, message_lower):
                         # was already collected earlier in the same
                         # call.
                         new_patient_demographics_stage = "household_same_address"
-                        pronoun_subj = (
-                            "he" if new_patient_household_relation == "husband"
-                            else "she" if new_patient_household_relation == "wife"
-                            else "they"
+                        return (
+                            f"Does your {new_patient_household_relation} live "
+                            "at the same address as you?"
                         )
-                        return f"Does {pronoun_subj} live at the same address as you?"
                     new_patient_demographics_stage = "address"
                     if new_patient_household_stage == "secondary":
                         poss = _household_pronoun_possessive(new_patient_household_relation)
@@ -2970,12 +3201,10 @@ def handle_new_patient_flow(message, message_lower):
                 new_patient_demographics_stage = "phone"
                 obj = _household_object_pronoun(new_patient_household_relation)
                 return f"Thank you. What is the best number to reach {obj} at?"
-            pronoun_subj = (
-                "he" if new_patient_household_relation == "husband"
-                else "she" if new_patient_household_relation == "wife"
-                else "they"
+            return (
+                f"Does your {new_patient_household_relation} live "
+                "at the same address as you?"
             )
-            return f"Does {pronoun_subj} live at the same address as you?"
 
         if new_patient_demographics_stage == "address":
             new_patient_street_address = message.strip()
@@ -3998,7 +4227,11 @@ def home():
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
-    global generic_reschedule_pending
+    global generic_reschedule_pending, generic_joint_cancel_pending
+    global generic_spouse_reschedule_pending
+    global generic_spouse_reschedule_slot, generic_spouse_reschedule_relation
+    global couple_followup_flow_active, couple_followup_previous_visit_date
+    global couple_followup_available_pairs
     global controlled_substance_appt_pending, controlled_substance_appt_medication_word
     global controlled_substance_appt_schedule, controlled_substance_bridge_awaiting_days
     global controlled_substance_appt_day_name, controlled_substance_appt_date
@@ -4045,6 +4278,22 @@ def home():
     acute_cancel_confirm_pending = False
     acute_new_time_pending = False
     generic_reschedule_pending = False
+    generic_joint_cancel_pending = False
+    generic_spouse_reschedule_pending = False
+    generic_spouse_reschedule_slot = None
+    generic_spouse_reschedule_relation = None
+    couple_followup_flow_active = False
+    couple_followup_previous_visit_date = None
+    couple_followup_available_pairs = None
+    individual_six_month_followup_active = False
+    individual_six_month_followup_previous_visit_date = None
+    individual_six_month_followup_days_since = None
+    individual_six_month_followup_eligible = None
+    individual_six_month_followup_spouse_stage = None
+    individual_six_month_followup_spouse_slot = None
+    individual_six_month_followup_spouse_relation = None
+    individual_six_month_followup_spouse_first_name = None
+    individual_six_month_followup_spouse_last_name = None
     controlled_substance_appt_pending = False
     controlled_substance_appt_medication_word = None
     controlled_substance_appt_schedule = None
@@ -4148,7 +4397,20 @@ def chat():
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
-    global generic_reschedule_pending
+    global generic_reschedule_pending, generic_joint_cancel_pending
+    global generic_spouse_reschedule_pending
+    global generic_spouse_reschedule_slot, generic_spouse_reschedule_relation
+    global couple_followup_flow_active, couple_followup_previous_visit_date
+    global couple_followup_available_pairs
+    global individual_six_month_followup_active
+    global individual_six_month_followup_previous_visit_date
+    global individual_six_month_followup_days_since
+    global individual_six_month_followup_eligible
+    global individual_six_month_followup_spouse_stage
+    global individual_six_month_followup_spouse_slot
+    global individual_six_month_followup_spouse_relation
+    global individual_six_month_followup_spouse_first_name
+    global individual_six_month_followup_spouse_last_name
     global controlled_substance_appt_pending, controlled_substance_appt_medication_word
     global controlled_substance_appt_schedule, controlled_substance_bridge_awaiting_days
     global controlled_substance_appt_day_name, controlled_substance_appt_date
@@ -4190,6 +4452,28 @@ def chat():
 
     user_message = request.json.get("message")
     message_lower = user_message.lower()
+
+    if (
+            "cancel" in message_lower
+            and re.search(r"\bour\s+new[\s-]patient\s+appointments?\b", message_lower)
+            and _JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower)
+    ):
+        generic_joint_cancel_pending = True
+
+    if is_couple_six_month_followup_request(message_lower):
+        couple_followup_flow_active = True
+    elif is_six_month_followup_request(message_lower):
+        individual_six_month_followup_active = True
+        if individual_six_month_followup_previous_visit_date is None:
+            individual_six_month_followup_eligible = random.random() >= 0.60
+            individual_six_month_followup_days_since = random.randint(
+                180, 365
+            ) if individual_six_month_followup_eligible else random.randint(1, 179)
+            individual_six_month_followup_previous_visit_date = (
+                datetime.now() - timedelta(
+                    days=individual_six_month_followup_days_since
+                )
+            ).strftime("%B %d, %Y")
 
     # Capture "wants lab results" intent the moment it is ever stated,
     # even if this turn's message gets intercepted by an earlier-return
@@ -4465,6 +4749,7 @@ def chat():
                 and not Sprint14.wellness_intent_detected
                 and not Sprint14.refill_intent_detected
                 and not Sprint14.lab_order_intent_detected
+                and not couple_followup_flow_active
                 # Bug fix: this shortcut fires the moment pre-chart
                 # collection completes, without checking whether the
                 # SAME message that completed it also expressed explicit
@@ -4491,6 +4776,148 @@ def chat():
             return jsonify({"response": chart_response})
 
     # ── Sprint 13: Post Hospital Follow-Up Workflow ──
+    if (
+            couple_followup_flow_active and pre_chart_complete
+            and not is_medical_professional_caller
+    ):
+        couple_followup_response = handle_couple_six_month_followup_flow(
+            user_message
+        )
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append(
+            {"role": "assistant", "content": couple_followup_response}
+        )
+        return jsonify({"response": couple_followup_response})
+
+    if (
+            individual_six_month_followup_active
+            and pre_chart_complete
+            and not is_medical_professional_caller
+    ):
+        spouse_response = None
+        if individual_six_month_followup_spouse_stage == "name":
+            spouse_first, spouse_last = aggressive_name_extraction(user_message)
+            if not spouse_first or not spouse_last:
+                parts = user_message.strip().split()
+                if len(parts) >= 2:
+                    spouse_first, spouse_last = parts[0], parts[1]
+            if spouse_first and spouse_last:
+                individual_six_month_followup_spouse_first_name = spouse_first
+                individual_six_month_followup_spouse_last_name = spouse_last
+                individual_six_month_followup_spouse_stage = "dob"
+                possessive = _household_pronoun_possessive(
+                    individual_six_month_followup_spouse_relation
+                )
+                spouse_response = f"Thank you. Could I get {possessive} date of birth?"
+            else:
+                spouse_response = "What is her first and last name?"
+        elif individual_six_month_followup_spouse_stage == "dob":
+            if detect_dob_in_message(user_message):
+                individual_six_month_followup_spouse_stage = "pcp"
+                spouse_first = individual_six_month_followup_spouse_first_name
+                spouse_pcp = get_patient_pcp_from_history()
+                if spouse_pcp:
+                    spouse_response = (
+                        f"Thank you. Just to confirm, is {spouse_first} "
+                        f"also seeing {spouse_pcp}?"
+                    )
+                else:
+                    spouse_response = (
+                        f"Thank you. Does {spouse_first} also see the "
+                        f"same primary care provider as you?"
+                    )
+            else:
+                possessive = _household_pronoun_possessive(
+                    individual_six_month_followup_spouse_relation
+                )
+                spouse_response = f"Could I get {possessive} date of birth?"
+        elif individual_six_month_followup_spouse_stage == "pcp":
+            store_generic_appointment_record(
+                individual_six_month_followup_spouse_first_name,
+                individual_six_month_followup_spouse_last_name,
+                individual_six_month_followup_spouse_slot,
+            )
+            individual_six_month_followup_active = False
+            individual_six_month_followup_spouse_stage = None
+            spouse_response = (
+                f"Thank you. I have {individual_six_month_followup_spouse_first_name} "
+                f"scheduled for {individual_six_month_followup_spouse_slot}. "
+                f"Is there anything else I can help you with today?"
+            )
+        else:
+            primary_slot, spouse_relation, spouse_slot = extract_household_scheduling(
+                user_message, message_lower
+            )
+            # Bug fix (household follow-up question order): this
+            # six-month follow-up flow offers appointments as calendar
+            # dates ("March 09, 2027"), never weekday names, so the slot
+            # extraction above cannot find a day and spouse_slot comes
+            # back None even when the caller clearly added a spouse
+            # request ("...please schedule my wife for 10:30 AM that
+            # same day"). The turn then fell through to the AI, which
+            # improvised the spouse collection in the wrong order
+            # (asking for her date of birth before her first and last
+            # name) and re-asked whether the spouse sees the same PCP.
+            # Fall back to a time-only slot parsed from the spouse
+            # portion of the message so the deterministic name-first ->
+            # DOB -> schedule machine below still engages for this
+            # household request, preserving the household context.
+            if spouse_relation and not spouse_slot:
+                _spouse_match = _HOUSEHOLD_SECOND_APPT_PATTERN.search(message_lower)
+                if _spouse_match:
+                    spouse_time = _find_time_in_text(
+                        user_message[_spouse_match.start():]
+                    )
+                    if spouse_time:
+                        spouse_slot = spouse_time
+            # Bug fix (primary slot lost on calendar-date phrasing):
+            # the caller's OWN slot suffers the same weekday-extraction
+            # failure the spouse slot just fell back from - this flow
+            # offers calendar dates ("October 05, 2026"), so a caller
+            # picking "October 5 at 9AM" leaves primary_slot at its raw
+            # message fallback, and the `!= user_message` guards below
+            # skip persisting/confirming the caller's own appointment.
+            # Recover it from the primary portion of the message so the
+            # primary patient's record is stored like the spouse's.
+            _primary_match = _HOUSEHOLD_SECOND_APPT_PATTERN.search(message_lower)
+            if (
+                    spouse_relation
+                    and primary_slot.strip() == user_message.strip()
+                    and _primary_match
+            ):
+                _primary_calendar_slot = _extract_calendar_date_slot_from_text(
+                    user_message[:_primary_match.start()]
+                )
+                if _primary_calendar_slot:
+                    primary_slot = _primary_calendar_slot
+            if spouse_relation and spouse_slot:
+                # Only persist the caller's own slot when the weekday
+                # extraction succeeded - otherwise primary_slot is the
+                # raw message (calendar-date phrasing) and storing it
+                # would corrupt the appointment record.
+                if primary_slot.strip() != user_message.strip():
+                    store_generic_appointment_record(
+                        caller_first_name, caller_last_name, primary_slot
+                    )
+                individual_six_month_followup_spouse_stage = "name"
+                individual_six_month_followup_spouse_slot = spouse_slot
+                individual_six_month_followup_spouse_relation = spouse_relation
+                name_question = (
+                    "What is her first and last name?"
+                    if spouse_relation == "wife"
+                    else f"What is your {spouse_relation}'s first and last name?"
+                )
+                if primary_slot.strip() != user_message.strip():
+                    spouse_response = (
+                        f"I have you scheduled for {primary_slot}. {name_question}"
+                    )
+                else:
+                    spouse_response = name_question
+        if spouse_response:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": spouse_response})
+            return jsonify({"response": spouse_response})
+
     if pre_chart_complete and not Sprint13.phf_flow_active:
         if Sprint13.phf_intent_detected:
             Sprint13.phf_flow_active = True
@@ -4697,7 +5124,25 @@ def chat():
         # trigger phrases since the patient's reply here (e.g. "Tuesday
         # at 2pm") won't itself contain "reschedule my appointment".
         if generic_reschedule_pending and existing_generic_record:
-            extracted_new_time = _extract_day_time_from_reply(user_message)
+            # Patient picks a new time from the calendar-dated offer
+            # (e.g. "October 7 at 11 AM") or, for plain weekday
+            # records, the weekday offer (e.g. "Tuesday at 2PM"). The
+            # same reply can also ask to move a spouse's appointment
+            # ("...please reschedule my wife for 1:30PM that same
+            # day") - split that off and handle both records.
+            spouse_prompt = _SPOUSE_RESCHEDULE_PATTERN.search(user_message)
+            if spouse_prompt:
+                primary_text = user_message[:spouse_prompt.start()]
+                second_text = user_message[spouse_prompt.start():]
+            else:
+                primary_text = user_message
+                second_text = ""
+            primary_date = _parse_calendar_date_from_text(primary_text)
+            extracted_new_time = _extract_calendar_date_slot_from_text(
+                primary_text
+            )
+            if not extracted_new_time:
+                extracted_new_time = _extract_day_time_from_reply(primary_text)
             chosen_new_time = extracted_new_time or user_message.strip()
             store_generic_appointment_record(
                 lookup_first, lookup_last, chosen_new_time,
@@ -4706,7 +5151,123 @@ def chat():
             generic_reschedule_pending = False
             generic_response = (
                 f"Perfect, I've moved your appointment to "
-                f"{chosen_new_time}. Is there anything else I can help "
+                f"{chosen_new_time}."
+            )
+            if spouse_prompt:
+                spouse_slot = _extract_calendar_date_slot_from_text(
+                    second_text
+                )
+                if not spouse_slot:
+                    spouse_time = _find_time_in_text(second_text)
+                    if spouse_time and primary_date is not None:
+                        spouse_slot = _calendar_slot_from_date(
+                            primary_date, spouse_time)
+                    elif spouse_time:
+                        spouse_slot = _extract_day_time_from_reply(
+                            second_text)
+                if spouse_prompt and spouse_slot:
+                    # Bug fix: the office cannot pull up or change a
+                    # spouse's record without first collecting their
+                    # first and last name and date of birth. Previously
+                    # this guessed the spouse's identity from a stored
+                    # same-surname record and rescheduled her with no
+                    # verification - Mark never supplied Helen's name
+                    # or DOB. Hold the spouse's slot and ask for that
+                    # identity instead; the caller's own slot above is
+                    # already stored.
+                    generic_spouse_reschedule_pending = True
+                    generic_spouse_reschedule_slot = spouse_slot
+                    generic_spouse_reschedule_relation = (
+                        spouse_prompt.group(1) or spouse_prompt.group(2)
+                    ).lower()
+                    spouse_possessive = _household_pronoun_possessive(
+                        generic_spouse_reschedule_relation
+                    )
+                    generic_response = (
+                        f"Perfect, I've moved your appointment to "
+                        f"{chosen_new_time}. To also reschedule "
+                        f"your {generic_spouse_reschedule_relation}'s "
+                        f"appointment, I'll need {spouse_possessive} "
+                        f"first and last name and date of birth so I "
+                        f"can pull up {spouse_possessive} chart. What "
+                        f"is {spouse_possessive} first and last name "
+                        f"and date of birth?"
+                    )
+            generic_response += (
+                " Is there anything else I can help you with today?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": generic_response}
+            )
+            return jsonify({"response": generic_response})
+
+        if generic_spouse_reschedule_pending:
+            # The previous turn stored the caller's own rescheduled
+            # slot and asked for the spouse's first/last name and DOB
+            # before touching the spouse's record. Once both arrive,
+            # apply the held spouse slot and confirm.
+            spouse_first, spouse_last = aggressive_name_extraction(
+                user_message
+            )
+            if not spouse_first or not spouse_last:
+                parts = re.findall(r"\b([A-Z][a-z]+)\b", user_message)
+                parts = [
+                    p for p in parts
+                    if p.lower() not in (
+                        "her", "his", "their", "name", "is", "my",
+                        "wife", "husband", "spouse", "and", "date",
+                        "birth", "of",
+                    )
+                ]
+                if len(parts) >= 2:
+                    spouse_first, spouse_last = parts[0], parts[1]
+            spouse_dob = extract_dob_from_message(user_message)
+            spouse_possessive = _household_pronoun_possessive(
+                generic_spouse_reschedule_relation or "spouse"
+            )
+            if not (spouse_first and spouse_last):
+                generic_response = (
+                    f"What is {spouse_possessive} first and last name?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": generic_response}
+                )
+                return jsonify({"response": generic_response})
+            if not spouse_dob:
+                generic_response = (
+                    f"What is {spouse_possessive} date of birth?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": generic_response}
+                )
+                return jsonify({"response": generic_response})
+            spouse_slot = generic_spouse_reschedule_slot
+            spouse_record = get_stored_generic_appointment_record(
+                spouse_first, spouse_last
+            )
+            provider = spouse_record.get("provider") if spouse_record else None
+            if provider is None and existing_generic_record:
+                provider = existing_generic_record.get("provider")
+            store_generic_appointment_record(
+                spouse_first, spouse_last, spouse_slot, provider=provider
+            )
+            generic_spouse_reschedule_pending = False
+            generic_spouse_reschedule_slot = None
+            generic_spouse_reschedule_relation = None
+            generic_response = (
+                f"Thank you. I've moved "
+                f"{spouse_first.capitalize()} "
+                f"{spouse_last.capitalize()}'s appointment to "
+                f"{spouse_slot}. Is there anything else I can help "
                 f"you with today?"
             )
             conversation_history.append(
@@ -4721,14 +5282,46 @@ def chat():
                 trigger in message_lower for trigger in RESCHEDULE_ACUTE_VISIT_TRIGGERS
         ):
             schedule = generate_weekly_availability()
-            avail_lines = [
-                f"{day}: {', '.join(slots)}"
-                for day, slots in schedule.items() if slots
-            ]
-            avail_text = (
-                "; ".join(avail_lines) if avail_lines
-                else "no availability this week"
+            # Bug fix: the routine six-month follow-up flow is the only
+            # flow that stores a concrete calendar date in the record
+            # (e.g. "September 30, 2026 @ 9:00 AM"). Each such
+            # appointment is always booked on/after the six-month due
+            # date, so a reschedule must never move it earlier - but the
+            # generic offer below used generate_weekly_availability()
+            # (always the upcoming week), which on the days right
+            # before the due date offered weekday slots that resolve to
+            # dates BEFORE the follow-up is due. For calendar-dated
+            # records, generate the offered week starting at the first
+            # Monday on/after the existing appointment and label every
+            # slot with its exact date, so no offered slot can fall
+            # before the follow-up is due.
+            existing_appt_date = _parse_calendar_date_from_text(
+                existing_generic_record.get("appointment_day") or ""
             )
+            if existing_appt_date is not None:
+                week_start = _next_monday_on_or_after(existing_appt_date)
+                avail_lines = []
+                for day_idx, day in enumerate(DAYS_OF_WEEK):
+                    day_slots = schedule.get(day, [])
+                    if day_slots:
+                        slot_date = week_start + timedelta(days=day_idx)
+                        avail_lines.append(
+                            f"{day}, {slot_date.strftime('%B %d, %Y')}: "
+                            f"{', '.join(day_slots)}"
+                        )
+                avail_text = (
+                    "; ".join(avail_lines) if avail_lines
+                    else "no availability"
+                )
+            else:
+                avail_lines = [
+                    f"{day}: {', '.join(slots)}"
+                    for day, slots in schedule.items() if slots
+                ]
+                avail_text = (
+                    "; ".join(avail_lines) if avail_lines
+                    else "no availability this week"
+                )
             generic_reschedule_pending = True
             generic_response = (
                 f"I can help you reschedule your appointment currently "
@@ -4743,6 +5336,42 @@ def chat():
                 {"role": "assistant", "content": generic_response}
             )
             return jsonify({"response": generic_response})
+
+        if generic_joint_cancel_pending:
+            generic_joint_cancel_pending = False
+            if (
+                    caller_first_name and caller_last_name
+                    and patient_first_name and patient_last_name
+                    and (caller_first_name, caller_last_name)
+                    != (patient_first_name, patient_last_name)
+            ):
+                caller_record = get_stored_generic_appointment_record(
+                    caller_first_name, caller_last_name
+                )
+                spouse_record = get_stored_generic_appointment_record(
+                    patient_first_name, patient_last_name
+                )
+                if caller_record and spouse_record:
+                    caller_time = caller_record.get("appointment_day")
+                    spouse_time = spouse_record.get("appointment_day")
+                    cancel_generic_appointment_record(
+                        caller_first_name, caller_last_name
+                    )
+                    cancel_generic_appointment_record(
+                        patient_first_name, patient_last_name
+                    )
+                    generic_response = (
+                        f"I've cancelled your appointment on {caller_time} "
+                        f"and {patient_first_name}'s appointment on {spouse_time}. "
+                        "Is there anything else I can help you with today?"
+                    )
+                    conversation_history.append(
+                        {"role": "user", "content": user_message}
+                    )
+                    conversation_history.append(
+                        {"role": "assistant", "content": generic_response}
+                    )
+                    return jsonify({"response": generic_response})
 
         if any(
                 trigger in message_lower for trigger in CANCEL_ACUTE_VISIT_TRIGGERS
@@ -5877,7 +6506,10 @@ def chat():
             or appointment_reason_just_requested
             or controlled_substance_schedule
             or controlled_substance_appt_pending
-    ) and not is_medical_professional_caller:
+    ) and not is_medical_professional_caller and not (
+            individual_six_month_followup_active
+            and individual_six_month_followup_eligible is False
+    ):
         if (
                 not is_same_day or virtual_visit_accepted_now
                 or same_day_virtual_clinic_declined_now
@@ -7099,6 +7731,87 @@ def chat():
     if pcp_collected:
         pcp_context = "PCP_ALREADY_COLLECTED: Do NOT ask for PCP again.\n"
 
+    individual_six_month_followup_context = ""
+    if individual_six_month_followup_active:
+        due_date = (
+            datetime.now() - timedelta(
+                days=individual_six_month_followup_days_since
+            ) + timedelta(days=180)
+        ).strftime("%B %d, %Y")
+        # Holiday-closure fix: this flow has no deterministic
+        # availability generator (unlike the couple workflow) - the AI
+        # invents its own calendar dates, which let it offer a
+        # recognized office holiday (e.g. Friday, January 01, 2027 =
+        # New Year's Day). Enumerate the recognized holiday closures
+        # inside the scheduling window and forbid them explicitly,
+        # reusing the same holiday calendar as the rest of the app.
+        _followup_window_end = datetime.now().date() + timedelta(days=200)
+        _holiday_closure_block = ""
+        _closed_holiday_dates = sorted(
+            (d, n) for d, n in
+            _office_holidays_near(_followup_window_end.year).items()
+            if datetime.now().date() < d <= _followup_window_end
+        )
+        if _closed_holiday_dates:
+            _holiday_closure_block = (
+                "RECOGNIZED OFFICE HOLIDAY CLOSURES (office CLOSED, do NOT "
+                "offer, confirm, or mention an appointment on any of): "
+                + "; ".join(
+                    f"{d.strftime('%B %d, %Y')} {n}"
+                    for d, n in _closed_holiday_dates
+                ) + ".\n"
+            )
+        if individual_six_month_followup_eligible:
+            individual_six_month_followup_context = (
+                "INDIVIDUAL_SIX_MONTH_FOLLOWUP INJECTED BY SYSTEM:\n"
+                f"Previous appointment date: "
+                f"{individual_six_month_followup_previous_visit_date} "
+                f"({individual_six_month_followup_days_since} days ago).\n"
+                "Say concisely that the patient is due for a routine "
+                "six-month follow-up, then offer availability. Use this "
+                "same date consistently for the rest of the call.\n"
+                "The patient has already stated the reason for this "
+                "appointment (the routine six-month follow-up). Do NOT "
+                "ask for the appointment reason.\n"
+                f"{_holiday_closure_block}"
+            )
+        else:
+            _due_dt = (
+                datetime.now() - timedelta(
+                    days=individual_six_month_followup_days_since
+                ) + timedelta(days=180)
+            ).date()
+            _post_due_business_days = []
+            _cursor = _due_dt
+            while len(_post_due_business_days) < 5:
+                if (
+                        _cursor.weekday() < 5
+                        and not is_recognized_office_holiday(_cursor)
+                ):
+                    _post_due_business_days.append(
+                        _cursor.strftime("%A, %B %d, %Y")
+                    )
+                _cursor += timedelta(days=1)
+            _post_due_dates_text = "; ".join(_post_due_business_days)
+            individual_six_month_followup_context = (
+                "INDIVIDUAL_SIX_MONTH_FOLLOWUP INJECTED BY SYSTEM:\n"
+                f"Previous appointment date: "
+                f"{individual_six_month_followup_previous_visit_date} "
+                f"({individual_six_month_followup_days_since} days ago).\n"
+                f"The patient is not due until {due_date}. Do NOT offer "
+                "an appointment before that date; offer a routine "
+                "follow-up on or after it. Offer ONLY the following "
+                "exact dates (do NOT offer, mention, or invent any "
+                f"date earlier than {due_date} or outside this list):\n"
+                f"- {_post_due_dates_text}\n"
+                "Use ONLY dates from this list, consistently, for the "
+                "rest of the call.\n"
+                "The patient has already stated the reason for this "
+                "appointment (the routine six-month follow-up). Do NOT "
+                "ask for the appointment reason.\n"
+                f"{_holiday_closure_block}"
+            )
+
     conversation_history.append({"role": "user", "content": user_message})
 
     phf_context = Sprint13.build_context()
@@ -7112,6 +7825,7 @@ def chat():
             todays_date_context + "\n" +
             medical_professional_context + "\n" +
             pcp_context + "\n" +
+            individual_six_month_followup_context + "\n" +
             nurse_ma_context + "\n" +
             lab_order_fax_to_facility_context + "\n" +
             lab_order_pickup_context + "\n" +
@@ -7166,6 +7880,7 @@ def chat():
                 store_generic_appointment_record(
                     capture_first, capture_last, confirmed_generic_appt
                 )
+                individual_six_month_followup_active = False
                 # Scenario 11/12: if this booking was for a
                 # controlled-substance-reason appointment, append a
                 # deterministic Python-authored bridge question rather
