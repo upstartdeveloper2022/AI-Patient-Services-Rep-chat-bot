@@ -116,6 +116,40 @@ lab_order_uncomfortable_with_tech = None
 lab_order_mailing_address = None
 lab_order_fax_destination = None
 
+# Husband & Wife (couple) wellness scheduling - a single workflow that
+# books BOTH patients back-to-back on the same day against ONE shared
+# insurance determination (never a divergent random insurance per
+# person). Escalates to Janet Walker when the PCP's back-to-back
+# opening isn't soon enough.
+couple_stage = None                        # None | "collect_spouse" | "collect_spouse_dob" | "locate_existing" | "eligibility" | "offer_pcp" | "offer_janet" | "await_callback" | "complete"
+couple_existing_located = False            # True once the couple's on-file appointments were surfaced ("located")
+couple_is_reschedule = False               # True when the caller said "reschedule" (not "schedule")
+couple_reschedule_old_days = None          # (day1, day2) of the couple's existing visits once a move is confirmed
+couple_patient1_first = None               # caller/husband-or-wife (from app.py pre-chart globals)
+couple_patient1_last = None
+couple_patient2_first = None               # the spouse named by the caller
+couple_patient2_last = None
+couple_patient2_dob = None                 # the spouse's DOB (asked once her full name is known)
+couple_patient2_age = None                 # computed from couple_patient2_dob
+couple_spouse_relation = None              # "husband" | "wife" | "spouse"
+couple_shared_insurance = None             # determined ONCE, shared by both
+couple_visit_type = None                   # "wellness" | "maw" | "cha", shared by both
+couple_pcp_pairs = None                    # list of (day_str, time1, time2) back-to-back PCP slots
+couple_covering_pairs = None               # same shape, Janet Walker (or covering provider) slots
+couple_covering_provider_name = None       # "Janet Walker" for MAW/CHA, covering provider otherwise
+
+# 1yr+1day eligibility (PDF Section 1) for the couple flow. Each
+# patient's last wellness visit is randomly generated, and scheduling
+# may only proceed once BOTH are at least 367 days past their last
+# visit (mirrors the single-patient determine_eligibility stage).
+couple_last_visit_date1 = None
+couple_days_since_last_visit1 = None
+couple_last_visit_date2 = None
+couple_days_since_last_visit2 = None
+couple_eligible_both = None                # None until evaluated, then True/False for BOTH patients
+couple_eligibility_narration = None        # set in the eligibility stage, consumed once by _present_couple_pcp_pairs
+couple_pcp_earliest_offset = 1             # back-to-back slots never offered before this many days out (proves the 1yr+1day rule)
+
 
 # ─────────────────────────────────────────────
 # Constants
@@ -375,6 +409,20 @@ def reset_state():
     global refill_will_run_out_before_next_appt
     global lab_order_ehr_guidance_active, lab_order_ehr_stage
     global lab_order_uncomfortable_with_tech, lab_order_mailing_address
+    global couple_stage
+    global couple_patient1_first, couple_patient1_last
+    global couple_patient2_first, couple_patient2_last, couple_spouse_relation
+    global couple_patient2_dob, couple_patient2_age
+    global couple_shared_insurance, couple_visit_type
+    global couple_pcp_pairs, couple_covering_pairs
+    global couple_covering_provider_name
+    global couple_last_visit_date1, couple_days_since_last_visit1
+    global couple_last_visit_date2, couple_days_since_last_visit2
+    global couple_eligible_both, couple_eligibility_narration
+    global couple_pcp_earliest_offset
+    global couple_existing_located
+    global couple_is_reschedule
+    global couple_reschedule_old_days
 
     wellness_flow_active = False
     wellness_stage = None
@@ -416,6 +464,29 @@ def reset_state():
     lab_order_uncomfortable_with_tech = None
     lab_order_mailing_address = None
     lab_order_fax_destination = None
+    couple_stage = None
+    couple_patient1_first = None
+    couple_patient1_last = None
+    couple_patient2_first = None
+    couple_patient2_last = None
+    couple_patient2_dob = None
+    couple_patient2_age = None
+    couple_spouse_relation = None
+    couple_shared_insurance = None
+    couple_visit_type = None
+    couple_pcp_pairs = None
+    couple_covering_pairs = None
+    couple_covering_provider_name = None
+    couple_last_visit_date1 = None
+    couple_days_since_last_visit1 = None
+    couple_last_visit_date2 = None
+    couple_days_since_last_visit2 = None
+    couple_eligible_both = None
+    couple_eligibility_narration = None
+    couple_pcp_earliest_offset = 1
+    couple_existing_located = False
+    couple_is_reschedule = False
+    couple_reschedule_old_days = None
 
 
 # ─────────────────────────────────────────────
@@ -431,9 +502,14 @@ def detect_appointment_lookup_intent(message_lower):
 
 
 def detect_wellness_intent(message_lower):
-    """Returns the specific visit type requested ("wellness", "maw", or
-    "cha") or None. Checked most-specific-first so a caller naming MAW
-    or CHA directly isn't misclassified as a generic wellness visit.
+    """Returns the specific visit type requested ("wellness", "maw",
+    "cha", or "couple") or None. Checked most-specific-first so a
+    caller naming MAW or CHA directly isn't misclassified as a generic
+    wellness visit.
+
+    "couple" is returned when a husband and wife are being scheduled
+    together (see detect_couple_wellness_intent) - it drives the
+    back-to-back couple workflow in handle_wellness_flow().
 
     DEFENSIVE FIX: If the message is clearly an appointment lookup
     ("When is my annual physical?"), return None so the lookup path
@@ -442,13 +518,9 @@ def detect_wellness_intent(message_lower):
     intent."""
     if detect_appointment_lookup_intent(message_lower):
         return None
-    if any(t in message_lower for t in CHA_TRIGGERS):
-        return "cha"
-    if any(t in message_lower for t in MAW_TRIGGERS):
-        return "maw"
-    if any(t in message_lower for t in WELLNESS_TRIGGERS):
-        return "wellness"
-    return None
+    if detect_couple_wellness_intent(message_lower):
+        return "couple"
+    return _base_wellness_intent(message_lower)
 
 
 def detect_refill_escalation_intent(message_lower):
@@ -491,27 +563,188 @@ def _extract_priority_network_lab(message_lower):
 KNOWN_EXTERNAL_LAB_TRIGGERS = ["quest", "labcorp", "lab corp"]
 
 
+# ── Husband & Wife (couple) wellness scheduling ──
+# First-person-joint phrasing that establishes BOTH of the couple are
+# being scheduled (e.g. "my husband and I", "we both", "for both of
+# us"). A single-patient request for just a spouse ("my husband needs
+# his annual physical") contains none of these and keeps routing to
+# the normal single wellness flow. Note pivotal visit-type checks
+# below are checked at the top of detect_wellness_intent() so wording
+# like "Comprehensive Health Assessment for my wife and I" routes to
+# the couple flow rather than the single CHA path.
+_JOINT_COUPLE_PHRASES = [
+    "husband and i", "husband and me", "husband and myself",
+    "wife and i", "wife and me", "wife and myself",
+    "spouse and i", "spouse and me", "spouse and myself",
+    "i and my husband", "i and my wife", "me and my husband",
+    "me and my wife", "myself and my husband", "myself and my wife",
+    "my husband and i", "my wife and i", "my spouse and i",
+    "and my husband", "and my wife", "and my spouse",
+    "we both", "both of us", "us both", "for both of us",
+    "both of our", "for the two of us", "schedule us both",
+]
+_COUPLE_RELATION_WORDS = ["husband", "wife", "spouse"]
+
+# Spouse name capture ("my husband William", "my husband, William
+# Vance", "my wife's name is Kate", "my wife named Diane"). The
+# captured tokens must be real names, so common pronoun/conjunction
+# words ("and I", "and Myself") are rejected even though the pattern
+# runs case-insensitively.
+_SPOUSE_NAME_PATTERN = re.compile(
+    r"\bmy\s+(husband|wife|spouse)(?:'s\s+name\s+is|'s\s+name|,|:)?\s*"
+    r"(?:named\s+|is\s+)?([A-Za-z][a-z]+)(?:\s+([A-Za-z][a-z]+))?",
+    re.IGNORECASE
+)
+_SPOUSE_NAME_STOPWORDS = {
+    "and", "is", "are", "was", "were", "with", "or", "my", "i", "me",
+    "mine", "to", "for", "the", "a", "an", "that", "he", "she", "his",
+    "her", "also", "us", "am", "will", "want", "need",
+}
+
+
+def _extract_spouse_name(message):
+    """Returns (relation, first_name, last_name) parsed from a message
+    mentioning the caller's husband/wife/spouse by name, or (None,
+    None, None) if absent. last_name may legitimately be None when the
+    caller only stated a first name."""
+    match = _SPOUSE_NAME_PATTERN.search(message)
+    if not match:
+        return None, None, None
+    first = match.group(2) or None
+    last = match.group(3) or None
+    if first and first.lower() in _SPOUSE_NAME_STOPWORDS:
+        return None, None, None
+    if last and last.lower() in _SPOUSE_NAME_STOPWORDS:
+        last = None
+    return match.group(1).lower(), first, last
+
+
+def _extract_plain_reply_names(message, exclude_first=None):
+    """Scoped fallback for the collect_spouse stage: after Steve has
+    explicitly asked for the spouse's name, the caller's next reply is
+    usually just the name ("William Brooks" / "William"). Pulls the
+    caller-attributable capitalized words out of that reply while
+    excluding the caller's own first name (spouses typically share the
+    same last name, so the caller's last name is NOT excluded)."""
+    tokens = re.findall(r"\b[A-Z][a-z]+\b", message)
+    filtered = []
+    for tok in tokens:
+        if exclude_first and tok == exclude_first:
+            continue
+        if tok.lower() in _SPOUSE_NAME_STOPWORDS:
+            continue
+        filtered.append(tok)
+    if not filtered:
+        return None, None
+    if len(filtered) >= 2:
+        return filtered[0], filtered[1]
+    return filtered[0], None
+
+
+def _base_wellness_intent(message_lower):
+    """Singular (per-person) wellness request type, without the lookup
+    short-circuit or the couple check - the pieces the couple detector
+    needs without recursing through detect_wellness_intent()."""
+    if any(t in message_lower for t in CHA_TRIGGERS):
+        return "cha"
+    if any(t in message_lower for t in MAW_TRIGGERS):
+        return "maw"
+    if any(t in message_lower for t in WELLNESS_TRIGGERS):
+        return "wellness"
+    return None
+
+
+def detect_couple_wellness_intent(message_lower):
+    """True when the caller is requesting annual wellness/MAW/CHA visits
+    for BOTH themselves and their husband/wife/spouse. Requires a
+    spouse word AND a first-person-joint phrase AND a wellness trigger
+    all in the same message, so a lone "my husband needs his annual
+    physical" (single third-party scheduling) can never reach here.
+
+    EXCEPTION - already-scheduled couple reschedule/locate: a couple
+    asking to "schedule appointments" (no literal wellness noun) for
+    BOTH of them is still a couple request WHEN the caller already has
+    a recorded Sprint14 appointment on file (located on a prior call;
+    observed failure: "I'd like to schedule appointments for my wife
+    and myself" fell through to generic appointment scheduling and the
+    on-file couple records were never surfaced). Without a stored
+    record - i.e. a first-time couple who hasn't named a visit type -
+    this stays a generic scheduling request, leaving that flow
+    untouched."""
+    has_spouse = any(w in message_lower for w in _COUPLE_RELATION_WORDS)
+    has_joint = any(p in message_lower for p in _JOINT_COUPLE_PHRASES)
+    if not (has_spouse and has_joint):
+        return False
+    if _base_wellness_intent(message_lower) is not None:
+        return True
+    return (
+        _mentions_couple_schedule_appointments(message_lower)
+        and _caller_has_stored_sprint14_appointment()
+    )
+
+
+_COUPLE_SCHEDULE_VERBS = ["schedule", "book", "set up", "make", "move", "change"]
+
+
+def _mentions_couple_schedule_appointments(message_lower):
+    """True for generic "schedule/book/make/move/change ... appointment(s)"
+    phrasing with no specific visit type named, e.g. "I'd like to
+    schedule appointments for my wife and myself"."""
+    return (
+        "appointment" in message_lower
+        and any(v in message_lower for v in _COUPLE_SCHEDULE_VERBS)
+    )
+
+
+def _caller_has_stored_sprint14_appointment():
+    """True when the caller (app.py pre-chart identity) already has an
+    appointment on file in the Sprint14 store - i.e. this is a callback
+    from a prior scheduling session. Uses the SAME store the couple
+    flow writes to, so the couple reschedule/locate detection and the
+    booking persistence can never disagree (observed failure: records
+    lived in sprint14_appointments.json but the caller's reschedule
+    phrasing routed to the generic scheduling flow instead)."""
+    try:
+        import app as _caller_app
+        first = getattr(_caller_app, "patient_first_name", None) or getattr(
+            _caller_app, "caller_first_name", None)
+        last = getattr(_caller_app, "patient_last_name", None) or getattr(
+            _caller_app, "caller_last_name", None)
+    except Exception:
+        return False
+    if not first or not last:
+        return False
+    return get_next_appointment_for_patient(f"{first} {last}") is not None
+
+
 NOT_ELIGIBLE_ACCEPTANCE_TRIGGERS = [
     "i understand", "i'm aware", "im aware", "i am aware",
     "schedule it now", "schedule it anyway", "book it now",
     "book it anyway", "go ahead and schedule", "i just want to schedule",
     "i need to schedule that far out", "schedule that far out",
     "that far out is fine", "far out is fine", "worry about it later",
+    # "I still want to schedule..." replies pull up the provider's
+    # availability anyway, instead of re-asking the eligibility question
+    # (observed failure: "I still want to schedule wellness visits for
+    # my wife and myself" re-printed the checkpoint instead of slots).
+    "i still want to schedule", "we still want to schedule",
+    "still want to schedule", "still want to book",
+    "i'd still like to schedule", "i'd still like to book",
 ]
 
 
 def patient_accepts_far_out_timeline(message_lower):
-    """Scoped acceptance detector used ONLY by the wellness_confirmation
-    stage. The general-purpose patient_wants_to_proceed() catches a
-    direct yes/sure/ok answer; this catches the declarative phrasing
-    patients more commonly use in response to that stage's binary
-    question ("I understand I need to schedule that far out", "I just
-    want to get this on the books now") which contains no bare yes/ok/
-    sure at all. Deliberately kept separate from PROCEED_PHRASES,
-    which is also used by several unrelated stages (covering-provider
-    accept/decline, lab-order tech-comfort check, refill option
-    selection) where a phrase as broad as "I understand" would risk
-    misclassifying an unrelated response.
+    """Scoped acceptance detector for the not-eligible checkpoint: the
+    general-purpose patient_wants_to_proceed() catches a direct yes/sure/
+    ok answer; this catches the declarative phrasing patients more
+    commonly use in response to that stage's binary question ("I
+    understand I need to schedule that far out", "I still want to
+    schedule", "I just want to get this on the books now") which
+    contains no bare yes/ok/sure at all. Deliberately kept separate from
+    PROCEED_PHRASES, which is also used by several unrelated stages
+    (covering-provider accept/decline, lab-order tech-comfort check,
+    refill option selection) where a phrase as broad as "I understand"
+    would risk misclassifying an unrelated response.
     """
     return _contains_trigger(message_lower, NOT_ELIGIBLE_ACCEPTANCE_TRIGGERS)
 
@@ -530,6 +763,26 @@ def patient_wants_to_proceed(message_lower):
 
 def patient_wants_to_decline(message_lower):
     return _contains_trigger(message_lower, DECLINE_PHRASES)
+
+
+# Reply to the couple "locate_existing" keep-vs-reschedule question.
+# Explicit keep/leave phrasing keeps both appointments untouched; ANY
+# other reply (including "reschedule them", "move them", plain "yes")
+# proceeds into the normal couple booking path to move them.
+KEEP_APPOINTMENT_TRIGGERS = [
+    "keep them", "keep the appointments", "keep the appointment",
+    "keep them as is", "keep as is", "keep it as is",
+    "leave them", "leave them as is", "leave them alone",
+    "leave the appointments", "leave the appointment",
+    "no change", "no need to change", "don't change", "dont change",
+    "don't reschedule", "dont reschedule", "no reschedule",
+    "that's fine", "thats fine", "as is", "as scheduled",
+    "keep the same", "keep my appointment",
+]
+
+
+def patient_wants_to_keep_appointments(message_lower):
+    return any(t in message_lower for t in KEEP_APPOINTMENT_TRIGGERS)
 
 
 def patient_uncomfortable_with_tech(message_lower):
@@ -860,6 +1113,183 @@ def format_availability(availability_dict):
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────
+# Husband & Wife (couple) back-to-back availability
+# ─────────────────────────────────────────────
+
+def _next_adjacent_time(t1):
+    """Returns the time slot exactly 30 minutes after t1 in
+    AVAILABLE_TIMES, or None if no such slot exists (handles the
+    lunch break and the 4:40 PM odd slot). Mirrors app.py's own
+    couple-followup adjacency requirement."""
+    t1_dt = datetime.strptime(t1, "%I:%M %p")
+    for t2 in AVAILABLE_TIMES:
+        t2_dt = datetime.strptime(t2, "%I:%M %p")
+        if (t2_dt - t1_dt).seconds == 30 * 60:
+            return t2
+    return None
+
+
+def _couple_reschedule_earliest_offset(record1, record2):
+    """Return the minimum number of days from today for a couple's
+    rescheduled appointments. A rescheduled wellness appointment must
+    remain later than both patients' existing scheduled appointments."""
+    today = datetime.now().date()
+    appointment_dates = []
+
+    for record in (record1, record2):
+        appointment_day = record.get("appointment_day", "")
+        match = re.search(
+            r"(January|February|March|April|May|June|July|August|"
+            r"September|October|November|December)\s+(\d{1,2})",
+            appointment_day,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+
+        month = datetime.strptime(match.group(1), "%B").month
+        day = int(match.group(2))
+        candidate = datetime(today.year, month, day).date()
+        if candidate < today:
+            candidate = candidate.replace(year=today.year + 1)
+        appointment_dates.append(candidate)
+
+    if not appointment_dates:
+        return 1
+
+    latest_existing_date = max(appointment_dates)
+    return max((latest_existing_date - today).days + 1, 1)
+
+
+def generate_couple_pcp_pairs(earliest_offset_days=1):
+    """Back-to-back (same-day, adjacent 30-minute) wellness slots for
+    the couple's own PCP, spanning the same 1-day to ~6-month window
+    the single-visit PCP generator uses. Each pair is
+    (day_str, time1, time2) with time2 exactly 30 minutes after time1
+    (the 11:30 AM-1:00 PM lunch gap and the 4:40 PM odd slot are
+    excluded so every pair is a true back-to-back open slot).
+    Guaranteed non-empty, mirroring the PCP generator's own non-empty
+    guarantee."""
+    today = datetime.now()
+    pairs = []
+    attempts = 0
+    while not pairs and attempts < 25:
+        attempts += 1
+        for _ in range(12):
+            offset = random.randint(earliest_offset_days, earliest_offset_days + 180)
+            date = today + timedelta(days=offset)
+            if date.weekday() >= 5:
+                continue
+            t1 = random.choice(AVAILABLE_TIMES)
+            t2 = _next_adjacent_time(t1)
+            if t2 is None:
+                continue
+            day_str = date.strftime("%A, %B %d")
+            if not any(p[0] == day_str for p in pairs):
+                pairs.append((day_str, t1, t2))
+        if len(pairs) >= 3:
+            break
+    if not pairs:
+        offset = earliest_offset_days
+        date = today + timedelta(days=offset)
+        while date.weekday() >= 5:
+            offset += 1
+            date = today + timedelta(days=offset)
+        pairs.append((date.strftime("%A, %B %d"), AVAILABLE_TIMES[0], AVAILABLE_TIMES[1]))
+    return pairs[:3]
+
+
+def generate_couple_covering_pairs(earliest_offset_days=1):
+    """Back-to-back couple slots for the covering provider (Janet Walker
+    for MAW/CHA). Janet's schedule is dedicated to MAW/CHA visits and
+    typically opens sooner than the PCP's - search a 2-week window
+    starting at earliest_offset_days so escalation genuinely offers
+    earlier (but rule-eligible) dates. Same (day_str, time1, time2)
+    back-to-back shape as the PCP generator."""
+    today = datetime.now()
+    start_offset = max(earliest_offset_days, 1)
+    pairs = []
+    date = today + timedelta(days=start_offset)
+    window_end = date + timedelta(days=14)
+    while date < window_end and len(pairs) < 3:
+        if date.weekday() < 5 and random.choice([True, True, False]):
+            t1 = random.choice(AVAILABLE_TIMES)
+            t2 = _next_adjacent_time(t1)
+            if t2 is None:
+                date += timedelta(days=1)
+                continue
+            pairs.append(
+                (
+                    date.strftime("%A, %B %d"),
+                    t1,
+                    t2,
+                )
+            )
+        date += timedelta(days=1)
+    if not pairs:
+        fallback = today + timedelta(days=start_offset)
+        while fallback.weekday() >= 5:
+            fallback += timedelta(days=1)
+        pairs.append(
+            (
+                fallback.strftime("%A, %B %d"),
+                AVAILABLE_TIMES[0],
+                AVAILABLE_TIMES[1],
+            )
+        )
+    return pairs[:3]
+
+
+def format_couple_pairs(pairs):
+    lines = [
+        f"- {day}: {t1} and {t2}" for day, t1, t2 in pairs
+    ]
+    return "\n".join(lines)
+
+
+def _match_couple_pair(message, message_lower, pairs):
+    """Return the (day_str, time1, time2) pair whose calendar day is
+    named in the message and whose start time (or second slot) matches
+    the time stated, or None. Falls back to matching 'the second time'
+    phrasing ('the 9:30 slot') so either member of the pair is a valid
+    selection."""
+    for day, t1, t2 in pairs:
+        if _slot_day_matches(message_lower, day):
+            if time_matches(message, t1) or time_matches(message, t2):
+                return (day, t1, t2)
+    return None
+
+
+def _couple_requested_day_unavailable(message_lower, pcp_pairs):
+    """Detect a caller request for a specific month or weekday that NONE
+    of the offered PCP back-to-back pairs cover (e.g. "get rescheduled
+    for a day in April" when the PCP list only shows September/February
+    dates). Returns the requested label ("April", "Friday"...), or None
+    when the message names nothing specific or the window IS covered by
+    the current PCP list. Drives the escalation to Janet Walker / the
+    covering provider when the PCP genuinely has no opening in the
+    window the caller wants, instead of silently re-listing the same
+    PCP pairs."""
+    _MONTH_NAMES = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november",
+        "december",
+    ]
+    _WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday"]
+    requested = None
+    for name in _MONTH_NAMES + _WEEKDAY_NAMES:
+        if re.search(r'\b' + name + r'\b', message_lower):
+            requested = name
+            break
+    if requested is None:
+        return None
+    for day_str, _t1, _t2 in pcp_pairs:
+        if requested in day_str.lower():
+            return None
+    return requested.capitalize()
+
+
 def time_matches(user_input_text, available_time_slot):
     """Flexible time-string match. Mirrors Sprint13.time_matches()."""
     user_lower = user_input_text.lower()
@@ -1084,6 +1514,20 @@ def _execute_pivot_handoff(reason, message_lower=""):
     global refill_escalation_active, refill_stage
     global lab_order_ehr_guidance_active, lab_order_ehr_stage
     global wellness_intent_detected, refill_intent_detected, lab_order_intent_detected
+    global couple_stage
+    global couple_patient1_first, couple_patient1_last
+    global couple_patient2_first, couple_patient2_last, couple_spouse_relation
+    global couple_patient2_dob, couple_patient2_age
+    global couple_shared_insurance, couple_visit_type
+    global couple_pcp_pairs, couple_covering_pairs
+    global couple_covering_provider_name
+    global couple_last_visit_date1, couple_days_since_last_visit1
+    global couple_last_visit_date2, couple_days_since_last_visit2
+    global couple_eligible_both, couple_eligibility_narration
+    global couple_pcp_earliest_offset
+    global couple_existing_located
+    global couple_is_reschedule
+    global couple_reschedule_old_days
 
     wellness_flow_active = False
     wellness_stage = None
@@ -1102,7 +1546,29 @@ def _execute_pivot_handoff(reason, message_lower=""):
     wellness_intent_detected = None
     refill_intent_detected = False
     lab_order_intent_detected = False
-
+    couple_stage = None
+    couple_patient1_first = None
+    couple_patient1_last = None
+    couple_patient2_first = None
+    couple_patient2_last = None
+    couple_patient2_dob = None
+    couple_patient2_age = None
+    couple_spouse_relation = None
+    couple_shared_insurance = None
+    couple_visit_type = None
+    couple_pcp_pairs = None
+    couple_covering_pairs = None
+    couple_covering_provider_name = None
+    couple_last_visit_date1 = None
+    couple_days_since_last_visit1 = None
+    couple_last_visit_date2 = None
+    couple_days_since_last_visit2 = None
+    couple_eligible_both = None
+    couple_eligibility_narration = None
+    couple_pcp_earliest_offset = 1
+    couple_existing_located = False
+    couple_is_reschedule = False
+    couple_reschedule_old_days = None
     if reason == "paperwork":
         # Unlike acute/chronic ("I'm sick" / "my diabetes is acting
         # up"), a paperwork trigger match - "paperwork", "form",
@@ -1249,6 +1715,83 @@ def _persist_appointment(patient_full, visit_type, appointment_day,
     return True
 
 
+def _remove_appointment_for_patient(patient_full, appointment_day):
+    """Remove a patient's stored appointment record matching the given
+    day. Used by the couple reschedule path so the new booking REPLACES
+    the old visit instead of accumulating duplicates in the store."""
+    patient_key = _resolve_patient_key(patient_full)
+    if not patient_key or not appointment_day:
+        return False
+    data = _load_appointments()
+    records = data.get(patient_key, [])
+    remaining = [r for r in records if r.get("appointment_day") != appointment_day]
+    if len(remaining) == len(records):
+        return False
+    if remaining:
+        data[patient_key] = remaining
+    else:
+        data.pop(patient_key, None)
+    _save_appointments(data)
+    print(f"[Sprint14] REMOVED OLD APPOINTMENT: key={patient_key!r}, "
+          f"appt={appointment_day!r}, file={APPOINTMENTS_JSON_PATH}")
+    return True
+
+
+def cancel_appointment_for_patient(patient_full):
+    """Public API: cancel the most recent Sprint14 appointment for a
+    patient.  Returns the removed record dict (with its appointment_day)
+    so the caller can reference it in a confirmation message, or None
+    if no record existed."""
+    patient_key = _resolve_patient_key(patient_full)
+    if not patient_key:
+        return None
+    data = _load_appointments()
+    records = data.get(patient_key, [])
+    if not records:
+        return None
+    removed = records.pop()
+    if records:
+        data[patient_key] = records
+    else:
+        data.pop(patient_key, None)
+    _save_appointments(data)
+    print(f"[Sprint14] CANCEL APPOINTMENT: key={patient_key!r}, "
+          f"appt={removed.get('appointment_day')!r}, "
+          f"file={APPOINTMENTS_JSON_PATH}")
+    return removed
+
+
+def find_spouse_appointment_record(first, last):
+    """Public API: find the most recent Sprint14 appointment record for
+    the caller's spouse - another patient in the store whose visit was
+    booked back-to-back on the SAME calendar date as the caller's (the
+    couple flow always books both halves on one shared date). Returns
+    (spouse_key, record) or (None, None) if none found. Same-date
+    matching is what keeps this from grabbing an unrelated patient's
+    record (e.g. a different patient booked alone on another day)."""
+    if not first or not last:
+        return None, None
+    caller_key = f"{first} {last}".strip()
+    data = _load_appointments()
+    caller_records = data.get(caller_key, []) or []
+    caller_day = None
+    if caller_records:
+        caller_day = str(caller_records[-1].get("appointment_day", "")) \
+            .split(" @ ")[0].strip()
+    if not caller_day:
+        return None, None
+    for key, records in data.items():
+        if not records:
+            continue
+        if key.strip().lower() == caller_key.lower():
+            continue
+        other_day = str(records[-1].get("appointment_day", "")) \
+            .split(" @ ")[0].strip()
+        if other_day == caller_day:
+            return key, records[-1]
+    return None, None
+
+
 def get_next_appointment_for_patient(patient_full):
     """Public API for app.py (or any caller) to look up the most
     recently scheduled Sprint14 appointment for a patient.
@@ -1388,6 +1931,16 @@ def handle_wellness_flow(message, message_lower):
                 "help you with today?"
             )
         return "May I get a good callback number for you?"
+
+    # ── HUSBAND & WIFE (COUPLE) WELLNESS SCHEDULING ──
+    # Entirely separate stage machine from the single-patient ladder
+    # below. Activated when detect_wellness_intent() returned "couple";
+    # books BOTH patients back-to-back against one shared insurance,
+    # escalating to Janet Walker if the PCP's pair isn't soon enough.
+    if wellness_requested_visit_type == "couple":
+        couple_response = _handle_couple_wellness_flow(message, message_lower)
+        if couple_response is not None:
+            return couple_response
 
     # ── STAGE: collect DOB (needed for age/insurance branch) ──
     if wellness_stage is None:
@@ -1918,6 +2471,545 @@ def _offer_covering_provider(for_maw_or_cha):
 
 
 # ─────────────────────────────────────────────
+# Husband & Wife (couple) wellness scheduling flow
+# ─────────────────────────────────────────────
+
+def _sync_couple_identity(message, message_lower, app_module):
+    """Fill the couple's identities from app.py's globals (patient 1 is
+    the caller/pre-chart patient) and from the conversation history or
+    the live message (patient 2 is the named spouse). Runs on every
+    couple-flow turn so a name/relation stated late is still caught."""
+    global couple_patient1_first, couple_patient1_last
+    global couple_patient2_first, couple_patient2_last
+    global couple_spouse_relation
+
+    if not couple_patient1_first:
+        couple_patient1_first = getattr(app_module, "caller_first_name", None) \
+            or getattr(app_module, "patient_first_name", None)
+    if not couple_patient1_last:
+        couple_patient1_last = getattr(app_module, "caller_last_name", None) \
+            or getattr(app_module, "patient_last_name", None)
+
+    # Spouse relation: prefer the live message, otherwise recover the
+    # original request from the earliest user turn in history (the
+    # couple intent was stated there, possibly turns ago while
+    # pre-chart ran).
+    rel, first, last = _extract_spouse_name(message)
+    if not rel:
+        for turn in getattr(app_module, "conversation_history", []):
+            if turn.get("role") != "user":
+                continue
+            content = turn.get("content", "")
+            if any(w in content.lower() for w in _COUPLE_RELATION_WORDS):
+                rel, first, last = _extract_spouse_name(content)
+                if rel:
+                    break
+    if not rel:
+        for w in _COUPLE_RELATION_WORDS:
+            if w in message_lower:
+                rel = w
+                break
+    if rel and not couple_spouse_relation:
+        couple_spouse_relation = rel
+    if rel and not couple_patient2_first and first:
+        couple_patient2_first = first
+    if rel and not couple_patient2_last and last:
+        couple_patient2_last = last
+
+
+def _format_couple_names():
+    name1 = f"{couple_patient1_first} {couple_patient1_last}".strip()
+    name2 = f"{couple_patient2_first} {couple_patient2_last}".strip()
+    return name1, name2
+
+
+def _find_patient_record_lenient(first, last):
+    """Locate the most recent stored appointment for the couple flow,
+    tolerating a slightly misspelled last name. Exact "First Last"
+    lookup is tried first; when that misses, fall back to matching a
+    store key whose first name matches exactly and whose last name
+    shares a >= 3-char prefix with the given last name (e.g. the
+    patient saying "Jone" must still surface the stored "Jones" record).
+    Used ONLY by the couple locate step so a spouse-name typo cannot
+    silently route an existing couple into the fresh-booking path."""
+    if not (first and last):
+        return None
+    patient_full = f"{first} {last}".strip()
+    exact = get_next_appointment_for_patient(patient_full)
+    if exact:
+        return exact
+    first_l, last_l = first.lower(), last.lower()
+    best = None
+    for key, records in _load_appointments().items():
+        if not records:
+            continue
+        parts = key.split()
+        if len(parts) < 2:
+            continue
+        if parts[0].lower() != first_l:
+            continue
+        stored_last = parts[1].lower()
+        common = min(len(stored_last), len(last_l))
+        if common >= 3 and stored_last[:common] == last_l[:common]:
+            best = records[-1]
+    return best
+
+
+def _couple_stored_appointment_records():
+    """Return (record1, record2) = most recent Sprint14 appointment for
+    each couple patient, or (None, None) if either patient has no
+    on-file record or the couple's identities aren't both known yet.
+    Reads the SAME store the couple booking flow persists to."""
+    if not (couple_patient1_first and couple_patient1_last
+            and couple_patient2_first and couple_patient2_last):
+        return None, None
+    record1 = _find_patient_record_lenient(
+        couple_patient1_first, couple_patient1_last
+    )
+    record2 = _find_patient_record_lenient(
+        couple_patient2_first, couple_patient2_last
+    )
+    if record1 and record2:
+        return record1, record2
+    return None, None
+
+
+def _present_couple_locatable_appointments(record1, record2):
+    """Build the narration that LOCATES the couple's already-scheduled
+    appointments (both patients' records from the Sprint14 store) and
+    asks whether to keep or reschedule them."""
+    label = _visit_type_label(record1.get("visit_type", "wellness"))
+    day1 = record1.get("appointment_day")
+    day2 = record2.get("appointment_day")
+    prov1 = record1.get("provider")
+    prov2 = record2.get("provider")
+    return (
+        f"I can help with that. I show you and {couple_patient2_first} "
+        f"already have {label} scheduled - yours with "
+        f"{prov1 or 'your provider'} on {day1}, and "
+        f"{couple_patient2_first}'s with {prov2 or 'your provider'} on "
+        f"{day2}. Would you like to keep those appointments as they "
+        f"are, or reschedule them for a different day or time?"
+    )
+
+
+def _book_couple_pair(pair, provider_name, storage_provider=None):
+    """Persist both back-to-back appointments and return the closing
+    response confirming both slots. storage_provider defaults to
+    provider_name; pass the raw PCP name (may be None) so the
+    placeholder display label never lands in the appointment store."""
+    global couple_stage, wellness_stage, wellness_flow_active
+    global couple_reschedule_old_days
+    day, t1, t2 = pair
+    name1, name2 = _format_couple_names()
+    if storage_provider is None:
+        storage_provider = provider_name
+    # On a reschedule, replace the couple's existing visits with the new
+    # pair instead of appending a duplicate alongside the old record.
+    if couple_reschedule_old_days:
+        _remove_appointment_for_patient(name1, couple_reschedule_old_days[0])
+        _remove_appointment_for_patient(name2, couple_reschedule_old_days[1])
+        couple_reschedule_old_days = None
+    _persist_appointment(name1, couple_visit_type, f"{day} @ {t1}", storage_provider)
+    _persist_appointment(name2, couple_visit_type, f"{day} @ {t2}", storage_provider)
+    couple_stage = "complete"
+    wellness_stage = "complete"
+    wellness_flow_active = False
+    label = _visit_type_label(couple_visit_type)
+    return (
+        f"Perfect. I have you scheduled for {label} on {day} @ {t1}, "
+        f"and {couple_patient2_first} scheduled for {label} on "
+        f"{day} @ {t2}, back-to-back with {provider_name}. Is there "
+        f"anything else I can help you with today?"
+    )
+
+
+def _present_couple_pcp_pairs(provider_label):
+    """Generate/present the PCP's back-to-back couple slots. Prepends
+    the eligibility narration (both-eligible or accepted-not-eligible)
+    exactly once; the offset floor keeps every offered date at or after
+    the 1yr+1day eligible date."""
+    global couple_pcp_pairs, couple_eligibility_narration
+    narration = couple_eligibility_narration or ""
+    couple_eligibility_narration = None
+    if couple_pcp_pairs is None:
+        couple_pcp_pairs = generate_couple_pcp_pairs(couple_pcp_earliest_offset)
+    insurance_note = ""
+    if couple_visit_type:
+        insurance_note = {
+            "cha": "Based on your shared insurance, I will schedule "
+                   "you both for a Comprehensive Health Assessment. ",
+            "maw": "Based on your shared insurance, I will schedule "
+                   "you both for a Medicare Annual Wellness visit. ",
+            "wellness": "Based on your shared insurance, I will "
+                       "schedule you both for a standard wellness "
+                       "visit. ",
+        }[couple_visit_type]
+    return (
+        f"{narration}"
+        f"Great, let's get those scheduled back-to-back. {insurance_note}"
+        f"Here is {provider_label}'s availability:\n"
+        f"{format_couple_pairs(couple_pcp_pairs)}\n"
+        f"Which day and starting time works best for you? If none of "
+        f"these work, just let me know and I can check for sooner "
+        f"availability."
+    )
+
+
+def _handle_couple_wellness_flow(message, message_lower):
+    """Schedule annual wellness/MAW/CHA visits for BOTH a husband and
+    wife in one workflow:
+      1. Patient 1 = the caller (already identified by app.py).
+      2. Patient 2 = the spouse, named by the caller or asked for.
+      3. ONE shared insurance determination drives BOTH visit types -
+         Steve never invents a different insurance per person.
+      4. Back-to-back PCP slots are offered first; if they aren't soon
+         enough, escalate to Janet Walker (MAW/CHA) just like the
+         single-visit escalation ladder.
+    Returns None only if this message isn't a couple-flow reply at
+    all (letting the caller's standard stage ladder take over)."""
+    global couple_stage
+    global couple_patient2_first, couple_patient2_last
+    global couple_patient2_dob, couple_patient2_age
+    global couple_pcp_pairs, couple_covering_pairs
+    global couple_covering_provider_name
+    global couple_shared_insurance, couple_visit_type
+    global couple_last_visit_date1, couple_days_since_last_visit1
+    global couple_last_visit_date2, couple_days_since_last_visit2
+    global couple_eligible_both, couple_eligibility_narration
+    global couple_pcp_earliest_offset
+    global couple_existing_located
+    global couple_is_reschedule
+    global couple_reschedule_old_days
+    global wellness_stage, wellness_flow_active
+    global wellness_work_in_requested
+    global wellness_patient_pcp
+
+    import app as _app
+
+    _sync_couple_identity(message, message_lower, _app)
+
+    # Track whether the flow was entered by an explicit "reschedule"
+    # request (Bob already has visits on the books and is changing
+    # them), as opposed to a fresh "schedule" (back-to-back mentions
+    # "reschedule"/"schedule" in the first message; recorded once so a
+    # later reply mentioning "reschedule" can't flip fresh to reschedule).
+    if not couple_is_reschedule and "reschedule" in message_lower:
+        couple_is_reschedule = True
+
+    provider_label = wellness_patient_pcp or "your provider"
+
+    # Shared insurance determination happens exactly once and applies
+    # to BOTH patients - the core "same insurance for both" rule.
+    if not couple_shared_insurance:
+        couple_shared_insurance = determine_insurance_type_for_senior()
+        if couple_shared_insurance == "priority_medicare_advantage":
+            couple_visit_type = "cha"
+        elif couple_shared_insurance == "original_medicare":
+            couple_visit_type = "maw"
+        else:
+            couple_visit_type = "wellness"
+
+    if couple_stage is None:
+        if not couple_patient2_first or not couple_patient2_last:
+            couple_stage = "collect_spouse"
+        elif not couple_patient2_dob:
+            couple_stage = "collect_spouse_dob"
+        elif _couple_stored_appointment_records()[0]:
+            couple_stage = "locate_existing"
+        else:
+            couple_stage = "eligibility"
+
+    # ── Stage: collect the spouse's name (if not already stated) ──
+    if couple_stage == "collect_spouse":
+        relation = couple_spouse_relation or "spouse"
+        if not couple_patient1_first or not couple_patient1_last:
+            return "Could I get your first and last name, please?"
+        if not couple_patient2_first or not couple_patient2_last:
+            # The caller was just asked for the spouse's name, so a
+            # bare name reply ("William Brooks") is safe to accept.
+            plain_first, plain_last = _extract_plain_reply_names(
+                message,
+                exclude_first=couple_patient1_first,
+            )
+            if plain_first and not couple_patient2_first:
+                couple_patient2_first = plain_first
+            if plain_last and not couple_patient2_last:
+                couple_patient2_last = plain_last
+        if not couple_patient2_first:
+            action = "reschedule" if couple_is_reschedule else "schedule"
+            return (
+                f"Wonderful - I'd be happy to {action} your "
+                f"{relation}'s visit back-to-back with yours. Could I "
+                f"get your {relation}'s first and last name?"
+            )
+        if not couple_patient2_last:
+            return (
+                f"Thank you. Could I get {couple_patient2_first}'s "
+                f"last name?"
+            )
+        couple_stage = "collect_spouse_dob"
+        return _handle_couple_wellness_flow(message, message_lower)
+
+    # ── Stage: collect the spouse's DOB (parity with the single flow) ──
+    # Every couple entry point asks for the spouse's date of birth once
+    # both parts of her name are known - previously Steve jumped
+    # straight from the name reply into the eligibility narration
+    # without ever asking for HER date of birth. A DOB bundled into the
+    # same message as the name is captured here via the recursion below.
+    if couple_stage == "collect_spouse_dob":
+        if not couple_patient2_dob and detect_dob_in_message(message):
+            couple_patient2_dob = extract_dob_from_message(message)
+            couple_patient2_age = calculate_age_from_dob(couple_patient2_dob)
+        if not couple_patient2_dob:
+            return (
+                f"Thank you. And could I get "
+                f"{couple_patient2_first}'s date of birth, please?"
+            )
+        couple_stage = (
+            "locate_existing" if _couple_stored_appointment_records()[0]
+            else "eligibility"
+        )
+        return _handle_couple_wellness_flow(message, message_lower)
+
+    # ── Stage: locate the couple's already-scheduled appointments ──
+    # Reschedule/locate path entered when a callback request was generic
+    # ("I'd like to schedule appointments for my wife and myself") and
+    # BOTH patients already have Sprint14 records on file. Surfaces the
+    # stored appointments ("locates" them); a keep reply closes the
+    # flow, anything else jumps straight to the back-to-back rebooking
+    # slots (eligibility was already passed when they first booked).
+    if couple_stage == "locate_existing":
+        record1, record2 = _couple_stored_appointment_records()
+        if not (record1 and record2):
+            couple_stage = "eligibility"
+            return _handle_couple_wellness_flow(message, message_lower)
+        if not couple_existing_located:
+            couple_existing_located = True
+            return _present_couple_locatable_appointments(record1, record2)
+        if patient_wants_to_keep_appointments(message_lower):
+            couple_stage = "complete"
+            wellness_stage = "complete"
+            wellness_flow_active = False
+            return (
+                "Great - I'll leave both appointments exactly where they "
+                "are. Is there anything else I can help you with today?"
+            )
+        # The caller wants to MOVE the already-booked visits. Preserve the
+        # exact visit type stored on the existing appointments and never offer a
+        # replacement date earlier than either existing appointment.
+        stored_visit_type = record1.get("visit_type")
+        if stored_visit_type in ("wellness", "maw", "cha"):
+            couple_visit_type = stored_visit_type
+
+        couple_pcp_earliest_offset = _couple_reschedule_earliest_offset(
+            record1, record2
+        )
+
+        # Force fresh availability generation using the reschedule date floor.
+        couple_pcp_pairs = None
+        couple_covering_pairs = None
+
+        # Remember which visits are being replaced so the new booking
+        # removes them from the store rather than duplicating them.
+        couple_reschedule_old_days = (
+            record1.get("appointment_day"), record2.get("appointment_day")
+        )
+
+        couple_eligibility_narration = (
+            "Great. Let's find you a new day and time for both visits. "
+        )
+        couple_stage = "offer_pcp"
+        return _present_couple_pcp_pairs(provider_label)
+
+    # ── Stage: 1yr+1day eligibility check (BOTH patients) ──
+    if couple_stage == "eligibility":
+        if couple_days_since_last_visit1 is None or couple_days_since_last_visit2 is None:
+            (couple_last_visit_date1, couple_days_since_last_visit1) = (
+                generate_last_wellness_date()
+            )
+            (couple_last_visit_date2, couple_days_since_last_visit2) = (
+                generate_last_wellness_date()
+            )
+            elig1 = is_eligible_for_next_wellness(couple_days_since_last_visit1)
+            elig2 = is_eligible_for_next_wellness(couple_days_since_last_visit2)
+            couple_eligible_both = elig1 and elig2
+            relation = couple_spouse_relation or "spouse"
+            if couple_eligible_both:
+                couple_eligibility_narration = (
+                    f"I see your last wellness visit was on "
+                    f"{couple_last_visit_date1}. Since that is over a "
+                    f"year and a day ago, you are eligible for your next "
+                    f"wellness visit. And your {relation}'s last wellness "
+                    f"visit was on {couple_last_visit_date2}, so "
+                    f"{couple_patient2_first} is eligible as well. "
+                )
+                couple_stage = "offer_pcp"
+                return _present_couple_pcp_pairs(provider_label)
+            narration = ""
+            if elig1:
+                narration += (
+                    f"I see your last wellness visit was on "
+                    f"{couple_last_visit_date1}. Since that is over a "
+                    f"year and a day ago, you are eligible for your next "
+                    f"wellness visit. "
+                )
+            else:
+                narration += (
+                    f"I see your last wellness visit was on "
+                    f"{couple_last_visit_date1}. In order for your "
+                    f"insurance to count this appointment as a wellness "
+                    f"visit, your upcoming visit needs to be scheduled at "
+                    f"least one year and one day away from your last "
+                    f"wellness visit, so you will not be eligible again "
+                    f"until {calculate_next_eligible_date(couple_days_since_last_visit1)}. "
+                )
+            if elig2:
+                narration += (
+                    f"Your {relation}'s last wellness visit was on "
+                    f"{couple_last_visit_date2}, and "
+                    f"{couple_patient2_first} is eligible as well. "
+                )
+            else:
+                narration += (
+                    f"Your {relation}'s last wellness visit was on "
+                    f"{couple_last_visit_date2}, so "
+                    f"{couple_patient2_first} will not be eligible again "
+                    f"until {calculate_next_eligible_date(couple_days_since_last_visit2)}. "
+                )
+            couple_eligibility_narration = (
+                f"{narration}Since an annual wellness visit only counts "
+                f"as a wellness visit when it is scheduled at least a "
+                f"year and a day away from the previous one, are you OK "
+                f"scheduling your visits that far out, or were you hoping "
+                f"to schedule for a specific issue that would not count "
+                f"as an annual wellness visit?"
+            )
+            return couple_eligibility_narration
+
+        # Already evaluated and at least one patient is NOT eligible -
+        # the caller is now replying to the checkpoint question.
+        if patient_wants_to_proceed(message_lower) or patient_accepts_far_out_timeline(message_lower):
+            couple_pcp_earliest_offset = max(
+                max(367 - couple_days_since_last_visit1,
+                    367 - couple_days_since_last_visit2),
+                1,
+            )
+            # Clear the checkpoint text (it must not be prepended to the
+            # availability below) and confirm before pulling up the
+            # provider's back-to-back openings.
+            couple_eligibility_narration = (
+                "Great. I will schedule your visits on or after the date "
+                "you are both eligible for your next wellness visit. "
+            )
+            couple_stage = "offer_pcp"
+            return _present_couple_pcp_pairs(provider_label)
+        if patient_wants_to_decline(message_lower):
+            couple_stage = "complete"
+            wellness_stage = "complete"
+            wellness_flow_active = False
+            return (
+                "OK - since an annual wellness visit needs to be "
+                "scheduled at least one year and one day after the "
+                "previous one in order to count as a wellness visit, I "
+                "will hold off on scheduling those for now. Is there "
+                "anything else I can help you with today?"
+            )
+        return couple_eligibility_narration
+
+    # ── Stage: offer the PCP's back-to-back couple slots ──
+    if couple_stage == "offer_pcp":
+        if couple_pcp_pairs is None:
+            couple_pcp_pairs = generate_couple_pcp_pairs()
+        if detect_appointment_too_far_out(message_lower):
+            couple_stage = "offer_janet"
+            if couple_visit_type in ("maw", "cha"):
+                couple_covering_provider_name = JANET_WALKER_NAME
+                return (
+                    f"Your provider's earliest back-to-back opening is "
+                    f"not soon enough. Would you like me to check "
+                    f"{JANET_WALKER_NAME}'s availability instead?"
+                )
+            couple_covering_provider_name = COVERING_PROVIDER_BARE_NAME
+            return (
+                f"Your provider's earliest back-to-back opening is "
+                f"not soon enough. Would you like me to check "
+                f"{COVERING_PROVIDER_BARE_NAME}'s availability instead?"
+            )
+        picked = _match_couple_pair(message, message_lower, couple_pcp_pairs)
+        if picked:
+            return _book_couple_pair(
+                picked, provider_label, storage_provider=wellness_patient_pcp
+            )
+        requested_day = _couple_requested_day_unavailable(
+            message_lower, couple_pcp_pairs
+        )
+        if requested_day:
+            couple_stage = "offer_janet"
+            if couple_visit_type in ("maw", "cha"):
+                couple_covering_provider_name = JANET_WALKER_NAME
+                return (
+                    f"I don't see any {requested_day} openings for "
+                    f"{provider_label} in the availability I shared. "
+                    f"Would you like me to check "
+                    f"{JANET_WALKER_NAME}'s availability instead?"
+                )
+            couple_covering_provider_name = COVERING_PROVIDER_BARE_NAME
+            return (
+                f"I don't see any {requested_day} openings for "
+                f"{provider_label} in the availability I shared. "
+                f"Would you like me to check "
+                f"{COVERING_PROVIDER_BARE_NAME}'s availability instead?"
+            )
+        if patient_wants_to_decline(message_lower):
+            couple_stage = "offer_janet"
+            if couple_visit_type in ("maw", "cha"):
+                couple_covering_provider_name = JANET_WALKER_NAME
+                return (
+                    "I understand. Would you like me to check "
+                    f"{JANET_WALKER_NAME}'s availability instead?"
+                )
+            couple_covering_provider_name = COVERING_PROVIDER_BARE_NAME
+            return (
+                "I understand. Would you like me to check "
+                f"{COVERING_PROVIDER_BARE_NAME}'s availability instead?"
+            )
+        return _present_couple_pcp_pairs(provider_label)
+
+    # ── Stage: escalate to Janet Walker / covering provider ──
+    if couple_stage == "offer_janet":
+        if couple_covering_pairs:
+            picked = _match_couple_pair(message, message_lower, couple_covering_pairs)
+            if picked:
+                return _book_couple_pair(picked, couple_covering_provider_name)
+        if patient_wants_to_decline(message_lower):
+            wellness_work_in_requested = True
+            wellness_stage = "await_callback"
+            couple_stage = "await_callback"
+            return (
+                f"I will create a high priority work-in request so "
+                f"both of you can be seen. May I get a good callback "
+                f"number for you?"
+            )
+        if not couple_covering_pairs:
+            couple_covering_pairs = generate_couple_covering_pairs(
+                couple_pcp_earliest_offset
+            )
+            return (
+                f"Here is {couple_covering_provider_name}'s availability:\n"
+                f"{format_couple_pairs(couple_covering_pairs)}\n"
+                f"Which day and starting time works best for you?"
+            )
+        return (
+            f"Here is {couple_covering_provider_name}'s availability:\n"
+            f"{format_couple_pairs(couple_covering_pairs)}\n"
+            f"Which day and starting time works best for you?"
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────
 # Medication refill escalation (PDF Section 6)
 # ─────────────────────────────────────────────
 
@@ -2325,6 +3417,18 @@ def build_context():
         context += f"REFILL_ESCALATION_ACTIVE: stage={refill_stage}\n"
     if lab_order_ehr_guidance_active:
         context += f"LAB_ORDER_EHR_GUIDANCE_ACTIVE: stage={lab_order_ehr_stage}\n"
+
+    if wellness_requested_visit_type == "couple":
+        context += f"COUPLE_WELLNESS_ACTIVE: stage={couple_stage or 'init'}\n"
+        if couple_visit_type:
+            context += f"Shared visit type: {couple_visit_type}\n"
+        if couple_covering_provider_name:
+            context += f"Escalation provider: {couple_covering_provider_name}\n"
+        context += (
+            "Husband and wife back-to-back wellness scheduling. "
+            "Both patients share the same insurance and visit type. "
+            "Schedule ONLY back-to-back same-day pairs.\n"
+        )
 
     context += (
         "This workflow is handled deterministically by Python. Do NOT "
