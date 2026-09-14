@@ -28,7 +28,7 @@ from groq import Groq
 import Sprint13
 import Sprint14
 
-os.environ["GROQ_API_KEY"] = "WITHHELDFORPROTECTION"
+os.environ["GROQ_API_KEY"] = ""Withheldforprotection
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -5118,6 +5118,25 @@ def chat():
             lookup_first, lookup_last
         )
 
+        # Sprint14 fallback: the caller's appointment may live in the
+        # Sprint14 store (sprint14_appointments.json) rather than the
+        # generic store - e.g. a CHA/wellness visit booked via the
+        # Sprint14 couple flow. Without this, cancel phrasing on such a
+        # patient falls through to the LLM with no appointment facts and
+        # Steve hallucinates a day/time (observed: "Friday at 2:00 PM").
+        existing_sprint14_record = None
+        existing_sprint14_spouse = None
+        if not existing_generic_record:
+            existing_sprint14_record = Sprint14.get_next_appointment_for_patient(
+                f"{lookup_first} {lookup_last}"
+            )
+            if existing_sprint14_record and any(
+                    w in message_lower for w in ("wife", "husband", "spouse")
+            ):
+                existing_sprint14_spouse = (
+                    Sprint14.find_spouse_appointment_record(lookup_first, lookup_last)
+                )
+
         # Resume a reschedule already in progress: the previous turn
         # presented availability and asked for a new day/time, this
         # turn is the patient's selection. Checked before re-detecting
@@ -5474,6 +5493,42 @@ def chat():
                     {"role": "assistant", "content": generic_response}
                 )
                 return jsonify({"response": generic_response})
+            # Sprint14 fallback cancel - the appointment lives in
+            # sprint14_appointments.json (e.g. a wellness/CHA visit booked
+            # via the couple flow). Cancel the real stored visit(s), then
+            # confirm with the actual appointment_day so the LLM never
+            # improvises a day/time it cannot know.
+            if existing_sprint14_record:
+                s14_parts = []
+                removed_mine = Sprint14.cancel_appointment_for_patient(
+                    f"{lookup_first} {lookup_last}"
+                )
+                if removed_mine:
+                    s14_parts.append(
+                        f"your appointment on {removed_mine.get('appointment_day')}"
+                    )
+                if existing_sprint14_spouse:
+                    spouse_key, spouse_record = existing_sprint14_spouse
+                    if spouse_record and spouse_record.get("appointment_day"):
+                        Sprint14._remove_appointment_for_patient(
+                            spouse_key, spouse_record.get("appointment_day")
+                        )
+                        s14_parts.append(
+                            f"{spouse_key}'s appointment on "
+                            f"{spouse_record.get('appointment_day')}"
+                        )
+                if s14_parts:
+                    generic_response = (
+                        f"I have successfully cancelled {' and '.join(s14_parts)}. "
+                        f"Is there anything else I can help you with today?"
+                    )
+                    conversation_history.append(
+                        {"role": "user", "content": user_message}
+                    )
+                    conversation_history.append(
+                        {"role": "assistant", "content": generic_response}
+                    )
+                    return jsonify({"response": generic_response})
 
     # ─────────────────────────────────────────
     # Controlled-substance appointment bridge follow-up (Scenario 11/12)
