@@ -28,7 +28,7 @@ from groq import Groq
 import Sprint13
 import Sprint14
 
-os.environ["GROQ_API_KEY"] = ""Withheldforprotection
+os.environ["GROQ_API_KEY"] = "WITHHELDFORPROTECTION"
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -162,6 +162,13 @@ individual_six_month_followup_spouse_slot = None
 individual_six_month_followup_spouse_relation = None
 individual_six_month_followup_spouse_first_name = None
 individual_six_month_followup_spouse_last_name = None
+
+# Established-couple routine three-month follow-up workflow. Mirrors the
+# six-month flow's shape but is a deliberately separate set of variables
+# so the two flows never cross-trigger.
+individual_three_month_followup_active = False
+individual_three_month_followup_previous_visit_date = None
+individual_three_month_followup_days_since = None
 
 # Controlled-substance appointment bridge follow-up (Scenario 11/12).
 # Set when a patient explicitly requests an appointment with a named
@@ -763,7 +770,7 @@ def _generic_patient_record_key(first_name, last_name):
     return f"{first_name.strip().lower()}_{last_name.strip().lower()}"
 
 
-def store_generic_appointment_record(first_name, last_name, day_time_text, provider=None):
+def store_generic_appointment_record(first_name, last_name, day_time_text, provider=None, reason=None):
     """Persist a confirmed generic appointment's day/time (and provider,
     if known) under the patient's identity."""
     key = _generic_patient_record_key(first_name, last_name)
@@ -772,6 +779,7 @@ def store_generic_appointment_record(first_name, last_name, day_time_text, provi
     generic_appointment_records[key] = {
         "appointment_day": day_time_text,
         "provider": provider,
+        "reason": reason,
     }
     _save_generic_appointment_records()
 
@@ -806,6 +814,147 @@ def cancel_generic_appointment_record(first_name, last_name):
         _save_generic_appointment_records()
         return True
     return False
+
+
+# Prefixes to strip from a patient's raw request message when deriving
+# the appointment reason, so the stored reason reads as a clean
+# noun-phrase ("3 month follow up" rather than "I would like to
+# schedule a 3 month follow up"). Ordered longest-first at use time via
+# sorted(..., key=len, reverse=True) so "i need an" wins over "i need a"
+# (which is a string prefix of "i need an..."), or the trailing "n"
+# survives the strip.
+_REASON_PREFIXES = (
+    "i would like to schedule a",
+    "i would like to schedule an",
+    "i would like to book a",
+    "i would like to book an",
+    "i would like to make an appointment for",
+    "i would like to make an appointment",
+    "i would like to make a",
+    "i would like to make an",
+    "i would like to set up an appointment for",
+    "i would like to set up an appointment",
+    "i would like to set up a",
+    "i would like to set up an",
+    "i would like an appointment for",
+    "i would like an appointment",
+    "i would like a",
+    "i would like an",
+    "i want to schedule a",
+    "i want to schedule an",
+    "i want to book a",
+    "i want to book an",
+    "i need to schedule an appointment for a",
+    "i need to schedule an appointment for",
+    "i need to schedule a",
+    "i need to schedule an",
+    "i need an appointment for",
+    "i need an appointment",
+    "i need a",
+    "i need an",
+    "i want a",
+    "i want an",
+    "can i get an appointment for a",
+    "can i get an appointment for",
+    "can i get a",
+    "can i get an",
+)
+
+
+def _trim_reason_prefix(text):
+    """Best-effort cleanup of a patient's raw request message into a
+    reason noun-phrase, so the stored reason reads naturally when Steve
+    echoes it back ("3 month follow up" rather than "I would like to
+    schedule a 3 month follow up")."""
+    t = text.strip().strip(".,!?")
+    t_lower = t.lower()
+    for prefix in sorted(_REASON_PREFIXES, key=len, reverse=True):
+        if t_lower.startswith(prefix):
+            t = t[len(prefix):].strip().strip(".,!?")
+            break
+    if t.lower().startswith("appointment for "):
+        t = t[len("appointment for "):].strip()
+    return t
+
+
+def _is_appointment_transaction_turn(text):
+    """True for user turns that are NOT a reason-for-visit statement:
+    appointment inquiry ("when is my next appointment"), reschedule,
+    cancel, or a slot-selection confirmation. Such turns must never be
+    stored as the appointment's reason."""
+    text_lower = text.lower()
+    if detect_generic_appointment_inquiry_intent(text_lower):
+        return True
+    if any(kw in text_lower for kw in (
+            "reschedule", "cancel", "move my", "move it",
+    )):
+        return True
+    if (
+            any(day in text_lower for day in _GENERIC_APPT_DAY_NAMES)
+            and _find_time_in_text(text)
+    ):
+        return True
+    return False
+
+
+def _derive_generic_appointment_reason():
+    """Best-effort capture of the reason for a just-booked generic
+    appointment. Prefers deterministic flow state (three/six-month
+    follow-up, wellness visit types), then the patient's own stated
+    reason: first the bare answer immediately following Steve's
+    "What is the reason for this appointment?" prompt (these answers
+    often carry no scheduling keyword at all, e.g. "I've been having
+    knee pain"), then the earliest message that stated the visit
+    intent. Inquiry / reschedule / cancel / slot-selection turns are
+    always excluded so they can never be stored as the reason."""
+    if individual_three_month_followup_active:
+        return "3-month follow-up"
+    if individual_six_month_followup_active:
+        return "6-month follow-up"
+    if Sprint14.wellness_flow_active and Sprint14.wellness_requested_visit_type:
+        label = {
+            "wellness": "annual wellness visit",
+            "maw": "Medicare Annual Wellness visit",
+            "cha": "Comprehensive Health Assessment",
+        }.get(
+            Sprint14.wellness_requested_visit_type, "wellness visit"
+        )
+        return label
+    # Pass 1: the patient's bare reason given right after Steve asked
+    # for it ("What is the reason for this appointment?").
+    for i, turn in enumerate(conversation_history):
+        if turn.get("role") != "assistant":
+            continue
+        a_lower = turn.get("content", "").lower()
+        if "reason" in a_lower and "appointment" in a_lower and "?" in a_lower:
+            for nxt in conversation_history[i + 1:]:
+                if nxt.get("role") != "user":
+                    continue
+                ut = nxt.get("content", "").strip()
+                if _is_appointment_transaction_turn(ut):
+                    break
+                cleaned = _trim_reason_prefix(ut)
+                if cleaned:
+                    return cleaned
+            break
+    # Pass 2: the earliest message that stated the visit intent,
+    # skipping inquiry / reschedule / cancel / booking-selection turns.
+    for turn in conversation_history:
+        if turn.get("role") != "user":
+            continue
+        content = turn.get("content", "").strip()
+        text_lower = content.lower()
+        if _is_appointment_transaction_turn(content):
+            continue
+        if any(kw in text_lower for kw in (
+                "appointment", "schedule", "book",
+                "checkup", "physical", "follow", "recheck",
+                "visit",
+        )):
+            cleaned = _trim_reason_prefix(content)
+            if cleaned:
+                return cleaned
+    return None
 
 
 _GENERIC_APPT_DAY_NAMES = [
@@ -1915,6 +2064,21 @@ def is_six_month_followup_request(message_lower):
     )
 
 
+def is_three_month_followup_request(message_lower):
+    """Recognise an individual 3-month routine follow-up request. Kept
+    deliberately separate from is_six_month_followup_request() so the two
+    flows never cross-trigger: a "3 month" phrase cannot match any of the
+    six-month phrases above and vice versa."""
+    return any(
+        phrase in message_lower for phrase in [
+            "3 month follow up", "3-month follow up",
+            "three month follow up", "three-month follow up",
+            "3 month follow-up", "3-month follow-up",
+            "three month follow-up", "three-month follow-up",
+        ]
+    )
+
+
 def is_couple_six_month_followup_request(message_lower):
     return (
         bool(_JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower))
@@ -1979,10 +2143,12 @@ def handle_couple_six_month_followup_flow(message):
                 store_generic_appointment_record(
                     caller_first_name, caller_last_name,
                     f"{day} {first_time}",
+                    reason=_derive_generic_appointment_reason(),
                 )
                 store_generic_appointment_record(
                     patient_first_name, patient_last_name,
                     f"{day} {second_time}",
+                    reason=_derive_generic_appointment_reason(),
                 )
                 couple_followup_flow_active = False
                 return (
@@ -2339,6 +2505,7 @@ def _new_patient_after_consent_response():
             new_patient_first_name, new_patient_last_name,
             new_patient_appointment_selection,
             provider=new_patient_offered_provider,
+            reason=_derive_generic_appointment_reason(),
         )
         address_name = (
                 caller_first_name or new_patient_household_primary_first_name
@@ -3345,6 +3512,7 @@ def handle_new_patient_flow(message, message_lower):
                 new_patient_first_name, new_patient_last_name,
                 new_patient_appointment_selection,
                 provider=new_patient_offered_provider,
+                reason=_derive_generic_appointment_reason(),
             )
             address_name = caller_first_name if caller_first_name else new_patient_first_name
             confirmation = (
@@ -4294,6 +4462,9 @@ def home():
     individual_six_month_followup_spouse_relation = None
     individual_six_month_followup_spouse_first_name = None
     individual_six_month_followup_spouse_last_name = None
+    individual_three_month_followup_active = False
+    individual_three_month_followup_previous_visit_date = None
+    individual_three_month_followup_days_since = None
     controlled_substance_appt_pending = False
     controlled_substance_appt_medication_word = None
     controlled_substance_appt_schedule = None
@@ -4411,6 +4582,9 @@ def chat():
     global individual_six_month_followup_spouse_relation
     global individual_six_month_followup_spouse_first_name
     global individual_six_month_followup_spouse_last_name
+    global individual_three_month_followup_active
+    global individual_three_month_followup_previous_visit_date
+    global individual_three_month_followup_days_since
     global controlled_substance_appt_pending, controlled_substance_appt_medication_word
     global controlled_substance_appt_schedule, controlled_substance_bridge_awaiting_days
     global controlled_substance_appt_day_name, controlled_substance_appt_date
@@ -4472,6 +4646,18 @@ def chat():
             individual_six_month_followup_previous_visit_date = (
                 datetime.now() - timedelta(
                     days=individual_six_month_followup_days_since
+                )
+            ).strftime("%B %d, %Y")
+
+    if is_three_month_followup_request(message_lower):
+        individual_three_month_followup_active = True
+        if individual_three_month_followup_previous_visit_date is None:
+            individual_three_month_followup_days_since = random.randint(
+                60, 120
+            )
+            individual_three_month_followup_previous_visit_date = (
+                datetime.now() - timedelta(
+                    days=individual_three_month_followup_days_since
                 )
             ).strftime("%B %d, %Y")
 
@@ -4836,6 +5022,7 @@ def chat():
                 individual_six_month_followup_spouse_first_name,
                 individual_six_month_followup_spouse_last_name,
                 individual_six_month_followup_spouse_slot,
+                reason=_derive_generic_appointment_reason(),
             )
             individual_six_month_followup_active = False
             individual_six_month_followup_spouse_stage = None
@@ -4897,7 +5084,8 @@ def chat():
                 # would corrupt the appointment record.
                 if primary_slot.strip() != user_message.strip():
                     store_generic_appointment_record(
-                        caller_first_name, caller_last_name, primary_slot
+                        caller_first_name, caller_last_name, primary_slot,
+                        reason=_derive_generic_appointment_reason(),
                     )
                 individual_six_month_followup_spouse_stage = "name"
                 individual_six_month_followup_spouse_slot = spouse_slot
@@ -5118,25 +5306,6 @@ def chat():
             lookup_first, lookup_last
         )
 
-        # Sprint14 fallback: the caller's appointment may live in the
-        # Sprint14 store (sprint14_appointments.json) rather than the
-        # generic store - e.g. a CHA/wellness visit booked via the
-        # Sprint14 couple flow. Without this, cancel phrasing on such a
-        # patient falls through to the LLM with no appointment facts and
-        # Steve hallucinates a day/time (observed: "Friday at 2:00 PM").
-        existing_sprint14_record = None
-        existing_sprint14_spouse = None
-        if not existing_generic_record:
-            existing_sprint14_record = Sprint14.get_next_appointment_for_patient(
-                f"{lookup_first} {lookup_last}"
-            )
-            if existing_sprint14_record and any(
-                    w in message_lower for w in ("wife", "husband", "spouse")
-            ):
-                existing_sprint14_spouse = (
-                    Sprint14.find_spouse_appointment_record(lookup_first, lookup_last)
-                )
-
         # Resume a reschedule already in progress: the previous turn
         # presented availability and asked for a new day/time, this
         # turn is the patient's selection. Checked before re-detecting
@@ -5165,7 +5334,11 @@ def chat():
             chosen_new_time = extracted_new_time or user_message.strip()
             store_generic_appointment_record(
                 lookup_first, lookup_last, chosen_new_time,
-                provider=existing_generic_record.get("provider")
+                provider=existing_generic_record.get("provider"),
+                reason=(
+                    existing_generic_record.get("reason")
+                    or _derive_generic_appointment_reason()
+                ),
             )
             generic_reschedule_pending = False
             generic_response = (
@@ -5276,8 +5449,17 @@ def chat():
             provider = spouse_record.get("provider") if spouse_record else None
             if provider is None and existing_generic_record:
                 provider = existing_generic_record.get("provider")
+            reason = (
+                (spouse_record.get("reason") if spouse_record else None)
+                or (
+                    existing_generic_record.get("reason")
+                    if existing_generic_record else None
+                )
+                or _derive_generic_appointment_reason()
+            )
             store_generic_appointment_record(
-                spouse_first, spouse_last, spouse_slot, provider=provider
+                spouse_first, spouse_last, spouse_slot,
+                provider=provider, reason=reason,
             )
             generic_spouse_reschedule_pending = False
             generic_spouse_reschedule_slot = None
@@ -5493,42 +5675,6 @@ def chat():
                     {"role": "assistant", "content": generic_response}
                 )
                 return jsonify({"response": generic_response})
-            # Sprint14 fallback cancel - the appointment lives in
-            # sprint14_appointments.json (e.g. a wellness/CHA visit booked
-            # via the couple flow). Cancel the real stored visit(s), then
-            # confirm with the actual appointment_day so the LLM never
-            # improvises a day/time it cannot know.
-            if existing_sprint14_record:
-                s14_parts = []
-                removed_mine = Sprint14.cancel_appointment_for_patient(
-                    f"{lookup_first} {lookup_last}"
-                )
-                if removed_mine:
-                    s14_parts.append(
-                        f"your appointment on {removed_mine.get('appointment_day')}"
-                    )
-                if existing_sprint14_spouse:
-                    spouse_key, spouse_record = existing_sprint14_spouse
-                    if spouse_record and spouse_record.get("appointment_day"):
-                        Sprint14._remove_appointment_for_patient(
-                            spouse_key, spouse_record.get("appointment_day")
-                        )
-                        s14_parts.append(
-                            f"{spouse_key}'s appointment on "
-                            f"{spouse_record.get('appointment_day')}"
-                        )
-                if s14_parts:
-                    generic_response = (
-                        f"I have successfully cancelled {' and '.join(s14_parts)}. "
-                        f"Is there anything else I can help you with today?"
-                    )
-                    conversation_history.append(
-                        {"role": "user", "content": user_message}
-                    )
-                    conversation_history.append(
-                        {"role": "assistant", "content": generic_response}
-                    )
-                    return jsonify({"response": generic_response})
 
     # ─────────────────────────────────────────
     # Controlled-substance appointment bridge follow-up (Scenario 11/12)
@@ -6564,7 +6710,7 @@ def chat():
     ) and not is_medical_professional_caller and not (
             individual_six_month_followup_active
             and individual_six_month_followup_eligible is False
-    ):
+    ) and not individual_three_month_followup_active:
         if (
                 not is_same_day or virtual_visit_accepted_now
                 or same_day_virtual_clinic_declined_now
@@ -7867,6 +8013,62 @@ def chat():
                 f"{_holiday_closure_block}"
             )
 
+    individual_three_month_followup_context = ""
+    if individual_three_month_followup_active:
+        _three_month_due = (
+            datetime.now() - timedelta(
+                days=individual_three_month_followup_days_since
+            ) + timedelta(days=90)
+        ).date()
+        three_month_due_text = _three_month_due.strftime("%B %d, %Y")
+        _holiday_closure_block = ""
+        _closed_holiday_dates = sorted(
+            (d, n) for d, n in
+            _office_holidays_near(_three_month_due.year).items()
+            if datetime.now().date() < d <= datetime.now().date() + timedelta(days=200)
+        )
+        if _closed_holiday_dates:
+            _holiday_closure_block = (
+                "RECOGNIZED OFFICE HOLIDAY CLOSURES (office CLOSED, do NOT "
+                "offer, confirm, or mention an appointment on any of): "
+                + "; ".join(
+                    f"{d.strftime('%B %d, %Y')} {n}"
+                    for d, n in _closed_holiday_dates
+                ) + ".\n"
+            )
+        _earliest = max(
+            _three_month_due, (datetime.now() + timedelta(days=1)).date()
+        )
+        _post_due_business_days = []
+        _cursor = _earliest
+        while len(_post_due_business_days) < 5:
+            if (
+                    _cursor.weekday() < 5
+                    and not is_recognized_office_holiday(_cursor)
+            ):
+                _post_due_business_days.append(
+                    _cursor.strftime("%A, %B %d, %Y")
+                )
+            _cursor += timedelta(days=1)
+        _post_due_dates_text = "; ".join(_post_due_business_days)
+        individual_three_month_followup_context = (
+            "INDIVIDUAL_THREE_MONTH_FOLLOWUP INJECTED BY SYSTEM:\n"
+            f"Previous appointment date: "
+            f"{individual_three_month_followup_previous_visit_date} "
+            f"({individual_three_month_followup_days_since} days ago).\n"
+            f"The patient is due for a routine 3-month follow-up on or "
+            f"after {three_month_due_text}. Offer ONLY the following "
+            "exact dates (do NOT offer, mention, or invent any date "
+            f"earlier than {three_month_due_text} or outside this list):\n"
+            f"- {_post_due_dates_text}\n"
+            "Use ONLY dates from this list, consistently, for the rest "
+            "of the call.\n"
+            "The patient has already stated the reason for this "
+            "appointment (the routine 3-month follow-up). Do NOT ask "
+            "for the appointment reason.\n"
+            f"{_holiday_closure_block}"
+        )
+
     conversation_history.append({"role": "user", "content": user_message})
 
     phf_context = Sprint13.build_context()
@@ -7881,6 +8083,7 @@ def chat():
             medical_professional_context + "\n" +
             pcp_context + "\n" +
             individual_six_month_followup_context + "\n" +
+            individual_three_month_followup_context + "\n" +
             nurse_ma_context + "\n" +
             lab_order_fax_to_facility_context + "\n" +
             lab_order_pickup_context + "\n" +
@@ -7933,9 +8136,11 @@ def chat():
                 capture_first = patient_first_name or caller_first_name
                 capture_last = patient_last_name or caller_last_name
                 store_generic_appointment_record(
-                    capture_first, capture_last, confirmed_generic_appt
+                    capture_first, capture_last, confirmed_generic_appt,
+                    reason=_derive_generic_appointment_reason(),
                 )
                 individual_six_month_followup_active = False
+                individual_three_month_followup_active = False
                 # Scenario 11/12: if this booking was for a
                 # controlled-substance-reason appointment, append a
                 # deterministic Python-authored bridge question rather
