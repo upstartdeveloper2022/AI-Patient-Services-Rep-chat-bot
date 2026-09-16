@@ -28,7 +28,7 @@ from groq import Groq
 import Sprint13
 import Sprint14
 
-os.environ["GROQ_API_KEY"] = "WITHHELDFORPROTECTION"
+os.environ["GROQ_API_KEY"] = "withheldforprotection"
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -1094,6 +1094,62 @@ GENERIC_APPOINTMENT_INQUIRY_TRIGGERS = [
 
 def detect_generic_appointment_inquiry_intent(message_lower):
     return any(t in message_lower for t in GENERIC_APPOINTMENT_INQUIRY_TRIGGERS)
+
+
+# ─────────────────────────────────────────
+# Provider-cancelled appointment: why did it happen?
+# ─────────────────────────────────────────
+# PCPs occasionally cancel scheduled appointments. When a patient calls
+# asking why their appointment was cancelled, Steve must never guess -
+# the reason is chosen deterministically from this weighted list and
+# recited verbatim. Weights MUST sum to 100 (25% labs, 25% provider
+# time off, 20% family emergency, 20% out sick, 10% termination for
+# misconduct). The why-question must be answered ahead of any generic
+# cancel-trigger block so "why did you cancel my appointment" is read
+# as a question, not as a NEW request to cancel the appointment.
+CANCELLATION_REASONS_WITH_WEIGHTS = [
+    ("the lab work required prior to the appointment had not been completed", 25),
+    ("the provider needed to take time off", 25),
+    ("the provider had a family emergency", 20),
+    ("the provider was out sick", 20),
+    ("the provider had to terminate the patient-provider relationship due to patient misconduct", 10),
+]
+
+_CANCELLATION_REASON_WEIGHTS = tuple(
+    w for _, w in CANCELLATION_REASONS_WITH_WEIGHTS
+)
+
+CANCELLATION_WHY_TRIGGERS = [
+    "why was my appointment cancelled", "why was my appointment canceled",
+    "why did my appointment get cancelled", "why did my appointment get canceled",
+    "why did you cancel my appointment", "why did the office cancel my appointment",
+    "why did the doctor cancel my appointment", "why did the provider cancel my appointment",
+    "why was my appointment brought up as cancelled", "why is my appointment cancelled",
+    "was my appointment cancelled", "was my appointment canceled",
+    "my appointment was cancelled", "my appointment was canceled",
+    "my appointment got cancelled", "my appointment got canceled",
+    "who cancelled my appointment", "who canceled my appointment",
+    "can you tell me why my appointment was cancelled",
+    "can you tell me why my appointment was canceled",
+]
+
+
+def detect_cancellation_why_intent(message_lower):
+    return any(t in message_lower for t in CANCELLATION_WHY_TRIGGERS)
+
+
+def _pick_cancellation_reason(round_index=None):
+    """Returns one of the five standard cancellation reasons per the
+    configured weights (25/25/20/20/10). Pass round_index (0-4) to
+    force a specific reason for tests; otherwise a weighted random pick,
+    so over many calls each reason appears with its probability."""
+    if round_index is not None:
+        return CANCELLATION_REASONS_WITH_WEIGHTS[round_index][0]
+    return random.choices(
+        CANCELLATION_REASONS_WITH_WEIGHTS,
+        weights=_CANCELLATION_REASON_WEIGHTS,
+        k=1,
+    )[0][0]
 
 
 def get_next_business_day():
@@ -2314,6 +2370,23 @@ CONVERSATION_CLOSING_PHRASES = [
     "no have a good day", "no that's it", "no thats it",
     "no we're good", "no we are good",
     "no i don't need anything else", "no i do not need anything else",
+    "have a good day", "have a great day",
+    "no you have been very helpful", "you have been very helpful",
+    "no you've been very helpful", "you've been very helpful",
+    "no you have been so helpful", "you have been so helpful",
+    "no you were very helpful", "you were very helpful",
+    "no you've been so helpful", "you've been so helpful",
+    "no you've been really helpful", "you've been really helpful",
+    "thank you for your help", "no thank you for your help",
+    "thank you for all your help", "no thank you for all your help",
+    "thanks for your help", "no thanks for your help",
+    "thanks for all your help", "no thanks for all your help",
+    "no that's all you've been very helpful",
+    "no that is all you have been very helpful",
+    "that's all you've been very helpful",
+    "thats all you've been very helpful",
+    "that's all you have been very helpful",
+    "thats all you have been very helpful",
 ]
 
 
@@ -5306,6 +5379,43 @@ def chat():
             lookup_first, lookup_last
         )
 
+        # Provider-cancelled appointment: patient wants to know WHY it
+        # was cancelled. Deterministic - never delegated to the LLM.
+        # Runs before the reschedule/cancel trigger blocks below so a
+        # message like "why did you cancel my appointment" is answered
+        # as a question instead of being treated as a new cancel
+        # request that erases the record. Answers regardless of whether
+        # a record is still on file (the appointment may already have
+        # been removed by the provider's office).
+        if detect_cancellation_why_intent(message_lower):
+            cancelled_day = (
+                existing_generic_record.get("appointment_day")
+                if existing_generic_record else None
+            )
+            why_provider = (
+                (existing_generic_record.get("provider")
+                 if existing_generic_record else None)
+                or get_patient_pcp_from_history()
+                or "your provider"
+            )
+            why_day_phrase = (
+                f" on {cancelled_day}" if cancelled_day else ""
+            )
+            why_reason = _pick_cancellation_reason()
+            generic_response = (
+                f"I apologize for the inconvenience. Your appointment"
+                f"{why_day_phrase} was cancelled by {why_provider} "
+                f"because {why_reason}. Is there anything else I can "
+                f"help you with today?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": generic_response}
+            )
+            return jsonify({"response": generic_response})
+
         # Resume a reschedule already in progress: the previous turn
         # presented availability and asked for a new day/time, this
         # turn is the patient's selection. Checked before re-detecting
@@ -5889,7 +5999,11 @@ def chat():
         for turn in reversed(conversation_history):
             if turn.get("role") == "assistant":
                 last_assistant_lower = turn.get("content", "").lower()
-                if "anything else" in last_assistant_lower and "?" in last_assistant_lower:
+                if ("anything else" in last_assistant_lower and (
+                        "?" in last_assistant_lower
+                        or "i can help" in last_assistant_lower
+                        or "can i help" in last_assistant_lower
+                )):
                     last_assistant_offered_closing = True
                 break
 
@@ -8063,6 +8177,11 @@ def chat():
             f"- {_post_due_dates_text}\n"
             "Use ONLY dates from this list, consistently, for the rest "
             "of the call.\n"
+            "Also state the patient's previous appointment date "
+            f"({individual_three_month_followup_previous_visit_date}) in "
+            "your availability response and use it consistently.\n"
+            "In that same availability response, explicitly list the "
+            "offered dates above so the patient can choose.\n"
             "The patient has already stated the reason for this "
             "appointment (the routine 3-month follow-up). Do NOT ask "
             "for the appointment reason.\n"
@@ -8112,7 +8231,7 @@ def chat():
 
     try:
         response = client.chat.completions.create(
-            model="qwen/qwen3.6-27b",
+            model="qwen/qwen3.8-27b",
             messages=messages,
             reasoning_effort="none",
             max_completion_tokens=900
