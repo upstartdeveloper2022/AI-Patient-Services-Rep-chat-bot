@@ -1835,6 +1835,29 @@ def handle_appointment_lookup(message_lower):
             f"I show you have {visit} scheduled with {provider} on "
             f"{appt}. Is there anything else I can help you with today?"
         )
+    # Sprint 15 fix: a generic (non-wellness) appointment - e.g. a
+    # 3-month follow-up booked through LLM-driven generic scheduling -
+    # lives in app.py's own generic_appointment_records store, NOT in
+    # this Sprint14 wellness store. Without this fallback, a patient
+    # whose only appointment on file is a generic one got "I don't see
+    # any upcoming appointments" here, because the generic inquiry
+    # block in app.py (which reads that store) never runs - this lookup
+    # handler short-circuits first. Read the generic store as the
+    # fallback so every scheduled appointment is answerable in one place.
+    generic = app.get_stored_generic_appointment_record(first, last)
+    if generic and generic.get("appointment_day"):
+        appt = generic["appointment_day"]
+        provider = generic.get("provider") or "your provider"
+        reason = generic.get("reason")
+        reason_label = None
+        if reason:
+            reason_label = re.split(r"[.!?\n]", reason, maxsplit=1)[0].strip()
+        reason_clause = f" for {reason_label}" if reason_label else ""
+        return (
+            f"I show you have an appointment scheduled{reason_clause} "
+            f"with {provider} on {appt}. Is there anything else I can "
+            f"help you with today?"
+        )
     print(f"[Sprint14] LOOKUP MISS: key={patient_key!r}, "
           f"file={APPOINTMENTS_JSON_PATH}, exists={os.path.exists(APPOINTMENTS_JSON_PATH)}")
     return (
