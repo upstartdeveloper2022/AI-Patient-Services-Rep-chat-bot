@@ -63,6 +63,24 @@ new_patient_flow_active = False
 new_patient_requested_provider = None
 new_patient_is_minor = None
 new_patient_minor_age = None
+new_patient_parent_on_line_pending = None
+# Sprint 15 (established patients): the under-18 DOB gate lives in the
+# new-patient flow, but existing patients (e.g. "I'm a patient of Dr.
+# Smith") never enter handle_new_patient_flow - determine_pre_chart_response
+# digests their DOB and only sets dob_collected. These flags carry the
+# parent/guardian gate for the established-patient path so a minor like
+# "Alice Addison, DOB 5/2/2011" cannot book without a guardian on the line.
+established_patient_minor_pending = None
+established_patient_minor_age = None
+established_patient_minor_guardian_confirmed = False
+established_patient_dob = None
+# Sprint 15 (established patients): parent FETCHED the minor away from
+# pre-chart ("...going to put my mom on the phone right now. Please
+# wait." was routed by the transfer branch) and Steve said "Go ahead,
+# I'll wait." While True, the next message(s) are expected from the
+# parent/guardian who must identify themselves by name before the gate
+# is confirmed and scheduling can proceed.
+established_patient_minor_waiting = False
 new_patient_eligible_providers = None
 new_patient_offered_provider = None
 new_patient_accepting_checked = False
@@ -139,6 +157,14 @@ acute_new_time_pending = False
 # generic_appointment_records instead of the simulated acute visit.
 generic_reschedule_pending = False
 generic_joint_cancel_pending = False
+# Provider-cancelled appointment reschedule offer (the cancellation-why
+# path): the reason-answer turn asks "Would you like to reschedule it?",
+# a yes-turn presents availability, and the following turn captures the
+# picked slot. Kept independent of generic_reschedule_pending above
+# because a cancelled appointment may no longer be on file at all.
+generic_cancelled_reschedule_pending = False
+generic_cancelled_reschedule_offered = False
+generic_cancelled_reschedule_provider = None
 # Spouse leg of a generic reschedule: the caller asked to move a
 # spouse's appointment too, but the office cannot pull up/change the
 # spouse's record without first collecting their first and last name
@@ -1175,6 +1201,135 @@ def detect_dob_in_message(message):
     return bool(dob_pattern.search(message))
 
 
+def _parent_yes_in_message(message):
+    """Deterministic parent/guardian-on-line YES router (Sprint 15).
+
+    After the under-18 DOB gate asked the minor's caller whether a
+    parent or guardian can come on the phone, THIS is the child's yes
+    reply. "Yes" here is a DIFFERENT axis from the appointment-proceed
+    yes ("yes, I want to book") - a minor saying "yes, my dad is right
+    here" must route the parent onto the line, NOT the adult booking
+    ladder. These phrases are the exact "parent is physically present"
+    confirmations we pass to _parent_yes_in_message from the dob stage.
+    """
+    # A negation ("my mom isnt home", "no she cannot come") is ALWAYS a
+    # refusal to produce a guardian, never a confirmation - even though
+    # the message contains "she"/"my mom". Without this guard the bare
+    # relationship-token match below would misroute those as YES and
+    # book a minor whose guardian explicitly declined to get on the line.
+    if _parent_no_in_message(message):
+        return False
+    yes_pattern = re.compile(
+        r'\b(yes|yeah|yep|yup|sure|absolutely|of course|okay|ok|fine)\b|'
+        r'\b(she|he|my (mum|mom|mother|dad|daddy|father|parent|guardian|'
+        r'grandma|grandfather|grandparent))\b',
+        re.IGNORECASE
+    )
+    return bool(yes_pattern.search(message))
+
+
+def _parent_no_in_message(message):
+    """Deterministic parent/guardian-on-line NO router (Sprint 15).
+
+    The minor's reply to "put the parent/guardian on the phone now"
+    declined to have the parent come on. Steve must never book a minor
+    without a guardian - so this routes to the warm no-parent exit (no
+    appointment scheduled, parent asked to call back) instead of the
+    adult booking ladder.
+    """
+    no_pattern = re.compile(
+        # Bug fix: the trailing \b is attached to the WHOLE group, not
+        # just the last alternative - otherwise a bare "no" has no right
+        # word-boundary and matches the "no" inside unrelated words like
+        # "nOW" ("put my mom on the phone right now" -> false NO, hanging
+        # up on a minor whose parent is literally being fetched).
+        r'\b(no|nope|nah|not (right )?now|not available|cant|can\'t|'
+        r'cannot|guards?)\b',  # not available right now
+        re.IGNORECASE
+    )
+    if no_pattern.search(message):
+        return True
+    # Explicit "parent is not here" / "they are not available" catches
+    no_parent_pattern = re.compile(
+        r'\b(parent|guardian|mom|dad|mother|father|she|he)\b[^.!?]{0,40}'
+        r'\b(not (here|available|home|able)|isn\'t|isnt|cant|can\'t|cannot|'
+        r'won\'t|wont)\b',
+        re.IGNORECASE
+    )
+    return bool(no_parent_pattern.search(message))
+
+
+def _parent_transfer_in_message(message):
+    """Deterministic parent/guardian-on-line TRANSFER router (Sprint 15).
+
+    A minor's reply to the under-18 gate question is not always a plain
+    yes/no ("yes, my mom is right here" / "no, she cannot come"). The
+    most common third shape is a TRANSFER announcement: the child is
+    about to fetch the parent but the parent is NOT yet on the line -
+    e.g. "I'm going to put my mom on the phone right now. Please wait."
+    or "hold on, I'll get my dad". Such a message is neither a guardian
+    confirmation (the guardian has not spoken) nor a refusal (they are
+    coming) - Steve must acknowledge the transfer and WAIT for the
+    parent to identify themselves, not prematurely declare the guardian
+    confirmed. Detected phrases are the "go get the parent" /
+    "putting them on" constructions WITHOUT the parent having spoken.
+    """
+    transfer_pattern = re.compile(
+        r'\b(going to put|gonna put|i\'?ll put|i will put|let me put|'
+        r'putting (?:my |her |him |the )?|get my|let me get|i\'?ll get|'
+        r'i will get|going to get|go get|bring|sending|transferring|'
+        r'hold on|one moment|please wait|just a (second|moment|minute)|'
+        r'wait (?:a|one) (?:second|moment|minute|bit)|'
+        r'put (?:my |the )?(?:mom|mum|mother|dad|daddy|father|parent|guardian)[^.!?]{0,30}'
+        r'on (?:the )?(?:phone|line))|'
+        r'\b(go get|fetch|retrieve)\b',
+        re.IGNORECASE
+    )
+    return bool(transfer_pattern.search(message))
+
+
+# Relationship/pronoun/low-content words that extract_names_from_message
+# can mistake for a caller identity when a parent self-introduces without
+# actually giving their name (e.g. "This is her mom", "I'm his father",
+# "Hi, my name is her mom"). Used by _established_parent_name_from_message
+# to reject such false captures so Steve keeps asking for a real name
+# instead of "confirming" a guardian whose name he never received.
+_ESTABLISHED_PARENT_NONNAME_TOKENS = frozenset({
+    "her", "his", "my", "our", "their", "the", "a", "an",
+    "mom", "mum", "mother", "dad", "daddy", "father",
+    "parent", "guardian", "grandma", "grandma", "grandmother",
+    "grandpa", "grandfather", "she", "he", "they", "wait", "waiting",
+    "hi", "hello", "hey", "yes", "yeah", "okay", "ok", "sure", "just",
+    "here", "there", "coming", "phone", "line", "right", "now",
+    "please", "one", "moment", "second", "minute", "hold", "gonna",
+})
+
+
+def _established_parent_name_from_message(message):
+    """Extract the parent/guardian's own first+last name from a message
+    spoken once they are on (or announced on) the line. Reuses
+    extract_names_from_message's caller patterns ("this is X Y", "my
+    name is X Y", "I'm X Y", bare "X Y") but rejects the relationship /
+    pronoun captures that would otherwise misidentify "This is her mom"
+    as a guardian named "Her Mom". Returns (first, last) or (None, None).
+    """
+    extracted = extract_names_from_message(message)
+    first = extracted.get("caller_first")
+    last = extracted.get("caller_last")
+    if not first or not last:
+        return None, None
+    if first.lower() in _ESTABLISHED_PARENT_NONNAME_TOKENS:
+        return None, None
+    if last.lower() in _ESTABLISHED_PARENT_NONNAME_TOKENS:
+        return None, None
+    if first.lower() == last.lower():
+        return None, None
+    # A transfer announcement carries no parent name yet ("I'm going to
+    # put my mom on the phone right now") - the only plausible extract
+    # there would be a false "my mom", which the token filter rejects.
+    return first, last
+
+
 def extract_dob_from_message(message):
     dob_pattern = re.compile(
         r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b|'
@@ -1931,7 +2086,8 @@ MEDICARE_TRIGGERS = [
 def calculate_age_from_dob(dob_string):
     """Parses a DOB string and returns age in years, or None if unparseable."""
     dob_patterns = [
-        "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y"
+        "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
+        "%B %d, %Y", "%B %d %Y",
     ]
     for fmt in dob_patterns:
         try:
@@ -2678,6 +2834,7 @@ def _household_consent_availability_question(relation):
 def handle_new_patient_flow(message, message_lower):
     global new_patient_flow_active, new_patient_requested_provider
     global new_patient_is_minor, new_patient_minor_age
+    global new_patient_parent_on_line_pending
     global caller_first_name, caller_last_name
     global new_patient_eligible_providers, new_patient_offered_provider
     global new_patient_accepting_checked, new_patient_no_provider_available
@@ -3374,11 +3531,81 @@ def handle_new_patient_flow(message, message_lower):
             return "Could I get your first and last name?"
 
         if new_patient_demographics_stage == "dob":
+            # ── Parent-on-line router (Sprint 15): after the under-18 gate
+            # above asked the minor's caller whether a parent/guardian can
+            # come on the line, THIS turn is the child's yes/no reply. It
+            # must be routed BEFORE the DOB-digest if below, because that
+            # digest already happened last turn - the demographics stage is
+            # still "dob", so a reply saying "yes, my dad is right here"
+            # contains NO date of birth and would otherwise fall straight
+            # out of the ladder stages below and get silently swallowed by
+            # the adult-path caller logic. Route in, deterministically.
+            if new_patient_parent_on_line_pending:
+                new_patient_parent_on_line_pending = False
+                if _parent_yes_in_message(message):
+                    # Parent is on the line: capture their name as the
+                    # caller (guardian) - one opportunistic parse, matching
+                    # the caller-stage behavior for adult callers - then
+                    # route straight to address collection so the parent
+                    # continues the registration with the patient beside
+                    # them on the line.
+                    pf, pl = aggressive_name_extraction(message)
+                    if pf and pl:
+                        caller_first_name = pf
+                        caller_last_name = pl
+                    new_patient_demographics_stage = "address"
+                    return (
+                        "Perfect - I have the parent or guardian on the line. "
+                        "Could I get the street address where the patient lives?"
+                    )
+                if _parent_no_in_message(message):
+                    # No parent available right now: Steve must never book
+                    # a minor without a guardian - apologize, ask the parent
+                    # to call back when they are available, and end warmly
+                    # with no appointment scheduled.
+                    return (
+                        "I completely understand. As the patient is under 18, "
+                        "I am not able to schedule the appointment without a "
+                        "parent or guardian on the line. When your parent "
+                        "or guardian is available, please give us a call "
+                        "back and we will be glad to help. We look forward "
+                        "to hearing from you. Take care!"
+                    )
             if detect_dob_in_message(message):
                 new_patient_dob = extract_dob_from_message(message)
+                # ── Under-18 gate (Sprint 15): Steve must never schedule
+                # a minor without a parent/guardian on the line. The DOB
+                # was just digested above, so compute the age from it and
+                # check the <18 bound deterministically BEFORE asking who
+                # is on the call (Caller stage below) - for an adult the
+                # caller is the patient, but for a minor the caller is the
+                # parent and must be explicitly routed onto the line first.
+                dob_age = calculate_age_from_dob(new_patient_dob)
+                if dob_age is not None and dob_age < 18:
+                    # Deterministic minor-from-DOB detection: DOB-derived
+                    # age under 18. The existing phrase-based minor
+                    # detection (new_patient_is_minor) fires on "my son /
+                    # my 8 year old daughter" - it NEVER computes age from
+                    # a raw DOB. So a minor who simply gave Steve their
+                    # DOB without stating a relationship or age gets past
+                    # that phrase gate today. Set the dedicated flag now -
+                    # and persist the parent-on-line confirmation through
+                    # the NEXT turn so a "yes, my parent is right here"
+                    # reply is routed onto the parent confirmation prompt
+                    # rather than silently swallowed by the caller stage.
+                    new_patient_is_minor = True
+                    new_patient_minor_age = dob_age
+                    new_patient_parent_on_line_pending = True
+                    return (
+                        f"Thank you for that. Since the patient is "
+                        f"{dob_age} and under 18, I need to confirm a "
+                        f"parent or guardian is on the line with you. "
+                        f"Would it be okay to put the patient's parent "
+                        f"or guardian on the phone now?"
+                    )
                 # After collecting the patient's DOB, ask who is on the
                 # call (caller) before continuing with address collection.
-                # For adult patients, the caller is the patient — name already collected.
+                # For adult patients, the caller is the patient �?" name already collected.
                 if not new_patient_is_minor and new_patient_first_name and new_patient_last_name:
                     # Household fix: don't overwrite the caller's own
                     # identity with the second household member's name
@@ -3755,6 +3982,94 @@ def determine_pre_chart_response(message, message_lower):
     global patient_last_name, caller_is_patient, pre_chart_complete
     global dob_collected, third_party_detected, pcp_collected
     global is_medical_professional_caller, third_party_availability_asked
+    global established_patient_minor_pending, established_patient_minor_age
+    global established_patient_minor_guardian_confirmed, established_patient_dob
+    global established_patient_minor_waiting
+
+    # Sprint 15 (established patients): parent/guardian-on-line router. The
+    # under-18 DOB gate below armed established_patient_minor_pending last
+    # turn by intercepting the minor's digested DOB right before pre-chart
+    # would have completed; THIS turn is the minor's yes/no reply to
+    # "can the parent or guardian come on the line?" Route it here, BEFORE
+    # name extraction - a reply like "yes, my mom is here" contains no
+    # patient name to extract and would otherwise fall straight through
+    # the caller_is_patient checks and get silently swallowed.
+    if established_patient_minor_pending:
+        established_patient_minor_pending = False
+        if _parent_yes_in_message(message):
+            if _parent_transfer_in_message(message):
+                # The minor did not say "yes, they are here" - they said
+                # they are GOING TO FETCH the parent ("I'm going to put
+                # my mom on the phone right now. Please wait." / "hold
+                # on, I'll get my dad"). The parent has not spoken yet,
+                # so this is NOT a guardian confirmation: acknowledge,
+                # arm the waiting state, and let the parent identify
+                # themselves by name on the next turn.
+                established_patient_minor_waiting = True
+                return "Go ahead, I'll wait."
+            # Parent/guardian is on the line now (or their name is in
+            # this reply): capture their name as the caller (the
+            # patient's identity stays the minor), mark the guardian
+            # confirmed so the gate never re-arms this call, and
+            # complete pre-chart - the minor's name/DOB/PCP were
+            # already collected before the gate fired.
+            parent_first, parent_last = _established_parent_name_from_message(message)
+            if parent_first and parent_last:
+                caller_first_name = parent_first
+                caller_last_name = parent_last
+                established_patient_minor_guardian_confirmed = True
+                pre_chart_complete = True
+                return "How can I help you today?"
+            # The parent is on the line but has not identified
+            # themselves yet - collect the guardian's name before any
+            # scheduling begins.
+            established_patient_minor_waiting = True
+            return (
+                "Perfect - I have the parent or guardian on the line. "
+                "Could I get your first and last name, please?"
+            )
+        if _parent_no_in_message(message):
+            # No parent/guardian available right now: Steve must never book
+            # a minor without a guardian - apologize, ask the parent to call
+            # back when available, and end warmly with no appointment booked.
+            return (
+                "I completely understand. As the patient is under 18, "
+                "I am not able to schedule the appointment without a "
+                "parent or guardian on the line. When your parent "
+                "or guardian is available, please give us a call "
+                "back and we will be glad to help. We look forward "
+                "to hearing from you. Take care!"
+            )
+        # Ambiguous reply - not a clear yes or no. Re-arm the gate and ask
+        # again so a minor is never booked without an explicit guardian.
+        established_patient_minor_pending = True
+        return (
+            "I still need to confirm a parent or guardian is on the line "
+            "before I can help with that. Would it be okay to put the "
+            "patient's parent or guardian on the phone now?"
+        )
+
+    # Sprint 15 (established patients): the minor said they were going to
+    # fetch the parent ("I'm going to put my mom on the phone right now.
+    # Please wait.") or that the parent is already on the line, so Steve
+    # replied "Go ahead, I'll wait." / asked for the guardian's name.
+    # THIS turn is the parent/guardian speaking for the first time.
+    # Capture their identity: if they give a name, confirm the guardian
+    # and complete pre-chart (the minor's name/DOB/PCP were already
+    # collected before the gate fired); if they only announce the
+    # relationship ("this is her mom") without a name, keep waiting and
+    # collect the name - a guardian who never identifies themselves is
+    # never confirmed.
+    if established_patient_minor_waiting:
+        parent_first, parent_last = _established_parent_name_from_message(message)
+        if parent_first and parent_last:
+            caller_first_name = parent_first
+            caller_last_name = parent_last
+            established_patient_minor_waiting = False
+            established_patient_minor_guardian_confirmed = True
+            pre_chart_complete = True
+            return "How can I help you today?"
+        return "Thank you. Could I get your first and last name, please?"
 
     # Bug fix: mirror the Sprint13.phf_intent_detected guard used on the
     # equivalent medical-professional intercept in the /chat route. This
@@ -3840,6 +4155,8 @@ def determine_pre_chart_response(message, message_lower):
 
     if detect_dob_in_message(message):
         dob_collected = True
+        if not established_patient_dob:
+            established_patient_dob = extract_dob_from_message(message)
 
     provider = detect_provider_in_message(message_lower)
     if provider:
@@ -3896,6 +4213,37 @@ def determine_pre_chart_response(message, message_lower):
             return (
                 "Which primary care provider do you see at our practice?"
             )
+        # Sprint 15 (established patients): deterministic under-18 gate.
+        # Existing patients never enter handle_new_patient_flow, so the
+        # minor DOB they give here in pre-chart is the ONLY place we can
+        # catch it - compute the age from the digested DOB right before
+        # pre-chart would otherwise complete and hand control to the adult
+        # scheduling flow. A minor (e.g. "Alice Addison, DOB 5/2/2011")
+        # must confirm a parent/guardian is on the line before any booking.
+        # Guarded to only fire in the plain established-patient booking
+        # path - mirrors the surrounding Sprint13.phf_flow_active guards
+        # that step aside for specialty workflows.
+        if (
+            not Sprint13.phf_flow_active
+            and not Sprint13.phf_intent_detected
+            and established_patient_dob
+            and not established_patient_minor_guardian_confirmed
+            and not established_patient_minor_pending
+        ):
+            established_patient_minor_age = calculate_age_from_dob(
+                established_patient_dob
+            )
+            if (
+                established_patient_minor_age is not None
+                and established_patient_minor_age < 18
+            ):
+                established_patient_minor_pending = True
+                return (
+                    f"Thank you for that. Since you are under the age of "
+                    f"18, I need to confirm a parent or guardian is with "
+                    f"you. Would it be okay to put the patient's parent "
+                    f"or guardian on the phone now?"
+                )
         pre_chart_complete = True
         return None
 
@@ -4440,6 +4788,10 @@ def home():
     global ma_request_reason_asked
     global new_patient_flow_active, new_patient_requested_provider
     global new_patient_is_minor, new_patient_minor_age
+    global new_patient_parent_on_line_pending
+    global established_patient_minor_pending, established_patient_minor_age
+    global established_patient_minor_guardian_confirmed, established_patient_dob
+    global established_patient_minor_waiting
     global new_patient_eligible_providers, new_patient_offered_provider
     global new_patient_accepting_checked, new_patient_no_provider_available
     global new_patient_insurance_collected, new_patient_insurance_type
@@ -4469,6 +4821,8 @@ def home():
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
     global generic_reschedule_pending, generic_joint_cancel_pending
+    global generic_cancelled_reschedule_pending
+    global generic_cancelled_reschedule_offered, generic_cancelled_reschedule_provider
     global generic_spouse_reschedule_pending
     global generic_spouse_reschedule_slot, generic_spouse_reschedule_relation
     global couple_followup_flow_active, couple_followup_previous_visit_date
@@ -4520,6 +4874,9 @@ def home():
     acute_new_time_pending = False
     generic_reschedule_pending = False
     generic_joint_cancel_pending = False
+    generic_cancelled_reschedule_pending = False
+    generic_cancelled_reschedule_offered = False
+    generic_cancelled_reschedule_provider = None
     generic_spouse_reschedule_pending = False
     generic_spouse_reschedule_slot = None
     generic_spouse_reschedule_relation = None
@@ -4562,7 +4919,14 @@ def home():
     new_patient_flow_active = False
     new_patient_requested_provider = None
     new_patient_is_minor = None
+    new_patient_is_minor = None
     new_patient_minor_age = None
+    new_patient_parent_on_line_pending = None
+    established_patient_minor_pending = None
+    established_patient_minor_age = None
+    established_patient_minor_guardian_confirmed = False
+    established_patient_dob = None
+    established_patient_minor_waiting = False
     new_patient_eligible_providers = None
     new_patient_offered_provider = None
     new_patient_accepting_checked = False
@@ -4642,6 +5006,8 @@ def chat():
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
     global generic_reschedule_pending, generic_joint_cancel_pending
+    global generic_cancelled_reschedule_pending
+    global generic_cancelled_reschedule_offered, generic_cancelled_reschedule_provider
     global generic_spouse_reschedule_pending
     global generic_spouse_reschedule_slot, generic_spouse_reschedule_relation
     global couple_followup_flow_active, couple_followup_previous_visit_date
@@ -4672,6 +5038,10 @@ def chat():
     global ma_request_reason_asked
     global new_patient_flow_active, new_patient_requested_provider
     global new_patient_is_minor, new_patient_minor_age
+    global new_patient_parent_on_line_pending
+    global established_patient_minor_pending, established_patient_minor_age
+    global established_patient_minor_guardian_confirmed, established_patient_dob
+    global established_patient_minor_waiting
     global new_patient_eligible_providers, new_patient_offered_provider
     global new_patient_accepting_checked, new_patient_no_provider_available
     global new_patient_insurance_collected, new_patient_insurance_type
@@ -4934,10 +5304,34 @@ def chat():
         existing_new_patient_appt_statement = bool(
             _EXISTING_NEW_PATIENT_APPOINTMENT_PATTERN.search(message_lower)
         )
+        # Bug fix: "for my daughter" / "schedule my son" / "establish my
+        # child" are how a parent asks for NEW-patient intake for a child -
+        # but the SAME phrase appears when the parent of an ESTABLISHED
+        # minor books for the patient already identified in this call
+        # ("I'd like to schedule an appointment for my daughter Alice"
+        # after Alice's name/DOB/PCP were collected and the guardian was
+        # confirmed). Once this call already has an established patient
+        # with a DOB on file and pre-chart complete, a bare relationship
+        # phrase must NOT reopen new-patient intake and re-ask for the
+        # provider. An explicit "new patient"/"not a patient" in the same
+        # message still starts new-patient intake, since it is a different
+        # trigger and is unaffected by this exclusion.
+        relationship_new_patient_phrases = (
+            "schedule my child", "schedule my son", "schedule my daughter",
+            "for my son", "for my daughter", "for my child",
+            "establish my child", "establish my son", "establish my daughter",
+        )
+        established_patient_identified = bool(
+            pre_chart_complete and established_patient_dob
+        )
         unambiguous_match = (
                 any(
                     trigger in message_lower for trigger in NEW_PATIENT_TRIGGERS
                     if trigger not in ambiguous_new_patient_phrases
+                    and not (
+                        established_patient_identified
+                        and trigger in relationship_new_patient_phrases
+                    )
                 )
                 and not existing_new_patient_appt_statement
         )
@@ -5402,12 +5796,90 @@ def chat():
                 f" on {cancelled_day}" if cancelled_day else ""
             )
             why_reason = _pick_cancellation_reason()
-            generic_response = (
-                f"I apologize for the inconvenience. Your appointment"
-                f"{why_day_phrase} was cancelled by {why_provider} "
-                f"because {why_reason}. Is there anything else I can "
-                f"help you with today?"
+            if "misconduct" in why_reason:
+                generic_response = (
+                    f"{why_provider} dismissed you for misconduct. You "
+                    f"are no longer a patient of {why_provider}. Is "
+                    f"there anything else that I can help you with?"
+                )
+            else:
+                generic_response = (
+                    f"I apologize for the inconvenience. Your appointment"
+                    f"{why_day_phrase} was cancelled by {why_provider} "
+                    f"because {why_reason}. Would you like to reschedule "
+                    f"it?"
+                )
+                generic_cancelled_reschedule_pending = True
+                generic_cancelled_reschedule_offered = False
+                generic_cancelled_reschedule_provider = why_provider
+            conversation_history.append(
+                {"role": "user", "content": user_message}
             )
+            conversation_history.append(
+                {"role": "assistant", "content": generic_response}
+            )
+            return jsonify({"response": generic_response})
+
+        # Continue a reschedule offer made by the cancellation-why block
+        # above: while pending, the yes-turn presents availability and
+        # the following turn captures the patient's picked slot. Kept
+        # deterministic and independent of generic_reschedule_pending
+        # (which requires a record still on file) since a cancelled
+        # appointment may no longer be on file at all.
+        if generic_cancelled_reschedule_pending:
+            if not generic_cancelled_reschedule_offered:
+                if patient_wants_to_decline(message_lower):
+                    generic_cancelled_reschedule_pending = False
+                    generic_response = (
+                        "No problem. Is there anything else I can help "
+                        "you with today?"
+                    )
+                elif (
+                        patient_wants_to_proceed(message_lower)
+                        or "reschedule" in message_lower
+                ):
+                    schedule = generate_weekly_availability()
+                    avail_lines = [
+                        f"{day}: {', '.join(slots)}"
+                        for day, slots in schedule.items() if slots
+                    ]
+                    avail_text = (
+                        "; ".join(avail_lines) if avail_lines
+                        else "no availability this week"
+                    )
+                    generic_cancelled_reschedule_offered = True
+                    generic_response = (
+                        "Great. Here is what we have available - "
+                        f"{avail_text}. Which day and time works best "
+                        "for you?"
+                    )
+                else:
+                    generic_response = "Would you like to reschedule it?"
+            else:
+                extracted_new_time = _extract_calendar_date_slot_from_text(
+                    user_message
+                )
+                if not extracted_new_time:
+                    extracted_new_time = _extract_day_time_from_reply(
+                        user_message
+                    )
+                chosen_new_time = extracted_new_time or user_message.strip()
+                store_generic_appointment_record(
+                    lookup_first, lookup_last, chosen_new_time,
+                    provider=generic_cancelled_reschedule_provider,
+                    reason=(
+                        existing_generic_record.get("reason")
+                        if existing_generic_record else None
+                    ) or _derive_generic_appointment_reason(),
+                )
+                generic_cancelled_reschedule_pending = False
+                generic_cancelled_reschedule_offered = False
+                generic_cancelled_reschedule_provider = None
+                generic_response = (
+                    f"Perfect, I've scheduled your appointment for "
+                    f"{chosen_new_time}. Is there anything else I can "
+                    f"help you with today?"
+                )
             conversation_history.append(
                 {"role": "user", "content": user_message}
             )
@@ -8046,6 +8518,31 @@ def chat():
     if pcp_collected:
         pcp_context = "PCP_ALREADY_COLLECTED: Do NOT ask for PCP again.\n"
 
+    # Sprint 15 (established patients): once the parent/guardian of an
+    # under-18 existing patient has come on the line and identified
+    # themselves, the guardian is authorized to schedule on the patient's
+    # behalf. Without this signal the AI can misapply the third-party /
+    # under-18 rules to the parent's own scheduling request and refuse
+    # ("have the patient call us directly") or re-ask settled questions.
+    # The static prompt already tells it to ask the reason for a future
+    # appointment when none is stated; this only removes the guardian
+    # ambiguity so that instruction fires reliably.
+    established_guardian_context = ""
+    if established_patient_minor_guardian_confirmed and patient_first_name:
+        established_guardian_context = (
+            "MINOR_GUARDIAN_CONFIRMED INJECTED BY SYSTEM:\n"
+            f"The patient, {patient_first_name}, is under 18 and a parent "
+            "or guardian is on the line with them right now and has "
+            "identified themselves. The guardian is authorized to schedule "
+            "on the patient's behalf. Proceed with scheduling normally: do "
+            "NOT ask the patient to call back, do NOT say the patient must "
+            "call directly, do NOT run HIPAA verification, do NOT ask for "
+            "the guardian again, and do NOT ask which provider (the "
+            "patient's PCP is already on file). If no reason for the visit "
+            "has been stated, ask exactly: \"What is the reason for the "
+            "appointment?\"\n"
+        )
+
     individual_six_month_followup_context = ""
     if individual_six_month_followup_active:
         due_date = (
@@ -8201,6 +8698,7 @@ def chat():
             todays_date_context + "\n" +
             medical_professional_context + "\n" +
             pcp_context + "\n" +
+            established_guardian_context + "\n" +
             individual_six_month_followup_context + "\n" +
             individual_three_month_followup_context + "\n" +
             nurse_ma_context + "\n" +
