@@ -28,11 +28,89 @@ from groq import Groq
 import Sprint13
 import Sprint14
 
-os.environ["GROQ_API_KEY"] = "withheldforprotection"
-
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
-client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+# ─────────────────────────────────────────────
+# Groq API key loading
+# ─────────────────────────────────────────────
+# Keys are read from the environment (optionally seeded from the local,
+# gitignored .env file) instead of a hardcoded literal, so a key can be
+# rotated without editing this file. Multiple keys are supported so that
+# when one account hits its daily token cap (HTTP 429) the next key is
+# tried automatically: set GROQ_API_KEYS to a comma-separated list,
+# and/or GROQ_API_KEY, GROQ_API_KEY_2, GROQ_API_KEY_3, ... Duplicates are
+# dropped and order is preserved (primary first).
+def _load_dotenv(path):
+    """Minimal stdlib .env loader (no python-dotenv dependency). Only
+    sets variables not already present in the environment, so a real
+    environment variable always wins over the file."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, _, value = line.partition("=")
+                name = name.strip()
+                value = value.strip().strip('"').strip("'")
+                if name and name not in os.environ:
+                    os.environ[name] = value
+    except OSError:
+        pass
+
+
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+
+def _collect_groq_api_keys():
+    keys = []
+    for raw in (os.environ.get("GROQ_API_KEYS", ""),
+                os.environ.get("GROQ_API_KEY", "")):
+        for candidate in raw.split(","):
+            candidate = candidate.strip()
+            if candidate and candidate not in keys:
+                keys.append(candidate)
+    index = 2
+    while True:
+        candidate = os.environ.get(f"GROQ_API_KEY_{index}", "").strip()
+        if not candidate:
+            break
+        if candidate not in keys:
+            keys.append(candidate)
+        index += 1
+    return keys
+
+
+GROQ_API_KEYS = _collect_groq_api_keys()
+groq_clients = [Groq(api_key=key) for key in GROQ_API_KEYS]
+client = groq_clients[0] if groq_clients else None
+
+
+def groq_create_completion(messages, **kwargs):
+    """Call the Groq API, rotating through all configured keys on any
+    error.  The *last* error is re-raised so real failures still surface
+    once every key has been tried."""
+    if not groq_clients:
+        raise RuntimeError(
+            "No Groq API key configured. Set GROQ_API_KEY in the "
+            "environment or in the project's .env file."
+        )
+    last_error = None
+    for idx, groq_client in enumerate(groq_clients):
+        try:
+            return groq_client.chat.completions.create(
+                messages=messages, **kwargs
+            )
+        except Exception as e:
+            last_error = e
+            print(
+                f"[groq_create_completion] key#{idx + 1}/{len(groq_clients)} "
+                f"failed: {e}"
+            )
+    raise last_error
 
 conversation_history = []
 profanity_count = 0
@@ -44,6 +122,8 @@ dob_collected = False
 patient_self_dob_verified = False
 pcp_collected = False
 verbal_consent_requested = False
+third_party_consent_asked = False
+third_party_consent_obtained = False
 response_time_stated = False
 office_hours_stated = False
 lab_result_fax_active = False
@@ -175,6 +255,18 @@ generic_spouse_reschedule_pending = False
 generic_spouse_reschedule_slot = None
 generic_spouse_reschedule_relation = None
 
+# Virtual-visit wait workflow: the patient is awaiting a scheduled
+# virtual visit and reports the PCP hasn't joined (or shows any sign of
+# annoyance with the wait). Steve explains the provider is running
+# behind, offers to reschedule or wait a little longer, presents the
+# provider's availability on a reschedule, and thanks the patient if
+# they choose to wait.
+virtual_wait_active = False
+virtual_wait_choice_pending = False
+virtual_wait_reschedule_pending = False
+virtual_wait_reschedule_schedule = None
+virtual_wait_reschedule_provider = None
+
 # Established-couple routine six-month follow-up workflow.
 couple_followup_flow_active = False
 couple_followup_previous_visit_date = None
@@ -218,6 +310,23 @@ controlled_substance_bridge_awaiting_pharmacy = False
 controlled_substance_bridge_awaiting_callback = False
 controlled_substance_bridge_callback_number = None
 controlled_substance_bridge_confirmed_insufficient = False
+
+# Generic (non-PHF) appointment availability snapshot. The weekly
+# schedule is randomly generated; before this cache it was regenerated
+# on EVERY turn, so a slot Steve offered on one turn (e.g. "Friday,
+# September 18 at 1:00 PM") could be absent from the freshly-generated
+# schedule injected on the very next turn when the patient accepted it -
+# producing "that time is not available" for a slot Steve had just
+# listed. Generate once per call and reuse; reset alongside the other
+# per-call state in home().
+generic_weekly_schedule_snapshot = None
+
+# Covering-provider counterpart to generic_weekly_schedule_snapshot. The
+# covering schedule is also randomly generated and was regenerated on
+# every turn, so a covering slot offered on one turn (when the PCP had no
+# availability) could be absent when the patient accepted it. Cache it the
+# same way; reset alongside the other per-call state in home().
+generic_covering_weekly_schedule_snapshot = None
 
 # Pre-chart state
 caller_first_name = None
@@ -460,6 +569,23 @@ _JOINT_APPOINTMENT_REFERENCE_PATTERN = re.compile(
     # "need to" + action-verb phrasing a caller naturally uses when
     # asking to cancel or reschedule on behalf of both of them.
     r"|\bwe\s+(?:would\s+like\s+to|want\s+to|need\s+to)\b",
+    re.IGNORECASE
+)
+
+# Bug fix: the virtual-visit wait phrasing "have/had been waiting for
+# my pcp/doctor/provider to join" contains "for my", which is a
+# THIRD_PARTY_PHRASES entry - so the patient's own wait complaint was
+# misrouted into the third-party HIPAA consent workflow ("Is the
+# patient available right now so I can ask for their consent?") and the
+# wait support flow never ran. Waiting "for my <provider>" (the
+# caller's OWN provider, phrased in first person) is unambiguously the
+# patient speaking for themself, never a third party. Same symmetric
+# exclusion shape as _JOINT_APPOINTMENT_REFERENCE_PATTERN above: allows
+# caller_is_patient=True inference and suppresses third-party detection.
+_VIRTUAL_WAIT_SELF_PATTERN = re.compile(
+    r"\b(?:been\s+|i(?:'m| am| have|'ve| have\s+been)\s+)?"
+    r"wait(?:ing|ed)?\s+(?:for|on)\s+my\s+"
+    r"(?:pcp|provider|physician|doctor|dr\.?)",
     re.IGNORECASE
 )
 
@@ -1706,6 +1832,85 @@ VIRTUAL_VISIT_REFUSAL_TRIGGERS = [
     "i really think he needs to see", "i really think she needs to see",
     "technically challenged", "in person",
 ]
+
+# Virtual-visit wait / late-PCP workflow. Detects a patient who says
+# they've been waiting for the PCP to join the virtual visit or gives
+# any indication they are annoyed with the wait, so Steve can
+# acknowledge the delay and offer to reschedule or wait.
+VIRTUAL_WAIT_DIRECT_PHRASES = [
+    "waiting for the doctor", "waiting for dr", "waiting for dr.",
+    "waiting for my doctor", "waiting for the provider",
+    "waiting for my pcp", "waiting for the physician",
+    "waiting for the pcp", "waiting on dr", "waiting on dr.",
+    "waiting on the doctor", "waiting on the provider",
+    "waiting on my pcp", "waiting on the pcp",
+    "doctor hasn't joined", "doctor has not joined",
+    "provider hasn't joined", "provider has not joined",
+    "pcp hasn't joined", "pcp has not joined",
+    "doctor hasn't shown up", "provider hasn't shown up",
+    "doctor hasn't started", "provider hasn't started",
+    "doctor to join", "provider to join", "pcp to join",
+    "join the virtual visit", "join my virtual visit",
+    "join the video visit", "join the video call",
+    "virtual visit hasn't started",
+    "waiting for the doctor to join", "waiting for the pcp to join",
+]
+
+VIRTUAL_WAIT_WAITING_WORDS = [
+    "waiting", "wait", "how much longer", "running late",
+    "running behind",
+]
+
+VIRTUAL_WAIT_PROVIDER_WORDS = [
+    "doctor", "provider", "pcp", "physician", "dr.",
+]
+
+VIRTUAL_WAIT_JOIN_WORDS = [
+    "join", "virtual", "video", "telehealth",
+]
+
+VIRTUAL_WAIT_ANNOYANCE_WORDS = [
+    "annoyed", "annoying", "frustrated", "impatient", "tired of waiting",
+    "sick of waiting", "ridiculous", "taking too long", "taking forever",
+    "is he even coming", "is she even coming", "what's taking so long",
+]
+
+VIRTUAL_WAIT_RESCHEDULE_PHRASES = [
+    "reschedule", "rebook", "another day", "another time",
+    "different day", "different time", "a different day",
+    "a different time", "move it", "move my",
+]
+
+VIRTUAL_WAIT_STAY_PHRASES = [
+    "i'll wait", "i will wait", "ill wait", "i can wait",
+    "i'll hold", "i will hold", "i'll stay on", "i will stay on",
+    "wait a little longer", "wait longer", "i'm fine to wait",
+    "i am fine to wait", "ok i'll wait", "okay i'll wait",
+    "no thank you", "thats fine", "that's fine",
+]
+
+VIRTUAL_WAIT_SCHEDULING_WORDS = [
+    "appointment", "get in", "get to see", "get to see him",
+    "get to see her", "book", "schedule", "waiting list",
+    "to be seen", "to see", "next available",
+    "first available",
+]
+
+
+def detect_virtual_wait_annoyance(message_lower):
+    """Return True when the patient reports waiting for the PCP to join
+    the virtual visit or shows any sign of annoyance with the wait."""
+    if any(p in message_lower for p in VIRTUAL_WAIT_DIRECT_PHRASES):
+        return True
+    waiting = any(w in message_lower for w in VIRTUAL_WAIT_WAITING_WORDS)
+    provider = any(w in message_lower for w in VIRTUAL_WAIT_PROVIDER_WORDS)
+    joining = any(w in message_lower for w in VIRTUAL_WAIT_JOIN_WORDS)
+    annoyed = any(a in message_lower for a in VIRTUAL_WAIT_ANNOYANCE_WORDS)
+    if not (provider or joining) or not (waiting or annoyed):
+        return False
+    if any(n in message_lower for n in VIRTUAL_WAIT_SCHEDULING_WORDS):
+        return False
+    return True
 
 UTI_TRIGGERS = [
     "uti", "urinary tract infection", "burning when i urinate",
@@ -3898,8 +4103,8 @@ def extract_names_from_message(message):
         # Avoid matching verbs like 'calling' after "I'm" or "I am".
         # Use a negative lookahead to skip common phrases such as
         # "I'm calling for" or "I'm calling about".
-        r"(?i:i(?:'|)m)\s+(?!(?i:calling\b|calling\s+for\b|calling\s+about\b))([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
-        r"(?i:i\s+am)\s+(?!(?i:calling\b|calling\s+for\b|calling\s+about\b))([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
+        r"(?i:i(?:'|)m)\s+(?!(?i:calling\b|calling\s+for\b|calling\s+about\b|not\b))([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
+        r"(?i:i\s+am)\s+(?!(?i:calling\b|calling\s+for\b|calling\s+about\b|not\b))([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
         # Fallback: a bare "Firstname Lastname" reply with no prefix at
         # all (e.g. answering "for whom do I have the pleasure of
         # speaking" with just "Nick Adams"). Anchored to the WHOLE
@@ -3916,7 +4121,14 @@ def extract_names_from_message(message):
         # lowercase two-word message here would meaningfully raise the
         # risk of matching an unrelated two-word reply as if it were a
         # name.
-        r"^\s*([A-Z][A-Za-z]*)\s+([A-Z][A-Za-z]*)\s*$",
+        # Bug fix: a transcribed answer ("Helen Harper.") may carry a
+        # trailing period/punctuation, which the old \s*$ anchor
+        # rejected - so the caller's name was never captured, the
+        # deterministic HIPAA gate never fired, and the LLM improvised
+        # a reply ("Thank") instead of the prescribed verdict. Tolerate
+        # trailing punctuation without weakening the whole-message,
+        # two-capitalized-words anchor.
+        r"^\s*([A-Z][A-Za-z]*)\s+([A-Z][A-Za-z]*)[.,;:!?\"'”\-]*\s*$",
     ]
     for pattern in caller_patterns:
         match = re.search(pattern, message)
@@ -3955,6 +4167,14 @@ def extract_names_from_message(message):
         # William Vance" or "calling for my husband named William
         # Vance" are captured.
         r"(?:on behalf of|calling for|calling about)\s+(?:my\s+)?(?:wife|husband|mother|father|son|daughter|sister|brother|grandmother|grandfather|spouse|partner|relative|friend)[,:\s]*(?:named\s+)?([A-Z][a-z]+)(?:\s+([A-Z][a-z]+))?",
+        # Bug fix: a caller can name the patient directly with NO
+        # relationship word ("...calling on behalf of Thelma Louis"),
+        # which the relationship-requiring pattern above silently
+        # skips - leaving the patient's name uncaptured and forcing a
+        # redundant "Could I get the patient's first and last name?"
+        # later. Stopword lookahead blocks non-name fillers like "an
+        # appointment" / "a refill" from being parsed as names.
+        r"(?:on behalf of|calling for|calling about)\s+(?!(?:an?|the|my|our|your|their|his|her|doctor|office|appointment|refill|medication|labs?|results?|records?|help|information)\s)([A-Za-z][a-z]+)(?:\s+([A-Za-z][a-z]+))?",
         r"\bmy\s+(?:wife|husband|mother|father|son|daughter|sister|brother|grandmother|grandfather|spouse|partner)(?:'s name is| named)?\s+([A-Z][a-z]+)(?:\s+([A-Z][a-z]+))?",
         # A caller with no personal relationship to the patient (e.g. a
         # hospital transition team member) typically states the patient's
@@ -4117,6 +4337,7 @@ def determine_pre_chart_response(message, message_lower):
                 and (
                 not any(phrase in message_lower for phrase in THIRD_PARTY_PHRASES)
                 or _JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower)
+                or _VIRTUAL_WAIT_SELF_PATTERN.search(message_lower)
         )
         ):
             caller_is_patient = True
@@ -4124,6 +4345,7 @@ def determine_pre_chart_response(message, message_lower):
     if (
             any(phrase in message_lower for phrase in THIRD_PARTY_PHRASES)
             and not _JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower)
+            and not _VIRTUAL_WAIT_SELF_PATTERN.search(message_lower)
     ):
         caller_is_patient = False
         third_party_detected = True
@@ -4150,7 +4372,17 @@ def determine_pre_chart_response(message, message_lower):
         "i am his patient", "i am her patient",
         "patient of dr", "a patient of dr"
     ]
-    if any(phrase in message_lower for phrase in patient_confirm_phrases):
+    # Bug fix: the bare confirm phrases "patient of dr" / "a patient of
+    # dr" also match a THIRD PARTY stating the patient's PCP ("She is a
+    # patient of Dr. Patel", "my mother is a patient of Dr. Chen") - the
+    # caller describes the PATIENT's provider, not themselves. Once a
+    # caller has been positively identified as a third party (set just
+    # above), no confirm phrase may re-flag them as the patient, or the
+    # third-party flow (caller-name collection, then the deterministic
+    # HIPAA status check) is silently bypassed and the AI improvises an
+    # unauthorized HIPAA verdict. Genuine patients never set
+    # third_party_detected, so their normal confirmation is unaffected.
+    if any(phrase in message_lower for phrase in patient_confirm_phrases) and not third_party_detected:
         caller_is_patient = True
 
     if detect_dob_in_message(message):
@@ -4255,8 +4487,39 @@ def determine_pre_chart_response(message, message_lower):
         hipaa_status = get_hipaa_status()
         if hipaa_status == "NOT_ON_HIPAA":
             third_party_availability_asked = True
-            return "Is the patient available right now so I can ask for their consent?"
-        # If ON_HIPAA, fall through to continue normal pre-chart flow
+            # Bug fix: previously this returned only the availability
+            # question, never reporting the HIPAA verdict - the caller
+            # was left with no idea why access was denied. State the
+            # verdict explicitly (matching the system prompt's prescribed
+            # NOT_ON_HIPAA script) and use the patient's name when it has
+            # been captured.
+            patient_label = patient_first_name or "the patient"
+            return (
+                f"You are not listed under {patient_label}'s HIPAA form. "
+                f"Is {patient_label} there with you?"
+            )
+        # Bug fix: a third-party caller who IS on the HIPAA form was never
+        # told so - the code fell through to post-pre-chart and the LLM's
+        # only output was "One moment while I pull up the chart." with no
+        # verdict, leaving the caller unaware their access was authorized.
+        # Report the ON verdict deterministically, mirroring the
+        # NOT_ON_HIPAA gate above. Only once the patient's name is
+        # captured (otherwise keep the fall-through so the name-collection
+        # asks below still run) and only when PHF's own handler isn't
+        # active (its flow takes over unchanged, as it did before).
+        if (
+            hipaa_status == "ON_HIPAA"
+            and patient_first_name and patient_last_name
+            and not Sprint13.phf_flow_active
+        ):
+            pre_chart_complete = True
+            return (
+                f"Thank you. One moment while I pull up the chart. "
+                f"You are listed under {patient_first_name}'s HIPAA "
+                f"form. How can I help you today?"
+            )
+        # If ON_HIPAA without a captured patient name, fall through to
+        # continue normal pre-chart flow below.
 
     # If the code hasn't yet captured the patient's name, try one
     # more tolerant extraction that looks for relationship + name
@@ -4391,7 +4654,7 @@ caller_is_patient is True, this section does NOT apply. Do NOT say
 "I'll wait while you get [patient name] on the line" to a caller who
 IS the patient.
 SITUATION A — PATIENT IS PRESENT:
-Say ONLY: "Of course! I'll wait while you get [patient name] on the line."
+Say ONLY: "Could you please put [patient name] on the line?"
 
 SITUATION B — PATIENT IS NOT PRESENT:
 NEVER say I'll wait.
@@ -4825,6 +5088,11 @@ def home():
     global generic_cancelled_reschedule_offered, generic_cancelled_reschedule_provider
     global generic_spouse_reschedule_pending
     global generic_spouse_reschedule_slot, generic_spouse_reschedule_relation
+    global virtual_wait_active, virtual_wait_choice_pending
+    global virtual_wait_reschedule_pending, virtual_wait_reschedule_schedule
+    global virtual_wait_reschedule_provider
+    global generic_weekly_schedule_snapshot
+    global generic_covering_weekly_schedule_snapshot
     global couple_followup_flow_active, couple_followup_previous_visit_date
     global couple_followup_available_pairs
     global controlled_substance_appt_pending, controlled_substance_appt_medication_word
@@ -4846,6 +5114,8 @@ def home():
     patient_self_dob_verified = False
     pcp_collected = False
     verbal_consent_requested = False
+    third_party_consent_asked = False
+    third_party_consent_obtained = False
     response_time_stated = False
     office_hours_stated = False
     lab_result_fax_active = False
@@ -4880,6 +5150,13 @@ def home():
     generic_spouse_reschedule_pending = False
     generic_spouse_reschedule_slot = None
     generic_spouse_reschedule_relation = None
+    virtual_wait_active = False
+    virtual_wait_choice_pending = False
+    virtual_wait_reschedule_pending = False
+    virtual_wait_reschedule_schedule = None
+    virtual_wait_reschedule_provider = None
+    generic_weekly_schedule_snapshot = None
+    generic_covering_weekly_schedule_snapshot = None
     couple_followup_flow_active = False
     couple_followup_previous_visit_date = None
     couple_followup_available_pairs = None
@@ -4986,7 +5263,8 @@ def home():
 def chat():
     global profanity_count, third_party_detected, dob_collected
     global patient_self_dob_verified
-    global pcp_collected, verbal_consent_requested, response_time_stated
+    global pcp_collected, verbal_consent_requested, third_party_consent_asked
+    global third_party_consent_obtained, response_time_stated
     global office_hours_stated, lab_result_fax_active
     global lab_result_inquiry_active
     global contagious_visit_active, contagious_same_day_check_pending
@@ -5010,6 +5288,11 @@ def chat():
     global generic_cancelled_reschedule_offered, generic_cancelled_reschedule_provider
     global generic_spouse_reschedule_pending
     global generic_spouse_reschedule_slot, generic_spouse_reschedule_relation
+    global virtual_wait_active, virtual_wait_choice_pending
+    global virtual_wait_reschedule_pending, virtual_wait_reschedule_schedule
+    global virtual_wait_reschedule_provider
+    global generic_weekly_schedule_snapshot
+    global generic_covering_weekly_schedule_snapshot
     global couple_followup_flow_active, couple_followup_previous_visit_date
     global couple_followup_available_pairs
     global individual_six_month_followup_active
@@ -5418,6 +5701,7 @@ def chat():
                     + QUERY_ACUTE_VISIT_TRIGGERS
             )
         )
+                and not detect_virtual_wait_annoyance(message_lower)
         ):
             chart_response = "Thank you for that. How can I help you today?"
             conversation_history.append(
@@ -5772,6 +6056,114 @@ def chat():
         existing_generic_record = get_stored_generic_appointment_record(
             lookup_first, lookup_last
         )
+
+        # Virtual-visit wait / late-PCP workflow: the patient reports
+        # waiting for the PCP to join the virtual visit (or shows any
+        # sign of annoyance with the wait). Steve explains the provider
+        # is running behind, offers to reschedule or wait a little
+        # longer, presents the provider's availability on a reschedule,
+        # and thanks the patient if they choose to wait. Deterministic
+        # Python state machine - never delegated to the LLM - and
+        # handled before the generic reschedule/cancel triggers below
+        # so a reschedule reply during this flow is never misread as a
+        # generic reschedule request.
+        if virtual_wait_choice_pending:
+            if any(p in message_lower for p in VIRTUAL_WAIT_RESCHEDULE_PHRASES):
+                if virtual_wait_reschedule_schedule is None:
+                    virtual_wait_schedule = generate_weekly_availability(
+                        force_has_availability=True
+                    )
+                    virtual_wait_avail_lines = [
+                        f"{day}: {', '.join(slots)}"
+                        for day, slots in virtual_wait_schedule.items() if slots
+                    ]
+                    virtual_wait_reschedule_schedule = (
+                        "; ".join(virtual_wait_avail_lines)
+                        if virtual_wait_avail_lines
+                        else "no availability this week"
+                    )
+                virtual_wait_choice_pending = False
+                virtual_wait_reschedule_pending = True
+                virtual_wait_reschedule_response = (
+                    f"Of course. {virtual_wait_reschedule_provider or 'your provider'} "
+                    f"has the following availability for a rescheduled visit: "
+                    f"{virtual_wait_reschedule_schedule}. Which day and time works "
+                    f"best for you?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": virtual_wait_reschedule_response}
+                )
+                return jsonify({"response": virtual_wait_reschedule_response})
+            virtual_wait_choice_pending = False
+            virtual_wait_active = False
+            virtual_wait_reschedule_provider = None
+            wait_patient_response = (
+                f"Thank you for your patience. "
+                f"{virtual_wait_reschedule_provider or 'Your provider'} will be with "
+                f"you shortly."
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": wait_patient_response}
+            )
+            return jsonify({"response": wait_patient_response})
+
+        if virtual_wait_reschedule_pending:
+            virtual_wait_reschedule_pending = False
+            virtual_wait_active = False
+            chosen_virtual_wait_time = (
+                _extract_day_time_from_reply(user_message)
+                or user_message.strip()
+            )
+            virtual_wait_reschedule_schedule = None
+            virtual_wait_reschedule_provider = None
+            virtual_wait_reschedule_confirm = (
+                f"Perfect, your virtual visit has been rescheduled for "
+                f"{chosen_virtual_wait_time}. Is there anything else I can help "
+                f"you with today?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": virtual_wait_reschedule_confirm}
+            )
+            return jsonify({"response": virtual_wait_reschedule_confirm})
+
+        if detect_virtual_wait_annoyance(message_lower):
+            if not virtual_wait_active:
+                virtual_wait_active = True
+                virtual_wait_choice_pending = True
+                virtual_wait_reschedule_provider = (
+                    get_patient_pcp_from_history()
+                    or next(
+                        (
+                            full_name
+                            for last_name, full_name in PROVIDER_LAST_NAMES.items()
+                            if last_name in message_lower
+                        ),
+                        None,
+                    )
+                )
+                wait_support_response = (
+                    f"I'm sorry about the wait. "
+                    f"{virtual_wait_reschedule_provider or 'Your provider'} is running a little bit "
+                    f"behind today and will be with you shortly. Would you like to "
+                    f"wait a little longer, or would you prefer to reschedule "
+                    f"your virtual visit?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": wait_support_response}
+                )
+                return jsonify({"response": wait_support_response})
 
         # Provider-cancelled appointment: patient wants to know WHY it
         # was cancelled. Deterministic - never delegated to the LLM.
@@ -6507,12 +6899,16 @@ def chat():
             return jsonify({"response": closing_response})
 
     # Detect the patient announcing themselves mid-call after a third
-    # party caller has already completed pre-chart. This is separate
-    # from determine_pre_chart_response (which only runs pre-completion)
-    # because pre_chart_complete is already True by this point in the
-    # call — Margaret's pre-chart finished first. We need a lightweight
-    # check here so Robert's "This is Robert Cooper" can flip
-    # caller_is_patient to True even though full pre-chart already ran.
+    # party caller has already completed pre-chart.
+    # A self-announcement may use the patient's FULL name ("this is
+    # Thelma Louis") OR, once we have just asked for the patient to come
+    # on the line (verbal_consent_requested is True, i.e. the DOB
+    # self-verification gate told them we are transferring to them), a
+    # bare FIRST NAME ("hi, this is Thelma"). The full-name form is the
+    # general path; the first-name-only form only applies right after we
+    # requested the patient, so a run-on "this is Thelma" greeting from
+    # the patient does not slip past the deterministic HIPAA gates — the
+    # LLM must not be allowed to improvise a response here.
     if third_party_detected and patient_first_name and patient_last_name:
         patient_self_announce_pattern = re.search(
             r"(?:this is|i am|i'm|it's|it is)\s+" +
@@ -6520,6 +6916,18 @@ def chat():
             re.escape(patient_last_name),
             message_lower, re.IGNORECASE
         )
+        if (
+            not patient_self_announce_pattern
+            and verbal_consent_requested
+            and patient_first_name
+            and re.search(
+                r"(?:this is|i am|i'm|it's|it is)\s+" +
+                re.escape(patient_first_name) +
+                r"\s*(?:,|\.|!|\?)?$",
+                message_lower, re.IGNORECASE
+            )
+        ):
+            patient_self_announce_pattern = True
         if patient_self_announce_pattern:
             caller_is_patient = True
 
@@ -6536,8 +6944,8 @@ def chat():
                 patient_self_dob_verified = True
             else:
                 dob_gate_response = (
-                    "Thank you. Can I get your date of birth to verify "
-                    "your identity?"
+                    f"Hi {patient_first_name}. What is your date of birth "
+                    "for verification purposes?"
                 )
                 conversation_history.append(
                     {"role": "user", "content": user_message}
@@ -6546,6 +6954,72 @@ def chat():
                     {"role": "assistant", "content": dob_gate_response}
                 )
                 return jsonify({"response": dob_gate_response})
+
+    # HIPAA Third-Party Consent Gate (deterministic).
+    # Once the patient has verified their own DOB after being put on the
+    # line (patient_self_dob_verified), Steve must obtain the patient's
+    # verbal consent before sharing any further information with the
+    # third party caller. This is handled deterministically instead of by
+    # the LLM, so a bare "Hi [name]" or greeting does not cause the model
+    # to improvise and skip the required consent step. Ask first; on the
+    # next turn interpret a clear yes, a clear no, or an ambiguous reply.
+    if third_party_detected and caller_is_patient and patient_self_dob_verified:
+        if not third_party_consent_obtained:
+            if not third_party_consent_asked:
+                third_party_consent_asked = True
+                consent_gate_response = (
+                    f"Thank you, {patient_first_name}. Do I have your "
+                    f"consent to share information about your care with "
+                    f"{caller_first_name}?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": consent_gate_response}
+                )
+                return jsonify({"response": consent_gate_response})
+            if patient_wants_to_proceed(message_lower):
+                third_party_consent_obtained = True
+                consent_gate_response = (
+                    f"Thank you, {patient_first_name}. I have your "
+                    f"consent, so I can discuss your care with "
+                    f"{caller_first_name}."
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": consent_gate_response}
+                )
+                return jsonify({"response": consent_gate_response})
+            if patient_wants_to_decline(message_lower):
+                third_party_consent_obtained = True
+                consent_gate_response = (
+                    f"I understand, {patient_first_name}. Without your "
+                    f"consent, I am not able to share your health "
+                    f"information with {caller_first_name}. Is there "
+                    "anything else I can help you with today?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": consent_gate_response}
+                )
+                return jsonify({"response": consent_gate_response})
+            consent_gate_response = (
+                f"Hi {patient_first_name}. Just to make sure I have your "
+                f"permission — will you allow me to share information "
+                f"about your care with {caller_first_name}?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": consent_gate_response}
+            )
+            return jsonify({"response": consent_gate_response})
 
     if caller_is_patient is False:
         third_party_detected = True
@@ -7183,8 +7657,8 @@ def chat():
         )
     elif patient_is_present and third_party_detected and verbal_consent_requested:
         patient_presence_context = (
-            "PATIENT_PRESENT: Say ONLY: 'Of course! I'll wait while "
-            "you get [patient name] on the line.' Nothing else.\n"
+            "PATIENT_PRESENT: Say ONLY: 'Could you please put "
+            "[patient name] on the line?' Nothing else.\n"
         )
 
     # Sprint 12: patient just accepted a previously-offered virtual visit.
@@ -7304,7 +7778,10 @@ def chat():
                 or appointment_reason_just_requested
         ):
             forced_pcp_weekly = get_harness_override("STEVE_FORCE_PCP_WEEKLY_AVAILABLE")
-            schedule = generate_weekly_availability(force_has_availability=forced_pcp_weekly)
+            if generic_weekly_schedule_snapshot is None:
+                generic_weekly_schedule_snapshot = generate_weekly_availability(
+                    force_has_availability=forced_pcp_weekly)
+            schedule = generic_weekly_schedule_snapshot
             pcp_has_no_availability_this_week = not any(schedule.values())
             if pcp_has_no_availability_this_week and not virtual_visit_accepted_now:
                 covering_eligible_week = is_visit_eligible_for_covering_provider(
@@ -7312,8 +7789,12 @@ def chat():
                 )
                 if covering_eligible_week:
                     forced_covering_weekly = get_harness_override("STEVE_FORCE_COVERING_WEEKLY_AVAILABLE")
-                    covering_weekly_schedule = generate_weekly_availability(
-                        force_has_availability=forced_covering_weekly)
+                    if generic_covering_weekly_schedule_snapshot is None:
+                        generic_covering_weekly_schedule_snapshot = (
+                            generate_weekly_availability(
+                                force_has_availability=forced_covering_weekly))
+                    covering_weekly_schedule = (
+                        generic_covering_weekly_schedule_snapshot)
                     covering_has_availability = any(
                         covering_weekly_schedule.values()
                     )
@@ -8728,7 +9209,7 @@ def chat():
                conversation_history
 
     try:
-        response = client.chat.completions.create(
+        response = groq_create_completion(
             model="qwen/qwen3.8-27b",
             messages=messages,
             reasoning_effort="none",
