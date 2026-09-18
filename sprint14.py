@@ -188,6 +188,24 @@ WELLNESS_TRIGGERS = [
     "routine check up", "checkup", "check up", "physical", "wellness",
 ]
 
+# Occupational / athletic clearance physicals are NOT annual wellness
+# visits. "I need a DOT physical for my job" and "...a sports physical"
+# both contain the bare "physical" trigger above, so they were being
+# misrouted into the wellness one-year-and-one-day eligibility flow
+# instead of the normal appointment scheduling. These functional,
+# employment/school-clearance exams must fall straight through to
+# generic scheduling - checked before WELLNESS_TRIGGERS in
+# _base_wellness_intent().
+NON_WELLNESS_PHYSICAL_TRIGGERS = [
+    "dot physical", "sports physical", "school physical",
+    "cdl physical", "pre-employment physical", "work physical",
+    "employment physical",
+]
+
+
+def _is_non_wellness_physical(message_lower):
+    return any(t in message_lower for t in NON_WELLNESS_PHYSICAL_TRIGGERS)
+
 MAW_TRIGGERS = [
     "medicare annual wellness", "annual wellness visit", "maw visit",
     "maw appointment", "medicare wellness visit",
@@ -645,6 +663,8 @@ def _base_wellness_intent(message_lower):
     """Singular (per-person) wellness request type, without the lookup
     short-circuit or the couple check - the pieces the couple detector
     needs without recursing through detect_wellness_intent()."""
+    if _is_non_wellness_physical(message_lower):
+        return None
     if any(t in message_lower for t in CHA_TRIGGERS):
         return "cha"
     if any(t in message_lower for t in MAW_TRIGGERS):
