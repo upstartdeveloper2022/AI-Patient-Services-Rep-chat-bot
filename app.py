@@ -120,6 +120,11 @@ third_party_availability_asked = False
 third_party_detected = False
 dob_collected = False
 patient_self_dob_verified = False
+# Sprint HIPAA fix: the patient taken on the line during a third-party
+# call must verify BOTH their last name AND their date of birth before
+# verbal consent is requested (patient_self_dob_verified exists for the
+# DOB half; this flag covers the last-name half).
+patient_self_last_name_verified = False
 pcp_collected = False
 verbal_consent_requested = False
 third_party_consent_asked = False
@@ -137,6 +142,13 @@ referral_lookup_done = False
 referral_lookup_result = None
 referral_specialist_name = None
 referral_specialist_phone = None
+# Nurse-visit request state: once a patient requests a nurse visit
+# (injection, B12/flu shot, vaccine, etc.) this stays True for the rest
+# of the call so the injected NURSE_VISIT context keeps Steve on the
+# correct in-office / MA-scheduled path across follow-up turns (e.g. the
+# turn where the patient provides a contact number). Reset alongside the
+# other per-call state in home().
+nurse_visit_active = False
 
 # New patient workflow state (Sprint 11)
 new_patient_flow_active = False
@@ -266,6 +278,18 @@ virtual_wait_choice_pending = False
 virtual_wait_reschedule_pending = False
 virtual_wait_reschedule_schedule = None
 virtual_wait_reschedule_provider = None
+
+# Patient-running-late workflow: the patient calls to say they will be
+# late for their appointment. Steve asks how many minutes late they will
+# be; under 15 minutes Steve just lets them know he will inform the
+# medical assistant; 15 minutes or more means the slot cannot be held
+# and Steve offers to reschedule during the call. Deterministic Python
+# state machine like virtual_wait_* above - never delegated to the LLM.
+late_arrival_active = False
+late_arrival_minutes_asked = False
+late_arrival_reschedule_pending = False
+late_arrival_reschedule_offered = False
+late_arrival_reschedule_schedule = None
 
 # Established-couple routine six-month follow-up workflow.
 couple_followup_flow_active = False
@@ -429,6 +453,23 @@ LAB_WORK_TRIGGERS = [
     "complete blood count", "comprehensive metabolic",
     "basic metabolic", "order a test", "run some labs",
     "run labs", "get some blood work", "get my blood drawn"
+]
+
+# Nurse-visit triggers: services that are always performed in the office
+# and are always scheduled by the medical assistant, never by Steve and
+# never virtually (injections/B12 shots, flu shots, vaccines, etc.).
+# Deliberately EXCLUDES "urinalysis", "blood draw", and "x-ray"/"lab
+# work" style service words: those already have their own routing via
+# LAB_WORK_TRIGGERS / the generic appointment path, so triggering here
+# would break those existing workflows. Detection is scoped to explicit
+# nurse-visit requests and injection/shots that have no other dedicated
+# handler.
+NURSE_VISIT_TRIGGERS = [
+    "nurse visit", "nurse appointment", "nurse's visit",
+    "b12 shot", "b12", "vitamin b12", "vitamin b-12",
+    "flu shot", "flu vaccine", "flu vaccination",
+    "vaccine", "vaccination", "immunization", "immunisation",
+    "injection", "cortisone shot", "depo shot", "testosterone shot",
 ]
 
 SAME_DAY_KEYWORDS = [
@@ -1175,6 +1216,37 @@ def _find_real_sentence_end(text, start):
         return end
 
 
+def _trim_to_complete_sentence(text):
+    """Trim a (possibly truncated) reply back to its last complete
+    sentence so it never ends mid-fragment. Keeps any sentence that
+    ends in . ! ? or a newline; skips title abbreviations like "Dr." so
+    the last sentence boundary is a genuine one. Returns the trimmed
+    text unchanged if no sentence boundary is found."""
+    if not text:
+        return text
+    last_end = None
+    pos = 0
+    while True:
+        match = re.search(r"[.!\n]", text[pos:])
+        if not match:
+            break
+        end = pos + match.end()
+        preceding_word = re.search(
+            r"([A-Za-z]+)$", text[pos:pos + match.start()]
+        )
+        if (
+                preceding_word
+                and preceding_word.group(1).lower() in _TITLE_ABBREVIATIONS
+        ):
+            pos = end
+            continue
+        last_end = end
+        pos = end
+    if last_end is None:
+        return text
+    return text[:last_end].rstrip()
+
+
 def _extract_generic_appointment_confirmation(assistant_text):
     """Best-effort extraction of a confirmed generic appointment's
     day/time from the AI's own free-form response text. Requires both
@@ -1483,6 +1555,14 @@ def detect_ma_name_in_message(message_lower):
 
 def detect_nurse_ma_request(message_lower):
     return any(phrase in message_lower for phrase in NURSE_MA_REQUEST_PHRASES)
+
+
+def detect_nurse_visit(message_lower):
+    """True when the patient is asking for a nurse visit (injection,
+    B12/flu shot, vaccine, etc.) - a service that must be performed in
+    the office and is scheduled by the medical assistant, never by Steve
+    and never virtually."""
+    return any(phrase in message_lower for phrase in NURSE_VISIT_TRIGGERS)
 
 
 def detect_lab_order_pickup(message_lower):
@@ -1911,6 +1991,178 @@ def detect_virtual_wait_annoyance(message_lower):
     if any(n in message_lower for n in VIRTUAL_WAIT_SCHEDULING_WORDS):
         return False
     return True
+
+
+# ─────────────────────────────────────────────
+# Patient running-late workflow
+# ─────────────────────────────────────────────
+# The patient calls to say they will be late for their appointment.
+# Steve asks how many minutes late they will be. Under 15 minutes Steve
+# says he will inform the medical assistant. 15 minutes or more means
+# the slot cannot be held, so Steve explains the visit must be
+# rescheduled and offers to reschedule during the call. Entirely
+# deterministic (mirrors virtual-wait state machine) so the LLM never
+# improvises the 15-minute threshold.
+LATE_ARRIVAL_TRIGGERS = [
+    "going to be late", "gonna be late", "i will be late", "i'll be late",
+    "ill be late", "im going to be late", "i'm going to be late",
+    "i am going to be late", "running late", "run late",
+    "going to run late", "gonna run late", "will be running late",
+    "i will be running late", "i'll be running late", "be running late",
+    "be a little late", "a little late", "be a few minutes late",
+    "few minutes late", "be a bit late", "be a few mins late",
+    "late for my appointment", "late for my visit",
+    "late to my appointment", "late to my visit",
+    "late for the appointment",
+    "i am late", "i'm late", "stuck in traffic", "traffic is bad",
+    "in traffic", "i am delayed", "i'm delayed", "going to be delayed",
+    "gonna be delayed", "will be delayed", "held up", "running behind"
+]
+
+
+def detect_late_arrival_intent(message_lower):
+    """True when the patient is reporting they will be late for their
+    appointment (rather than asking about a third party or the provider
+    running late)."""
+    return any(phrase in message_lower for phrase in LATE_ARRIVAL_TRIGGERS)
+
+
+def parse_late_minutes(message_lower):
+    """Parse how many minutes late the patient says they will be from a
+    free-form reply to Steve's 'how many minutes late will you be?'
+    question. Handles '10 minutes', '10 mins', '15 min', 'half an hour',
+    'an hour', '2 hours', and a bare number like '20'. Returns an int
+    number of minutes, or None if nothing recognizable is present.
+    Kwargs: none."""
+    # 'an hour' style phrases must be matched after 'half an hour',
+    # since 'half an hour' also contains the substring 'an hour'.
+    if re.search(r"\b(?:half an hour|half hour|thirty minutes?)\b", message_lower):
+        return 30
+    if re.search(r"\b(?:an hour|one hour|a few hours?)\b", message_lower):
+        return 60
+    if re.search(r"\b(?:a couple(?: of)? hours?|two hours?)\b", message_lower):
+        return 120
+    match = re.search(r"\b(\d{1,3})\s*(?:hour|hr)s?\b", message_lower)
+    if match:
+        return int(match.group(1)) * 60
+    match = re.search(r"\b(\d{1,3})\s*(?:min(?:ute)?s?|m)\b", message_lower)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\b(\d{1,3})\b", message_lower)
+    if match:
+        minutes = int(match.group(1))
+        if 1 <= minutes <= 240:
+            return minutes
+    return None
+
+
+def handle_late_arrival_flow(message, message_lower):
+    """State machine for the patient-running-late workflow. Returns a
+    deterministic response at each digestible step, or None if this
+    turn does not belong to the workflow (so the caller can fall
+    through to the normal dispatch unchanged)."""
+    global late_arrival_active, late_arrival_minutes_asked
+    global late_arrival_reschedule_pending, late_arrival_reschedule_offered
+    global late_arrival_reschedule_schedule
+
+    if late_arrival_reschedule_pending:
+        if not late_arrival_reschedule_offered:
+            if patient_wants_to_decline(message_lower):
+                late_arrival_reschedule_pending = False
+                late_arrival_reschedule_offered = False
+                late_arrival_reschedule_schedule = None
+                late_arrival_active = False
+                return (
+                    "No problem. Since you'll be more than 15 minutes "
+                    "late, we won't be able to hold today's appointment "
+                    "slot. Is there anything else I can help you with "
+                    "today?"
+                )
+            if patient_wants_to_proceed(message_lower) or "reschedule" in message_lower:
+                late_arrival_reschedule_schedule = generate_weekly_availability(
+                    force_has_availability=True
+                )
+                avail_lines = [
+                    f"{day}: {', '.join(slots)}"
+                    for day, slots in late_arrival_reschedule_schedule.items()
+                    if slots
+                ]
+                avail_text = (
+                    "; ".join(avail_lines) if avail_lines
+                    else "no availability this week"
+                )
+                late_arrival_reschedule_offered = True
+                return (
+                    "Of course. Here is what we have available - "
+                    f"{avail_text}. Which day and time works best for you?"
+                )
+            return (
+                "Since you'll be more than 15 minutes late, we will need "
+                "to reschedule your appointment. Would you like me to "
+                "reschedule it for you now?"
+            )
+        slot = _extract_calendar_date_slot_from_text(message) or (
+            _extract_day_time_from_reply(message)
+        )
+        if not slot:
+            if patient_wants_to_decline(message_lower):
+                late_arrival_active = False
+                late_arrival_reschedule_pending = False
+                late_arrival_reschedule_offered = False
+                late_arrival_reschedule_schedule = None
+                return (
+                    "No problem. Is there anything else I can help you "
+                    "with today?"
+                )
+            return (
+                "I'm sorry, could you tell me the day and time that "
+                "works best for you from the options I listed?"
+            )
+        store_generic_appointment_record(
+            patient_first_name or caller_first_name,
+            patient_last_name or caller_last_name,
+            slot,
+            reason=_derive_generic_appointment_reason(),
+        )
+        late_arrival_active = False
+        late_arrival_reschedule_pending = False
+        late_arrival_reschedule_offered = False
+        late_arrival_reschedule_schedule = None
+        return (
+            f"Perfect, I've rescheduled your appointment for {slot}. "
+            "Is there anything else I can help you with today?"
+        )
+
+    if late_arrival_active and late_arrival_minutes_asked:
+        minutes = parse_late_minutes(message_lower)
+        if minutes is None:
+            return "No problem. About how many minutes late will you be?"
+        late_arrival_active = False
+        late_arrival_minutes_asked = False
+        if minutes < 15:
+            return (
+                f"Thank you for letting us know. I'll let the medical "
+                f"assistant know you're running about {minutes} minutes "
+                f"late. Have a great day!"
+            )
+        late_arrival_reschedule_pending = True
+        late_arrival_reschedule_offered = False
+        return (
+            "Since you'll be 15 minutes or more late, the provider "
+            "won't be able to see you today and we will need to "
+            "reschedule your appointment. Would you like me to reschedule "
+            "it for you while you're on the line?"
+        )
+
+    if not late_arrival_active and detect_late_arrival_intent(message_lower):
+        late_arrival_active = True
+        late_arrival_minutes_asked = True
+        return (
+            "I'm sorry to hear that. About how many minutes late will "
+            "you be today?"
+        )
+
+    return None
 
 UTI_TRIGGERS = [
     "uti", "urinary tract infection", "burning when i urinate",
@@ -4915,6 +5167,16 @@ VIRTUAL VISIT:
 Same day: check MA, callback, HIGH PRIORITY.
 Future: schedule directly.
 
+NURSE VISIT:
+Nurse visits (injections, B12/flu shots, vaccines, urinalysis, x-rays,
+etc.) are ALWAYS performed IN OFFICE - never virtually, so never ask
+about a virtual visit or a virtual/in-office preference for a nurse
+visit. You do NOT schedule nurse visits; the medical assistant schedules
+them. If a patient requests a nurse visit, inform them the medical
+assistant will need to schedule it, put in a note for the medical
+assistant, and ask for a good contact number. Do NOT offer appointment
+times and do NOT book the nurse visit yourself.
+
 SYMPTOM ROUTING:
 Contagious: offer virtual. Declines: callback, 24 hours.
 Pushes back: urgent care only.
@@ -5037,6 +5299,8 @@ def home():
     global profanity_count, hipaa_status_determined, current_hipaa_status
     global third_party_detected, dob_collected, pcp_collected
     global verbal_consent_requested, response_time_stated, office_hours_stated
+    global patient_self_dob_verified, patient_self_last_name_verified
+    global third_party_consent_asked, third_party_consent_obtained
     global urgent_symptoms_active, urgent_can_wait_asked
     global acute_same_day_established
     global ma_availability_determined, current_ma_availability
@@ -5091,6 +5355,9 @@ def home():
     global virtual_wait_active, virtual_wait_choice_pending
     global virtual_wait_reschedule_pending, virtual_wait_reschedule_schedule
     global virtual_wait_reschedule_provider
+    global late_arrival_active, late_arrival_minutes_asked
+    global late_arrival_reschedule_pending, late_arrival_reschedule_offered
+    global late_arrival_reschedule_schedule
     global generic_weekly_schedule_snapshot
     global generic_covering_weekly_schedule_snapshot
     global couple_followup_flow_active, couple_followup_previous_visit_date
@@ -5105,6 +5372,7 @@ def home():
     global ma_request_reason_collected
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
+    global nurse_visit_active
 
     profanity_count = 0
     hipaa_status_determined = False
@@ -5112,6 +5380,7 @@ def home():
     third_party_detected = False
     dob_collected = False
     patient_self_dob_verified = False
+    patient_self_last_name_verified = False
     pcp_collected = False
     verbal_consent_requested = False
     third_party_consent_asked = False
@@ -5155,6 +5424,11 @@ def home():
     virtual_wait_reschedule_pending = False
     virtual_wait_reschedule_schedule = None
     virtual_wait_reschedule_provider = None
+    late_arrival_active = False
+    late_arrival_minutes_asked = False
+    late_arrival_reschedule_pending = False
+    late_arrival_reschedule_offered = False
+    late_arrival_reschedule_schedule = None
     generic_weekly_schedule_snapshot = None
     generic_covering_weekly_schedule_snapshot = None
     couple_followup_flow_active = False
@@ -5193,6 +5467,7 @@ def home():
     referral_lookup_result = None
     referral_specialist_name = None
     referral_specialist_phone = None
+    nurse_visit_active = False
     new_patient_flow_active = False
     new_patient_requested_provider = None
     new_patient_is_minor = None
@@ -5262,7 +5537,7 @@ def home():
 @app.route("/chat", methods=["POST"])
 def chat():
     global profanity_count, third_party_detected, dob_collected
-    global patient_self_dob_verified
+    global patient_self_dob_verified, patient_self_last_name_verified
     global pcp_collected, verbal_consent_requested, third_party_consent_asked
     global third_party_consent_obtained, response_time_stated
     global office_hours_stated, lab_result_fax_active
@@ -5291,6 +5566,9 @@ def chat():
     global virtual_wait_active, virtual_wait_choice_pending
     global virtual_wait_reschedule_pending, virtual_wait_reschedule_schedule
     global virtual_wait_reschedule_provider
+    global late_arrival_active, late_arrival_minutes_asked
+    global late_arrival_reschedule_pending, late_arrival_reschedule_offered
+    global late_arrival_reschedule_schedule
     global generic_weekly_schedule_snapshot
     global generic_covering_weekly_schedule_snapshot
     global couple_followup_flow_active, couple_followup_previous_visit_date
@@ -5316,6 +5594,7 @@ def chat():
     global controlled_substance_bridge_confirmed_insufficient
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
+    global nurse_visit_active
     global ma_request_active, ma_request_name
     global ma_request_provider, ma_request_reason_collected
     global ma_request_reason_asked
@@ -6056,6 +6335,26 @@ def chat():
         existing_generic_record = get_stored_generic_appointment_record(
             lookup_first, lookup_last
         )
+
+        # Patient-running-late workflow: the patient calls to say they
+        # will be late for their appointment. Steve asks how many
+        # minutes late; under 15 minutes he informs the MA, 15 or more
+        # means the slot cannot be held and he offers to reschedule
+        # during the call. Deterministic Python state machine - never
+        # delegated to the LLM - running ahead of all other
+        # reschedule/cancel handling so a late-arrival turn is never
+        # misread as a generic reschedule/cancel request.
+        late_arrival_response = handle_late_arrival_flow(
+            user_message, message_lower
+        )
+        if late_arrival_response is not None:
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": late_arrival_response}
+            )
+            return jsonify({"response": late_arrival_response})
 
         # Virtual-visit wait / late-PCP workflow: the patient reports
         # waiting for the PCP to join the virtual visit (or shows any
@@ -6916,54 +7215,110 @@ def chat():
             re.escape(patient_last_name),
             message_lower, re.IGNORECASE
         )
-        if (
-            not patient_self_announce_pattern
-            and verbal_consent_requested
-            and patient_first_name
-            and re.search(
-                r"(?:this is|i am|i'm|it's|it is)\s+" +
-                re.escape(patient_first_name) +
-                r"\s*(?:,|\.|!|\?)?$",
-                message_lower, re.IGNORECASE
-            )
-        ):
-            patient_self_announce_pattern = True
+        # Bug fix: the "we just asked for the patient" signal lives in
+        # verbal_consent_requested, but that flag is only set when the
+        # caller's reply happens to match a PATIENT_PRESENT_PHRASE entry
+        # ("she is here", etc.). A short acknowledgment like "Yes she is"
+        # slips through, so the patient's first-name-only introduction
+        # ("hi, this is Thelma") was never recognized as the patient
+        # taking the line — caller_is_patient stayed False, the
+        # deterministic verification gates were bypassed, and the LLM
+        # improvised a HIPAA consent request with NO identity
+        # verification. Also treat the patient as on the line whenever
+        # Steve has already asked to put them on the phone ("...please put
+        # Thelma on the line?"), regardless of the presence-phrase match.
+        if not patient_self_announce_pattern and patient_first_name:
+            last_assistant_put_on_line = False
+            for _turn in reversed(conversation_history):
+                if _turn.get("role") == "assistant":
+                    _last_text = _turn.get("content", "") or ""
+                    last_assistant_put_on_line = bool(re.search(
+                        r"\bput(?:ting)?\s+[^.!?\n]{0,25}" +
+                        re.escape(patient_first_name) +
+                        r"[^.!?\n]{0,25}\bon the line\b",
+                        _last_text, re.IGNORECASE
+                    ))
+                    break
+            if (
+                (verbal_consent_requested or last_assistant_put_on_line)
+                and re.search(
+                    r"(?:this is|i am|i'm|it's|it is)\s+" +
+                    re.escape(patient_first_name) +
+                    r"\s*(?:,|\.|!|\?)?$",
+                    message_lower, re.IGNORECASE
+                )
+            ):
+                patient_self_announce_pattern = True
         if patient_self_announce_pattern:
             caller_is_patient = True
 
     # HIPAA Patient Self-Verification Gate.
     # When a third party call later has the PATIENT take over speaking
     # (caller_is_patient becomes True), the patient must verify their
-    # OWN date of birth before any consent step can proceed — even
-    # though the third party already gave a date of birth earlier.
-    # This uses a SEPARATE flag (patient_self_dob_verified) so it does
-    # not interfere with the third party's own DOB-based HIPAA check.
+    # OWN identity — their last name AND their date of birth — before any
+    # consent step can proceed, even though the third party already gave
+    # a date of birth earlier. These use SEPARATE flags
+    # (patient_self_last_name_verified / patient_self_dob_verified) so
+    # they do not interfere with the third party's own DOB-based HIPAA
+    # check.
     if third_party_detected and caller_is_patient:
-        if not patient_self_dob_verified:
-            if detect_dob_in_message(message_lower):
-                patient_self_dob_verified = True
+        if (
+            patient_last_name
+            and not patient_self_last_name_verified
+            and re.search(
+                r"\b" + re.escape(patient_last_name) + r"\b",
+                message_lower, re.IGNORECASE
+            )
+        ):
+            patient_self_last_name_verified = True
+        if not patient_self_dob_verified and detect_dob_in_message(message_lower):
+            patient_self_dob_verified = True
+        patient_self_verified = (
+            patient_self_dob_verified
+            and (patient_self_last_name_verified or not patient_last_name)
+        )
+        if not patient_self_verified:
+            if patient_self_dob_verified:
+                verification_response = (
+                    f"Thank you, {patient_first_name}. For verification "
+                    "purposes, could you also provide me with your last "
+                    "name?"
+                )
+            elif patient_self_last_name_verified or not patient_last_name:
+                verification_response = (
+                    f"Thank you, {patient_first_name}. For verification "
+                    "purposes, could you also provide me with your date "
+                    "of birth?"
+                )
             else:
-                dob_gate_response = (
-                    f"Hi {patient_first_name}. What is your date of birth "
-                    "for verification purposes?"
+                verification_response = (
+                    f"Hello {patient_first_name}. For verification "
+                    "purposes, please provide me with your last name "
+                    "and date of birth."
                 )
-                conversation_history.append(
-                    {"role": "user", "content": user_message}
-                )
-                conversation_history.append(
-                    {"role": "assistant", "content": dob_gate_response}
-                )
-                return jsonify({"response": dob_gate_response})
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": verification_response}
+            )
+            return jsonify({"response": verification_response})
 
     # HIPAA Third-Party Consent Gate (deterministic).
-    # Once the patient has verified their own DOB after being put on the
-    # line (patient_self_dob_verified), Steve must obtain the patient's
-    # verbal consent before sharing any further information with the
-    # third party caller. This is handled deterministically instead of by
-    # the LLM, so a bare "Hi [name]" or greeting does not cause the model
-    # to improvise and skip the required consent step. Ask first; on the
-    # next turn interpret a clear yes, a clear no, or an ambiguous reply.
-    if third_party_detected and caller_is_patient and patient_self_dob_verified:
+    # Once the patient has verified their OWN identity (last name and
+    # date of birth) after being put on the line
+    # (patient_self_last_name_verified / patient_self_dob_verified),
+    # Steve must obtain the patient's verbal consent before sharing any
+    # further information with the third party caller. This is handled
+    # deterministically instead of by the LLM, so a bare "Hi [name]" or
+    # greeting does not cause the model to improvise and skip the
+    # required consent step. Ask first; on the next turn interpret a
+    # clear yes, a clear no, or an ambiguous reply.
+    if (
+        third_party_detected and caller_is_patient
+        and patient_self_dob_verified
+        and (patient_self_last_name_verified or not patient_last_name)
+    ):
         if not third_party_consent_obtained:
             if not third_party_consent_asked:
                 third_party_consent_asked = True
@@ -7159,6 +7514,13 @@ def chat():
             any(trigger in message_lower for trigger in LAB_WORK_TRIGGERS)
             and not lab_order_pickup
     )
+
+    # Nurse-visit request detection. Sticky once True for the rest of the
+    # call, so the injected NURSE_VISIT context below keeps Steve on the
+    # in-office / MA-scheduled path even on follow-up turns (e.g. when the
+    # patient answers the contact-number question on a later message).
+    if detect_nurse_visit(message_lower) and not is_medical_professional_caller:
+        nurse_visit_active = True
 
     hipaa_gate_conditions_met = (
             third_party_detected and dob_collected and pcp_collected
@@ -7770,7 +8132,7 @@ def chat():
     ) and not is_medical_professional_caller and not (
             individual_six_month_followup_active
             and individual_six_month_followup_eligible is False
-    ) and not individual_three_month_followup_active:
+    ) and not individual_three_month_followup_active and not nurse_visit_active:
         if (
                 not is_same_day or virtual_visit_accepted_now
                 or same_day_virtual_clinic_declined_now
@@ -8804,6 +9166,32 @@ def chat():
     # is the fix — no injection is needed here anymore.
     referral_lookup_context = ""
 
+    # Nurse-visit context: deterministic injection that keeps Steve on
+    # the correct in-office / MA-scheduled path for the entire call once
+    # a nurse-visit request is detected, including the follow-up turn
+    # where the patient provides a contact number.
+    nurse_visit_context = ""
+    if nurse_visit_active and not is_medical_professional_caller:
+        nurse_visit_context = (
+            "NURSE_VISIT_REQUEST INJECTED BY SYSTEM:\n"
+            "The patient is requesting a NURSE VISIT (in-office services "
+            "such as injections, B12/flu shots, vaccines, etc.).\n"
+            "- NURSE VISITS ARE ALWAYS PERFORMED IN OFFICE. Never ask "
+            "about a virtual visit or a virtual-versus-in-office preference "
+            "for a nurse visit.\n"
+            "- YOU DO NOT SCHEDULE NURSE VISITS. The medical assistant "
+            "schedules all nurse visits.\n"
+            "- Tell the patient the medical assistant will need to schedule "
+            "the nurse visit, and that you will put in a note for the "
+            "medical assistant.\n"
+            "- Then ask: 'May I get a good contact number for you?'\n"
+            "- Do NOT check or present appointment availability, do NOT "
+            "offer any times, and do NOT book anything yourself.\n"
+            "- Once a contact number has been provided: confirm the note "
+            "has been put in for the medical assistant and say: 'Is there "
+            "anything else I can help you with today?'\n"
+        )
+
     lab_result_fax_outside_context = ""
     if (lab_result_fax_active or lab_result_fax_to_outside_detected) and not is_medical_professional_caller:
         already_has_fax_info_outside = bool(re.search(
@@ -8973,7 +9361,30 @@ def chat():
             hipaa_instruction = (
                 "Say: 'I was able to verify that you are listed on the "
                 "patient's HIPAA authorization. I will be happy to "
-                "assist you today.' Then ask for PCP if not collected."
+                "assist you today.' Then ask for PCP if not collected.\n"
+                # Bug fix: a caller verified ON the patient's HIPAA form is
+                # authorized to act on the patient's behalf, but the static
+                # SITUATION B text ("I would recommend having [patient name]
+                # call us directly") is unconditional in the system prompt,
+                # so the model kept applying that patient-must-call rule to
+                # authorized callers and refused to schedule. Provide an
+                # explicit deterministic override for the authorized path,
+                # exactly like MINOR_GUARDIAN_CONFIRMED does for guardians -
+                # it only ADDS scheduling authorization for ON-HIPAA callers
+                # and never touches the not-on-HIPAA/SITUATION B flows.
+                "THIRD PARTY AUTHORIZED (ON HIPAA) INJECTED BY SYSTEM:\n"
+                "This caller is listed on the patient's HIPAA form and is "
+                "authorized to act on the patient's behalf. If they ask to "
+                "schedule or book an appointment for the patient, proceed "
+                "with scheduling normally EXACTLY as for the patient "
+                "themselves: ask for the reason for the visit only if none "
+                "has been stated, then present the injected weekly "
+                "availability and continue to booking. Do NOT tell them to "
+                "have the patient call us directly, do NOT say the patient "
+                "must call back themselves, and do NOT apply the SITUATION "
+                "B patient-must-call rule to a caller who is verified on "
+                "HIPAA. The HIPAA status is already verified for this call "
+                "- do NOT re-run or re-ask HIPAA verification.\n"
             )
         else:
             hipaa_instruction = (
@@ -9183,6 +9594,7 @@ def chat():
             individual_six_month_followup_context + "\n" +
             individual_three_month_followup_context + "\n" +
             nurse_ma_context + "\n" +
+            nurse_visit_context + "\n" +
             lab_order_fax_to_facility_context + "\n" +
             lab_order_pickup_context + "\n" +
             patient_presence_context + "\n" +
@@ -9215,7 +9627,22 @@ def chat():
             reasoning_effort="none",
             max_completion_tokens=900
         )
-        assistant_message = response.choices[0].message.content
+        first_choice = response.choices[0]
+        assistant_message = first_choice.message.content or ""
+        # Root cause fix: the completion above is hard-capped at
+        # max_completion_tokens=900. When the model exhausts that budget
+        # Groq returns finish_reason="length" with the reply cut off
+        # mid-sentence, and it was previously served to the patient
+        # verbatim (e.g. "...Is there anything else I" with no ending).
+        # Never expose a dangling fragment - trim to the last complete
+        # sentence so the reply always reads cleanly.
+        if getattr(first_choice, "finish_reason", None) == "length":
+            trimmed = _trim_to_complete_sentence(assistant_message)
+            print(
+                "[chat] completion truncated (finish_reason=length); "
+                f"reply trimmed from {len(assistant_message)} to {len(trimmed)} chars"
+            )
+            assistant_message = trimmed
         conversation_history.append(
             {"role": "assistant", "content": assistant_message}
         )
