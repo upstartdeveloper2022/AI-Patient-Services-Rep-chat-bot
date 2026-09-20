@@ -173,6 +173,14 @@ established_patient_dob = None
 # parent/guardian who must identify themselves by name before the gate
 # is confirmed and scheduling can proceed.
 established_patient_minor_waiting = False
+# Sprint 15 (established patients): a parent/guardian who identifies with
+# only a first name ("Hi this is Dawn") must not be re-asked for their
+# first AND last name - Steve holds the half already given here until the
+# missing half arrives, then confirms the guardian. Distinct from
+# caller_first_name / caller_last_name because the minor's own name still
+# occupies those variables until the guardian is fully identified.
+established_patient_minor_parent_first = None
+established_patient_minor_parent_last = None
 new_patient_eligible_providers = None
 new_patient_offered_provider = None
 new_patient_accepting_checked = False
@@ -199,6 +207,7 @@ new_patient_household_stage = "primary"
 new_patient_household_second_time = None
 new_patient_household_primary_first_name = None
 new_patient_household_primary_address = None
+new_patient_household_speaker_active = False
 
 # Urgent symptoms state
 urgent_symptoms_active = False
@@ -266,6 +275,34 @@ generic_cancelled_reschedule_provider = None
 generic_spouse_reschedule_pending = False
 generic_spouse_reschedule_slot = None
 generic_spouse_reschedule_relation = None
+# Dual NEW-PATIENT household reschedule ("my spouse and myself are
+# scheduled to establish care with Dr. Mitchell and we need to reschedule
+# those appointments"). The caller has never been seen at the office, so
+# the spouse has never had a chance to add the caller to a HIPAA form -
+# the office cannot pull up/transfer the spouse's chart on the caller's
+# authority alone. Steve must collect the spouse's first/last name, date
+# of birth, AND the originally-scheduled appointment day/time to locate
+# it, reschedule the spouse first, then the caller.
+generic_newpatient_household_reschedule_pending = False
+generic_household_reschedule_stage = None
+generic_household_spouse_first = None
+generic_household_spouse_last = None
+generic_household_spouse_dob = None
+generic_household_spouse_old_slot = None
+generic_household_spouse_relation = None
+
+# Dual NEW-PATIENT household cancellation mirror: same HIPAA rationale
+# as the reschedule flow - the caller's own records exist, but the
+# office cannot cancel a spouse's separate appointment on the caller's
+# authority alone, so the spouse's name/DOB/original slot are collected
+# first, then BOTH stored appointments are removed.
+generic_newpatient_household_cancel_pending = False
+generic_household_cancel_stage = None
+generic_household_cancel_spouse_first = None
+generic_household_cancel_spouse_last = None
+generic_household_cancel_spouse_dob = None
+generic_household_cancel_spouse_old_slot = None
+generic_household_cancel_spouse_relation = None
 
 # Virtual-visit wait workflow: the patient is awaiting a scheduled
 # virtual visit and reports the PCP hasn't joined (or shows any sign of
@@ -1019,6 +1056,22 @@ def cancel_generic_appointment_record(first_name, last_name):
 _REASON_PREFIXES = (
     "i would like to schedule a",
     "i would like to schedule an",
+    "i'd like to schedule a",
+    "i'd like to schedule an",
+    "i'd like to schedule an appointment for",
+    "i'd like to book a",
+    "i'd like to book an",
+    "i'd like an appointment for",
+    "i'd like an appointment",
+    "i'd like to set up an appointment for",
+    "i'd like to set up a",
+    "i'd like to set up an",
+    "i'd like to make an appointment for",
+    "i'd like to make a",
+    "i'd like to make an",
+    "i'd like a",
+    "i'd like an",
+    "i'd like to",
     "i would like to book a",
     "i would like to book an",
     "i would like to make an appointment for",
@@ -1100,6 +1153,12 @@ def _derive_generic_appointment_reason():
     knee pain"), then the earliest message that stated the visit
     intent. Inquiry / reschedule / cancel / slot-selection turns are
     always excluded so they can never be stored as the reason."""
+    if new_patient_flow_active:
+        # New-patient registrations are always booked as a new-patient
+        # visit - never as a verbatim replay of the caller's opening
+        # message ("I'm not a patient yet. This is Janet Jackson dob
+        # 5/15/1965 I want to set up new patient appointments..." ).
+        return "New patient appointment"
     if individual_three_month_followup_active:
         return "3-month follow-up"
     if individual_six_month_followup_active:
@@ -1128,7 +1187,7 @@ def _derive_generic_appointment_reason():
                     break
                 cleaned = _trim_reason_prefix(ut)
                 if cleaned:
-                    return cleaned
+                    return _condense_appointment_reason(cleaned)
             break
     # Pass 2: the earliest message that stated the visit intent,
     # skipping inquiry / reschedule / cancel / booking-selection turns.
@@ -1146,8 +1205,73 @@ def _derive_generic_appointment_reason():
         )):
             cleaned = _trim_reason_prefix(content)
             if cleaned:
-                return cleaned
+                return _condense_appointment_reason(cleaned)
     return None
+
+
+# Deterministic condensation of a captured appointment reason so the
+# persisted record reads as a concise phrase instead of a verbatim
+# transcription of what the caller typed (e.g. "I want to discuss
+# possibly increasing how much adderall I should take" ->
+# "Discuss increasing dosage of Adderall"). Applied by
+# _derive_generic_appointment_reason() to every reason derived from
+# free-form caller text. Deliberately conservative: only well-bounded
+# phrasings are rewritten, everything else is left unchanged.
+_DOSAGE_INCREASE_RULES = (
+    # "... discuss ... increasing ... how much <med> ..."
+    # "i want to discuss possibly increasing how much adderall i should
+    # take" -> "Discuss increasing dosage of Adderall"
+    (
+        re.compile(
+            r"\bdiscuss\b.*?\bincreas(?:e|es|ed|ing)\b.*?\bhow much\b\s+"
+            r"([a-z][a-z'-]*)\b",
+            re.IGNORECASE
+        ),
+        "Discuss increasing dosage of",
+    ),
+    # "... discuss ... increasing ... (my|the) (dosage|dose|amount) of <med>"
+    # "i want to discuss increasing my dosage of Lorazepam" ->
+    # "Discuss increasing dosage of Lorazepam"
+    (
+        re.compile(
+            r"\bdiscuss\b.*?\bincreas(?:e|es|ed|ing)\b[^.!?]*?\b"
+            r"(?:dosage|dose|amount)\s+of\s+([a-z][a-z'\s-]*?)[.,!?]?\s*$",
+            re.IGNORECASE
+        ),
+        "Discuss increasing dosage of",
+    ),
+    # "I want to increase ... (my|the) dosage of <med>" (no "discuss")
+    # - requires a first-person subject so it never re-matches the
+    # imperative output above ("Discuss increasing dosage of X").
+    (
+        re.compile(
+            r"\bi\b.*?\bincreas(?:e|es|ed|ing)\b.*?\b"
+            r"(?:dosage|dose|amount)\s+of\s+([a-z][a-z'\s-]*?)[.,!?]?\s*$",
+            re.IGNORECASE
+        ),
+        "Increase dosage of",
+    ),
+)
+
+
+def _condense_appointment_reason(text):
+    """Shorten a free-form appointment-reason fragment into a concise,
+    reason-like phrase. Only well-bounded phrasings are rewritten;
+    anything unrecognized is returned unchanged."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+    # Late-arrival relay messages ("Can you tell <name> that I'm going
+    # to be late for my appointment today") are not a visit reason.
+    if "be late for my appointment" in low or "running late for my appointment" in low:
+        return "Running late for appointment"
+    for pattern, label in _DOSAGE_INCREASE_RULES:
+        match = pattern.search(t)
+        if match and match.lastindex:
+            med = match.group(match.lastindex).strip().capitalize()
+            return f"{label} {med}"
+    return t
 
 
 _GENERIC_APPT_DAY_NAMES = [
@@ -1321,6 +1445,92 @@ def detect_generic_appointment_inquiry_intent(message_lower):
 
 
 # ─────────────────────────────────────────
+# Fasting-lab appointment inquiry
+# ─────────────────────────────────────────
+# "Are my labs fasting labs?" - whether an upcoming appointment's labs
+# must be fasting depends on the appointment type:
+#   RULE 1  wellness visits and diabetes-management appointments
+#           (incl. diabetes-medication refills / dosage increases)
+#           -> fasting. ALWAYS.
+#   RULE 2  follow-up appointments (1/3/6-month, medication, chronic
+#           condition) -> 75% fasting / 25% not.
+#   RULE 3  every other appointment type (sports physical, Form 1823,
+#           medication refill, virtual visit, misc) -> 50/50.
+# The answer is generated fresh at inquiry time and never persisted.
+# If the appointment type cannot be determined, the message falls
+# through to the existing (LLM-driven) behavior unchanged.
+FASTING_LAB_INQUIRY_TRIGGERS = [
+    "fasting labs", "fasting lab",
+    "fasting blood work", "fasting blood test", "fasting blood draw",
+    "fast before my labs", "fast before the labs",
+    "fast before my lab work", "fast before the lab work",
+    "fast before the lab", "fast for the labs",
+    "labs need to be fasting", "lab needs to be fasting",
+    "labs need to be fasted", "do these labs require fasting",
+    "does this lab require fasting",
+]
+
+_WORD_BOUNDARY_FAST_RE = re.compile(r"\bfast(?:ing)?\b", re.IGNORECASE)
+
+# Diabetes-management markers (medications commonly used for diabetes).
+DIABETES_MEDICATION_WORDS = [
+    "glucophage", "metformin", "ozempic", "mounjaro", "januvia",
+    "victoza", "trulicity", "lantus", "levemir", "tresiba", "toujeo",
+    "humalog", "novolog", "glyburide", "glipizide", "pioglitazone",
+    "actos", "farxiga", "jardiance", "invokana", "insulin",
+]
+
+
+def detect_fasting_lab_inquiry(message_lower):
+    """True when the patient is asking whether their pre-appointment
+    labs must be fasting labs."""
+    if any(t in message_lower for t in FASTING_LAB_INQUIRY_TRIGGERS):
+        return True
+    if _WORD_BOUNDARY_FAST_RE.search(message_lower) and "lab" in message_lower:
+        return True
+    return False
+
+
+def _fasting_lab_is_wellness_or_diabetes(text_lower):
+    """RULE 1: wellness visits and diabetes-management appointments
+    (including diabetes-medication refills / dosage increases) are
+    always fasting."""
+    if any(p in text_lower for p in (
+            "annual wellness visit", "medicare annual wellness",
+            "comprehensive health assessment", "wellness",
+    )):
+        return True
+    if "diabetes" in text_lower:
+        return True
+    if any(d in text_lower for d in DIABETES_MEDICATION_WORDS):
+        return True
+    return False
+
+
+def _fasting_lab_is_follow_up(text_lower):
+    """RULE 2: follow-up appointments."""
+    return "follow" in text_lower
+
+
+def generate_fasting_lab_answer(appointment_reason):
+    """Classify the appointment reason and pick the fasting-lab answer at
+    inquiry time. RULE 1 -> always fasting; RULE 2 -> 75% fasting; every
+    other determined appointment type -> 50% fasting."""
+    text_lower = appointment_reason.lower()
+    if _fasting_lab_is_wellness_or_diabetes(text_lower):
+        return "Yes. These are fasting labs."
+    if _fasting_lab_is_follow_up(text_lower):
+        return (
+            "Yes, these are fasting labs." if random.random() < 0.75
+            else "No, fasting is not required."
+        )
+    return (
+        "Yes, these are fasting labs." if random.random() < 0.50
+        else "No, fasting is not required."
+    )
+
+
+# ─────────────────────────────────────────
 # Provider-cancelled appointment: why did it happen?
 # ─────────────────────────────────────────
 # PCPs occasionally cancel scheduled appointments. When a patient calls
@@ -1393,7 +1603,7 @@ def detect_dob_in_message(message):
     dob_pattern = re.compile(
         r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b|'
         r'\b(january|february|march|april|may|june|july|august|'
-        r'september|october|november|december)\s+\d{1,2},?\s+\d{4}\b',
+        r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b',
         re.IGNORECASE
     )
     return bool(dob_pattern.search(message))
@@ -1528,11 +1738,52 @@ def _established_parent_name_from_message(message):
     return first, last
 
 
+def _established_parent_first_name_from_message(message):
+    """Best-effort capture of a guardian's FIRST name when only one name
+    token has been offered so far ("Hi this is Dawn", "my name is Dawn").
+    _established_parent_name_from_message requires both names and yields
+    (None, None) here, which made Steve re-ask "first and last name, "
+    "please?" despite the first name already being on the line. Requires
+    a capital-initial token, so lowercase filler ("I'm going to get her")
+    can never be mistaken for a name, and rejects the known
+    relationship/pronoun tokens."""
+    m = re.search(
+        r"(?i:this\s+is|my\s+name\s+is|i'?m|i\s+am)\s+([A-Z][a-z]+)",
+        message
+    )
+    if not m:
+        return None
+    name = m.group(1)
+    if name.lower() in _ESTABLISHED_PARENT_NONNAME_TOKENS:
+        return None
+    return name
+
+
+def _established_parent_last_name_from_message(message, known_first=None):
+    """Best-effort capture of a guardian's LAST name when Steve just
+    asked for it and the parent replies with the surname alone ("Baldwin",
+    "It's Baldwin."). Only fires on a short, name-like reply (at most 4
+    tokens) containing exactly ONE capitalized candidate that is not the
+    already-known first name and not a relationship/pronoun token."""
+    tokens = re.findall(r"\b[A-Za-z'.-]+\b", message)
+    if len(tokens) > 4:
+        return None
+    candidates = [
+        c for c in re.findall(r"\b[A-Z][a-z'.-]+\b", message)
+        if c.lower() not in _ESTABLISHED_PARENT_NONNAME_TOKENS
+        and c.lower() != "this"   # the "this is" self-intro keyword
+        and (not known_first or c.lower() != known_first.lower())
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
 def extract_dob_from_message(message):
     dob_pattern = re.compile(
         r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b|'
         r'\b(january|february|march|april|may|june|july|august|'
-        r'september|october|november|december)\s+\d{1,2},?\s+\d{4}\b',
+        r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b',
         re.IGNORECASE
     )
     match = dob_pattern.search(message)
@@ -1785,6 +2036,21 @@ QUERY_ACUTE_VISIT_TRIGGERS = [
     "when is my visit", "what time is my appointment",
 ]
 
+# Bug fix (household NEW-PATIENT cancellation): a couple establishing
+# care together says "we need to cancel THOSE appointments" - a
+# plural-family phrasing that matches none of the singular
+# CANCEL_ACUTE_VISIT_TRIGGERS above. Kept OUT of
+# CANCEL_ACUTE_VISIT_TRIGGERS on purpose so the acute-visit cancel
+# block (which fabricates an acute visit on any of those phrases for
+# patients without a generic record) is not broadened; this list gates
+# ONLY the dual new-patient household cancel branch in the generic
+# block plus the pre-chart same-message shortcut guard.
+HOUSEHOLD_CANCEL_TRIGGERS = [
+    "cancel those appointments", "cancel those",
+    "cancel the appointments", "cancel our appointments",
+    "cancel both appointments",
+]
+
 
 def generate_existing_acute_appointment():
     """
@@ -1991,6 +2257,78 @@ def detect_virtual_wait_annoyance(message_lower):
     if any(n in message_lower for n in VIRTUAL_WAIT_SCHEDULING_WORDS):
         return False
     return True
+
+
+# Virtual-visit paywall bypass. When a patient says they do not want to
+# (or are not comfortable) providing credit card / payment information
+# through the virtual visit portal - for any reason - or asks for a way
+# around the virtual visit payment screen, Steve is allowed to bypass
+# the virtual visit paywall. Detected deterministically and answered
+# with a fixed business script (never delegated to the LLM), mirroring
+# the virtual-visit wait workflow just above.
+VIRTUAL_VISIT_PAYWALL_BYPASS_TRIGGERS = [
+    "way around the payment",
+    "around the payment screen",
+    "bypass the payment",
+    "bypass the payment screen",
+    "bypass the virtual visit payment",
+    "bypass that for me",
+    "bypass the screen",
+    "skip the payment",
+    "is there a way around",
+    "can someone bypass",
+    "can you bypass",
+]
+
+# Payment / card refusal words used together with a reluctance phrase
+# ("don't want", "not comfortable", etc.). "ccard" is included because
+# patients actually type it ("don't want to give my ccard information").
+_VIRTUAL_VISIT_PAYWALL_CARD_WORDS = [
+    "credit card", "ccard", "card information", "payment info",
+]
+# "payment" alone needs a virtual-visit-ish context word so a general
+# billing/copay statement ("I don't want to pay my bill online") can
+# never fire the virtual-visit bypass on its own.
+_VIRTUAL_VISIT_PAYWALL_PAYMENT_CONTEXT_WORDS = [
+    "virtual visit", "virtual", "portal", "online",
+    "over the internet", "check-in", "check in",
+]
+_VIRTUAL_VISIT_PAYWALL_RELUCTANCE_PHRASES = [
+    "don't want", "do not want", "dont want",
+    "not comfortable", "don't feel comfortable",
+    "do not feel comfortable", "dont feel comfortable",
+    "won't", "will not", "wont", "prefer not", "rather not",
+]
+
+
+def detect_virtual_visit_paywall_bypass(message_lower):
+    """Return True when the patient does not want to provide credit card
+    / payment information through the virtual visit portal (for any
+    reason) or asks for a way around the virtual visit payment screen.
+    Narrowly scoped to genuine paywall-bypass requests so unrelated
+    billing / insurance questions never trigger it."""
+    if any(p in message_lower for p in VIRTUAL_VISIT_PAYWALL_BYPASS_TRIGGERS):
+        return True
+    has_card_word = any(
+        p in message_lower for p in _VIRTUAL_VISIT_PAYWALL_CARD_WORDS
+    )
+    has_payment_context = (
+        "payment" in message_lower
+        and any(
+            p in message_lower
+            for p in _VIRTUAL_VISIT_PAYWALL_PAYMENT_CONTEXT_WORDS
+        )
+    )
+    if not (has_card_word or has_payment_context):
+        return False
+    reluctant = any(
+        p in message_lower for p in _VIRTUAL_VISIT_PAYWALL_RELUCTANCE_PHRASES
+    )
+    if reluctant:
+        return True
+    return any(
+        p in message_lower for p in ("is there a way", "any way around")
+    )
 
 
 # ─────────────────────────────────────────────
@@ -2287,7 +2625,15 @@ _EXISTING_NEW_PATIENT_APPOINTMENT_PATTERN = re.compile(
     # only covered "have/has/had/got" and "already scheduled" phrasing,
     # so this cancellation-of-an-existing-appointment case fell
     # through and was misread as a fresh new-patient REQUEST instead.
-    r"|\b(?:cancel|reschedule|change|move)\s+(?:our|my|the)\s+new[\s-]patient\s+appointments?\b",
+    r"|\b(?:cancel|reschedule|change|move)\s+(?:our|my|the)\s+new[\s-]patient\s+appointments?\b"
+    # Bug fix: a caller can also reference their ALREADY-scheduled
+    # new-patient appointment using "establish care" phrasing while
+    # saying they need to move it ("my spouse and myself are scheduled
+    # to establish care with Dr. Mitchell and we need to reschedule
+    # those appointments"). "are scheduled to establish care" states an
+    # existing arranged fact - it must not be re-read as a REQUEST for
+    # new-patient intake the way the bare "establish care" trigger is.
+    r"|\b(?:are|is|am)\s+scheduled\s+to\s+establish\s+care\b",
     re.IGNORECASE
 )
 
@@ -2542,13 +2888,20 @@ MEDICARE_TRIGGERS = [
 
 def calculate_age_from_dob(dob_string):
     """Parses a DOB string and returns age in years, or None if unparseable."""
+    # Day-ordinal normalization: a spelled-month DOB can arrive with an
+    # ordinal suffix on the day ("May 15th, 1965"). strptime's %B %d
+    # patterns reject the suffix, so strip it first ("May 15th, 1965" ->
+    # "May 15, 1965"). Numeric formats are unaffected (no ordinals).
+    normalized_dob = re.sub(
+        r"\b(\d{1,2})(?:st|nd|rd|th)\b", r"\1", dob_string.strip()
+    )
     dob_patterns = [
         "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
         "%B %d, %Y", "%B %d %Y",
     ]
     for fmt in dob_patterns:
         try:
-            dob_date = datetime.strptime(dob_string.strip(), fmt)
+            dob_date = datetime.strptime(normalized_dob, fmt)
             today = datetime.now()
             age = today.year - dob_date.year
             if (today.month, today.day) < (dob_date.month, dob_date.day):
@@ -3170,6 +3523,7 @@ def _new_patient_after_consent_response():
     global caller_first_name, new_patient_first_name, new_patient_offered_provider
     global new_patient_household_second_time, new_patient_household_primary_first_name
     global new_patient_household_relation, new_patient_last_name
+    global new_patient_household_speaker_active
     if (
             new_patient_household_stage == "secondary"
             and new_patient_household_second_time
@@ -3196,8 +3550,16 @@ def _new_patient_after_consent_response():
         address_name = (
                 caller_first_name or new_patient_household_primary_first_name
         )
+        # Bug fix: if the household member themselves took the line for
+        # consent (household_speaker_transfer -> household_speaker_verify),
+        # they are the one Steve is speaking to now, so address them
+        # directly rather than as "your <relation>" of the caller.
+        target = (
+            "you" if new_patient_household_speaker_active
+            else f"your {new_patient_household_relation}"
+        )
         return (
-            f"Thank you. I have your {new_patient_household_relation} "
+            f"Thank you. I have {target} "
             f"scheduled with {new_patient_offered_provider} for "
             f"{new_patient_appointment_selection}. You're both all "
             f"set. Is there anything else I can help you with today?"
@@ -3306,6 +3668,7 @@ def handle_new_patient_flow(message, message_lower):
     global new_patient_household_relation, new_patient_household_stage
     global new_patient_household_second_time, new_patient_household_primary_first_name
     global new_patient_household_primary_address
+    global new_patient_household_speaker_active
 
     print(f"DEBUG STAGE_ENTRY: message={message_lower!r} "
           f"insurance_type={new_patient_insurance_type!r} "
@@ -4234,16 +4597,51 @@ def handle_new_patient_flow(message, message_lower):
                 and new_patient_first_name.lower() in message_lower
             )
             if identity_confirmed:
-                new_patient_demographics_stage = "text_consent"
+                # The second household member has now taken the line,
+                # so Steve's subsequent messages speak to them - not
+                # the caller who set up the booking.
+                new_patient_household_speaker_active = True
+                # Bug fix: confirming the household member's FIRST name
+                # is not identity verification. A spouse (or anyone) who
+                # takes the line must verify their last name AND their
+                # date of birth - mirroring the HIPAA patient self-
+                # verification gate used when a patient is put on a
+                # third-party call - before Steve may accept their
+                # consent. Previously the flow jumped straight from
+                # "Hi this is <first name>" to asking for text consent.
+                new_patient_demographics_stage = "household_speaker_verify"
                 return (
-                    "Do we have your consent to text you at the number "
-                    "provided?"
+                    "For verification purposes, May I have your last "
+                    "name and date of birth?"
                 )
             full_name = f"{new_patient_first_name} {new_patient_last_name}".strip()
             return (
                 f"I just want to make sure I'm speaking with "
                 f"{full_name} before continuing. Could you confirm "
                 f"that for me?"
+            )
+
+        if new_patient_demographics_stage == "household_speaker_verify":
+            # The household member who took the line must offer their
+            # last name AND a date of birth before consent is asked.
+            last_name_present = (
+                not new_patient_last_name
+                or bool(
+                    re.search(
+                        r"\b" + re.escape(new_patient_last_name) + r"\b",
+                        message_lower, re.IGNORECASE
+                    )
+                )
+            )
+            if last_name_present and detect_dob_in_message(message_lower):
+                new_patient_demographics_stage = "text_consent"
+                return (
+                    "Do we have your consent to text you at the number "
+                    "provided?"
+                )
+            return (
+                "For verification purposes, May I have your last name "
+                "and date of birth?"
             )
 
         if new_patient_demographics_stage == "text_consent":
@@ -4457,6 +4855,7 @@ def determine_pre_chart_response(message, message_lower):
     global established_patient_minor_pending, established_patient_minor_age
     global established_patient_minor_guardian_confirmed, established_patient_dob
     global established_patient_minor_waiting
+    global established_patient_minor_parent_first, established_patient_minor_parent_last
 
     # Sprint 15 (established patients): parent/guardian-on-line router. The
     # under-18 DOB gate below armed established_patient_minor_pending last
@@ -4486,6 +4885,12 @@ def determine_pre_chart_response(message, message_lower):
             # complete pre-chart - the minor's name/DOB/PCP were
             # already collected before the gate fired.
             parent_first, parent_last = _established_parent_name_from_message(message)
+            if not parent_first:
+                parent_first = _established_parent_first_name_from_message(message)
+            if parent_first:
+                established_patient_minor_parent_first = parent_first
+            if parent_last:
+                established_patient_minor_parent_last = parent_last
             if parent_first and parent_last:
                 caller_first_name = parent_first
                 caller_last_name = parent_last
@@ -4493,9 +4898,14 @@ def determine_pre_chart_response(message, message_lower):
                 pre_chart_complete = True
                 return "How can I help you today?"
             # The parent is on the line but has not identified
-            # themselves yet - collect the guardian's name before any
-            # scheduling begins.
+            # themselves yet - collect the missing part of their name
+            # before any scheduling begins.
             established_patient_minor_waiting = True
+            if parent_first:
+                return (
+                    "Perfect - I have the parent or guardian on the line. "
+                    "Could I get your last name please?"
+                )
             return (
                 "Perfect - I have the parent or guardian on the line. "
                 "Could I get your first and last name, please?"
@@ -4534,13 +4944,29 @@ def determine_pre_chart_response(message, message_lower):
     # never confirmed.
     if established_patient_minor_waiting:
         parent_first, parent_last = _established_parent_name_from_message(message)
-        if parent_first and parent_last:
-            caller_first_name = parent_first
-            caller_last_name = parent_last
+        if not parent_first:
+            parent_first = _established_parent_first_name_from_message(message)
+        if parent_first:
+            established_patient_minor_parent_first = parent_first
+        if parent_last:
+            established_patient_minor_parent_last = parent_last
+        first = established_patient_minor_parent_first
+        last = established_patient_minor_parent_last
+        if not last:
+            last = _established_parent_last_name_from_message(
+                message, known_first=first
+            )
+        if first and last:
+            caller_first_name = first
+            caller_last_name = last
             established_patient_minor_waiting = False
             established_patient_minor_guardian_confirmed = True
             pre_chart_complete = True
             return "How can I help you today?"
+        if first:
+            return "Thank you. Could I get your last name please?"
+        if last:
+            return "Thank you. Could I get your first name please?"
         return "Thank you. Could I get your first and last name, please?"
 
     # Bug fix: mirror the Sprint13.phf_intent_detected guard used on the
@@ -5290,6 +5716,318 @@ When a patient or hospital transition team calls to schedule a post-hospital fol
     - Wish patient a good day"""
 
 
+def _generic_reschedule_avail_text():
+    """Build the 'Here is what we have available' text shared by the
+    generic reschedule flows. Plain weekday listing, matching the
+    standard established-patient reschedule offer. New-patient records
+    store weekday slots, so the calendar-dated alternative used by the
+    six-month follow-up reschedule is not needed here."""
+    schedule = generate_weekly_availability()
+    lines = [
+        f"{day}: {', '.join(slots)}"
+        for day, slots in schedule.items() if slots
+    ]
+    return "; ".join(lines) if lines else "no availability this week"
+
+
+def _household_reschedule_possessive(relation):
+    """Possessive pronoun for the dual new-patient household reschedule
+    ask. The scenario speaks to the caller's husband, so a gender-
+    neutral 'spouse' is addressed with 'his' (matching Steve's planned
+    script: '...date and time of his appointment?'); an explicit 'wife'
+    maps to 'her'."""
+    if relation == "wife":
+        return "her"
+    return "his"
+
+
+def _handle_household_reschedule_continuation(message, existing_generic_record):
+    """Continuation state machine for the dual NEW-PATIENT household
+    reschedule started in chat() (the generic reschedule block). Stages:
+    collect the spouse's first/last name + DOB + ORIGINALLY-scheduled
+    appointment day/time -> present spouse availability -> capture the
+    spouse's new slot -> present the caller's availability -> capture
+    the caller's new slot -> confirm. Returns the next response, or None
+    when no household reschedule is in progress."""
+    global generic_newpatient_household_reschedule_pending
+    global generic_household_reschedule_stage
+    global generic_household_spouse_first, generic_household_spouse_last
+    global generic_household_spouse_dob, generic_household_spouse_old_slot
+    global generic_household_spouse_relation
+    if not generic_newpatient_household_reschedule_pending:
+        return None
+    relation = generic_household_spouse_relation or "spouse"
+    possessive = _household_reschedule_possessive(relation)
+    stage = generic_household_reschedule_stage or "spouse_info"
+    if stage == "spouse_info":
+        spouse_first, spouse_last = aggressive_name_extraction(message)
+        if not (spouse_first and spouse_last):
+            title_cased = re.findall(r"\b([A-Z][a-z]+)\b", message)
+            title_cased = [
+                p for p in title_cased if p.lower() not in (
+                    "her", "his", "their", "name", "is", "my", "wife",
+                    "husband", "spouse", "and", "date", "birth", "of",
+                    "the", "first", "last", "appointment",
+                )
+            ]
+            if len(title_cased) >= 2:
+                spouse_first, spouse_last = title_cased[0], title_cased[1]
+        spouse_dob = extract_dob_from_message(message)
+        spouse_old_slot = (
+            _extract_calendar_date_slot_from_text(message)
+            or _extract_day_time_from_reply(message)
+        )
+        if not (spouse_first and spouse_last):
+            return f"What is your {relation}'s first and last name?"
+        if not spouse_dob:
+            return f"What is your {relation}'s date of birth?"
+        if not spouse_old_slot:
+            return (
+                f"What day and time is {possessive} appointment currently "
+                f"scheduled for?"
+            )
+        generic_household_spouse_first = spouse_first
+        generic_household_spouse_last = spouse_last
+        generic_household_spouse_dob = spouse_dob
+        generic_household_spouse_old_slot = spouse_old_slot
+        generic_household_reschedule_stage = "spouse_slot"
+        return (
+            f"Thank you. I have located "
+            f"{spouse_first.capitalize()} {spouse_last.capitalize()}'s new "
+            f"patient appointment. Here is what we have available for the "
+            f"reschedule - {_generic_reschedule_avail_text()}. Which day "
+            f"and time would you like to move {possessive} appointment to?"
+        )
+    if stage == "spouse_slot":
+        spouse_first = generic_household_spouse_first
+        spouse_last = generic_household_spouse_last
+        # Bug fix (single-turn combined rebook): the caller may answer
+        # the spouse's availability question with BOTH new times in one
+        # message ("Please reschedule me for friday at 9AM and him the
+        # same day at 930AM"). Previously the whole message was treated
+        # as the spouse's pick - the FIRST time found (9:00 AM) was
+        # stored to the SPOUSE even when the caller meant it for
+        # themselves, and the caller then had to answer a second
+        # availability prompt to move their own appointment. Detect the
+        # speaker split ("me/mine" = caller, "him/her/his/theirs" =
+        # spouse), store BOTH records, and confirm both in one
+        # response.
+        spouse_marker = re.search(
+            r"\b(?:him|her|his|their)\b", message, re.IGNORECASE
+        )
+        if spouse_marker:
+            caller_part = message[:spouse_marker.start()]
+            spouse_part = message[spouse_marker.start():]
+        else:
+            caller_part = message
+            spouse_part = ""
+        caller_slot = (
+            _extract_calendar_date_slot_from_text(caller_part)
+            or _extract_day_time_from_reply(caller_part)
+        )
+        spouse_slot = (
+            _extract_calendar_date_slot_from_text(spouse_part)
+            or _extract_day_time_from_reply(spouse_part)
+        )
+        if not spouse_slot:
+            spouse_time = _find_time_in_text(spouse_part)
+            if spouse_time:
+                day_match = re.search(
+                    r"\b(" + "|".join(_GENERIC_APPT_DAY_NAMES) + r")\b",
+                    message, re.IGNORECASE
+                )
+                spouse_slot = (
+                    _extract_day_time_from_reply(
+                        f"{day_match.group(1)} at {spouse_time}"
+                    )
+                    if day_match else spouse_time
+                )
+        if caller_slot and spouse_slot:
+            caller_first = patient_first_name or caller_first_name
+            caller_last = patient_last_name or caller_last_name
+            store_generic_appointment_record(
+                caller_first, caller_last, caller_slot,
+                provider=(
+                    existing_generic_record.get("provider")
+                    if existing_generic_record else None
+                ),
+                reason=(
+                    (existing_generic_record.get("reason")
+                     if existing_generic_record else None)
+                    or _derive_generic_appointment_reason()
+                ),
+            )
+            store_generic_appointment_record(
+                spouse_first, spouse_last, spouse_slot,
+                provider=(
+                    existing_generic_record.get("provider")
+                    if existing_generic_record else None
+                ),
+                reason="New patient appointment",
+            )
+            generic_newpatient_household_reschedule_pending = False
+            generic_household_reschedule_stage = None
+            generic_household_spouse_first = None
+            generic_household_spouse_last = None
+            generic_household_spouse_dob = None
+            generic_household_spouse_old_slot = None
+            generic_household_spouse_relation = None
+            return (
+                f"Perfect, I've moved your appointment to {caller_slot} and "
+                f"I moved {spouse_first.capitalize()} "
+                f"{spouse_last.capitalize()}'s appointment to {spouse_slot}. "
+                f"Is there anything else I can help you with?"
+            )
+        spouse_pick = (
+            spouse_slot
+            or _extract_calendar_date_slot_from_text(message)
+            or _extract_day_time_from_reply(message)
+            or message.strip()
+        )
+        store_generic_appointment_record(
+            spouse_first, spouse_last, spouse_pick,
+            provider=(
+                existing_generic_record.get("provider")
+                if existing_generic_record else None
+            ),
+            reason="New patient appointment",
+        )
+        generic_household_reschedule_stage = "caller_slot"
+        return (
+            f"Perfect, I've moved {spouse_first.capitalize()} "
+            f"{spouse_last.capitalize()}'s appointment to {spouse_pick}. "
+            f"Now, to reschedule your own appointment currently set for "
+            f"{existing_generic_record['appointment_day']} - here is what "
+            f"we have available - {_generic_reschedule_avail_text()}. "
+            f"Which day and time would you like to move yours to?"
+        )
+    if stage == "caller_slot":
+        caller_pick = (
+            _extract_calendar_date_slot_from_text(message)
+            or _extract_day_time_from_reply(message)
+            or message.strip()
+        )
+        caller_first = patient_first_name or caller_first_name
+        caller_last = patient_last_name or caller_last_name
+        store_generic_appointment_record(
+            caller_first, caller_last, caller_pick,
+            provider=(
+                existing_generic_record.get("provider")
+                if existing_generic_record else None
+            ),
+            reason=(
+                (existing_generic_record.get("reason")
+                 if existing_generic_record else None)
+                or _derive_generic_appointment_reason()
+            ),
+        )
+        generic_newpatient_household_reschedule_pending = False
+        generic_household_reschedule_stage = None
+        generic_household_spouse_first = None
+        generic_household_spouse_last = None
+        generic_household_spouse_dob = None
+        generic_household_spouse_old_slot = None
+        generic_household_spouse_relation = None
+        return (
+            f"Thank you. I've moved your appointment to {caller_pick}. "
+            f"You're both all set. Is there anything else I can help you "
+            f"with today?"
+        )
+    return None
+
+
+def _handle_household_cancel_continuation(message):
+    """Continuation state machine for the dual NEW-PATIENT household
+    cancellation started in chat() (the generic reschedule/cancel
+    block). Mirrors _handle_household_reschedule_continuation: collects
+    the spouse's first/last name + DOB + originally-scheduled
+    appointment day/time, then cancels BOTH the spouse's and the
+    caller's stored appointments. Returns the next response, or None
+    when no household cancellation is in progress."""
+    global generic_newpatient_household_cancel_pending
+    global generic_household_cancel_stage
+    global generic_household_cancel_spouse_first
+    global generic_household_cancel_spouse_last
+    global generic_household_cancel_spouse_dob
+    global generic_household_cancel_spouse_old_slot
+    global generic_household_cancel_spouse_relation
+    if not generic_newpatient_household_cancel_pending:
+        return None
+    relation = generic_household_cancel_spouse_relation or "spouse"
+    stage = generic_household_cancel_stage or "spouse_info"
+    if stage == "spouse_info":
+        spouse_first, spouse_last = aggressive_name_extraction(message)
+        if not (spouse_first and spouse_last):
+            title_cased = re.findall(r"\b([A-Z][a-z]+)\b", message)
+            title_cased = [
+                p for p in title_cased if p.lower() not in (
+                    "her", "his", "their", "name", "is", "my", "wife",
+                    "husband", "spouse", "and", "date", "birth", "of",
+                    "the", "first", "last", "appointment",
+                )
+            ]
+            if len(title_cased) >= 2:
+                spouse_first, spouse_last = title_cased[0], title_cased[1]
+        spouse_dob = extract_dob_from_message(message)
+        spouse_old_slot = (
+            _extract_calendar_date_slot_from_text(message)
+            or _extract_day_time_from_reply(message)
+        )
+        if not (spouse_first and spouse_last):
+            return f"What is your {relation}'s first and last name?"
+        if not spouse_dob:
+            return f"What is your {relation}'s date of birth?"
+        if not spouse_old_slot:
+            return (
+                f"What day and time is {relation}'s appointment currently "
+                f"scheduled for?"
+            )
+        generic_household_cancel_spouse_first = spouse_first
+        generic_household_cancel_spouse_last = spouse_last
+        generic_household_cancel_spouse_dob = spouse_dob
+        generic_household_cancel_spouse_old_slot = spouse_old_slot
+        caller_first = patient_first_name or caller_first_name
+        caller_last = patient_last_name or caller_last_name
+        cancelled_parts = []
+        spouse_record = get_stored_generic_appointment_record(
+            spouse_first, spouse_last
+        )
+        if spouse_record:
+            spouse_day = spouse_record.get("appointment_day")
+            if cancel_generic_appointment_record(spouse_first, spouse_last):
+                cancelled_parts.append(
+                    f"{spouse_first.capitalize()} "
+                    f"{spouse_last.capitalize()}'s appointment "
+                    f"on {spouse_day}"
+                )
+        caller_record = get_stored_generic_appointment_record(
+            caller_first, caller_last
+        )
+        if caller_record:
+            caller_day = caller_record.get("appointment_day")
+            if cancel_generic_appointment_record(caller_first, caller_last):
+                cancelled_parts.append(f"your appointment on {caller_day}")
+        generic_newpatient_household_cancel_pending = False
+        generic_household_cancel_stage = None
+        generic_household_cancel_spouse_first = None
+        generic_household_cancel_spouse_last = None
+        generic_household_cancel_spouse_dob = None
+        generic_household_cancel_spouse_old_slot = None
+        generic_household_cancel_spouse_relation = None
+        if not cancelled_parts:
+            return (
+                f"I'm sorry, I couldn't find any appointments on file for "
+                f"{spouse_first.capitalize()} {spouse_last.capitalize()} "
+                f"or yourself to cancel. Is there anything else I can help "
+                f"you with today?"
+            )
+        return (
+            f"I've cancelled {' and '.join(cancelled_parts)}. Is there "
+            f"anything else I can help you with today?"
+        )
+    return None
+
+
 # ─────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────
@@ -5319,6 +6057,7 @@ def home():
     global established_patient_minor_pending, established_patient_minor_age
     global established_patient_minor_guardian_confirmed, established_patient_dob
     global established_patient_minor_waiting
+    global established_patient_minor_parent_first, established_patient_minor_parent_last
     global new_patient_eligible_providers, new_patient_offered_provider
     global new_patient_accepting_checked, new_patient_no_provider_available
     global new_patient_insurance_collected, new_patient_insurance_type
@@ -5352,6 +6091,10 @@ def home():
     global generic_cancelled_reschedule_offered, generic_cancelled_reschedule_provider
     global generic_spouse_reschedule_pending
     global generic_spouse_reschedule_slot, generic_spouse_reschedule_relation
+    global generic_newpatient_household_reschedule_pending
+    global generic_household_reschedule_stage, generic_household_spouse_first
+    global generic_household_spouse_last, generic_household_spouse_dob
+    global generic_household_spouse_old_slot, generic_household_spouse_relation
     global virtual_wait_active, virtual_wait_choice_pending
     global virtual_wait_reschedule_pending, virtual_wait_reschedule_schedule
     global virtual_wait_reschedule_provider
@@ -5419,6 +6162,20 @@ def home():
     generic_spouse_reschedule_pending = False
     generic_spouse_reschedule_slot = None
     generic_spouse_reschedule_relation = None
+    generic_newpatient_household_reschedule_pending = False
+    generic_household_reschedule_stage = None
+    generic_household_spouse_first = None
+    generic_household_spouse_last = None
+    generic_household_spouse_dob = None
+    generic_household_spouse_old_slot = None
+    generic_household_spouse_relation = None
+    generic_newpatient_household_cancel_pending = False
+    generic_household_cancel_stage = None
+    generic_household_cancel_spouse_first = None
+    generic_household_cancel_spouse_last = None
+    generic_household_cancel_spouse_dob = None
+    generic_household_cancel_spouse_old_slot = None
+    generic_household_cancel_spouse_relation = None
     virtual_wait_active = False
     virtual_wait_choice_pending = False
     virtual_wait_reschedule_pending = False
@@ -5479,6 +6236,8 @@ def home():
     established_patient_minor_guardian_confirmed = False
     established_patient_dob = None
     established_patient_minor_waiting = False
+    established_patient_minor_parent_first = None
+    established_patient_minor_parent_last = None
     new_patient_eligible_providers = None
     new_patient_offered_provider = None
     new_patient_accepting_checked = False
@@ -5506,6 +6265,7 @@ def home():
     new_patient_household_second_time = None
     new_patient_household_primary_first_name = None
     new_patient_household_primary_address = None
+    new_patient_household_speaker_active = False
     urgent_symptoms_active = False
     urgent_can_wait_asked = False
     acute_same_day_established = False
@@ -5563,14 +6323,21 @@ def chat():
     global generic_cancelled_reschedule_offered, generic_cancelled_reschedule_provider
     global generic_spouse_reschedule_pending
     global generic_spouse_reschedule_slot, generic_spouse_reschedule_relation
+    global generic_newpatient_household_reschedule_pending
+    global generic_household_reschedule_stage, generic_household_spouse_first
+    global generic_household_spouse_last, generic_household_spouse_dob
+    global generic_household_spouse_old_slot, generic_household_spouse_relation
+    global generic_newpatient_household_cancel_pending
+    global generic_household_cancel_stage, generic_household_cancel_spouse_first
+    global generic_household_cancel_spouse_last, generic_household_cancel_spouse_dob
+    global generic_household_cancel_spouse_old_slot, generic_household_cancel_spouse_relation
     global virtual_wait_active, virtual_wait_choice_pending
     global virtual_wait_reschedule_pending, virtual_wait_reschedule_schedule
     global virtual_wait_reschedule_provider
     global late_arrival_active, late_arrival_minutes_asked
     global late_arrival_reschedule_pending, late_arrival_reschedule_offered
     global late_arrival_reschedule_schedule
-    global generic_weekly_schedule_snapshot
-    global generic_covering_weekly_schedule_snapshot
+    global generic_weekly_schedule_snapshot, generic_covering_weekly_schedule_snapshot
     global couple_followup_flow_active, couple_followup_previous_visit_date
     global couple_followup_available_pairs
     global individual_six_month_followup_active
@@ -5604,6 +6371,7 @@ def chat():
     global established_patient_minor_pending, established_patient_minor_age
     global established_patient_minor_guardian_confirmed, established_patient_dob
     global established_patient_minor_waiting
+    global established_patient_minor_parent_first, established_patient_minor_parent_last
     global new_patient_eligible_providers, new_patient_offered_provider
     global new_patient_accepting_checked, new_patient_no_provider_available
     global new_patient_insurance_collected, new_patient_insurance_type
@@ -5978,6 +6746,7 @@ def chat():
                     RESCHEDULE_ACUTE_VISIT_TRIGGERS
                     + CANCEL_ACUTE_VISIT_TRIGGERS
                     + QUERY_ACUTE_VISIT_TRIGGERS
+                    + HOUSEHOLD_CANCEL_TRIGGERS
             )
         )
                 and not detect_virtual_wait_annoyance(message_lower)
@@ -6220,6 +6989,57 @@ def chat():
         )
         return jsonify({"response": lookup_response})
 
+    # ── Fasting-lab inquiry ("Are my labs fasting labs?") ──
+    # Whether an upcoming appointment's labs must be fasting depends on
+    # the appointment type (fasting-lab RULES 1/2/3 described above).
+    # Reuses the existing appointment-type sources: the active
+    # wellness/refill flow (Sprint14), the routine follow-up flow
+    # flags, the persisted generic appointment's reason, and the stated
+    # scheduling reason from history. If NO appointment type can be
+    # determined the message falls through unchanged to the existing
+    # behavior, and no fasting-lab state is ever stored.
+    if (
+            pre_chart_complete and not Sprint13.phf_flow_active
+            and not is_medical_professional_caller
+            and detect_fasting_lab_inquiry(message_lower)
+    ):
+        lookup_first = patient_first_name or caller_first_name
+        lookup_last = patient_last_name or caller_last_name
+        fasting_reason = None
+        if Sprint14.wellness_flow_active and Sprint14.refill_medication_name:
+            fasting_reason = f"{Sprint14.refill_medication_name} refill"
+        elif Sprint14.wellness_flow_active:
+            fasting_reason = {
+                "wellness": "annual wellness visit",
+                "maw": "Medicare annual wellness visit",
+                "cha": "comprehensive health assessment",
+                "couple": "wellness visit",
+                "paperwork": "paperwork visit",
+            }.get(Sprint14.wellness_requested_visit_type, "wellness visit")
+        elif individual_six_month_followup_active:
+            fasting_reason = "6-month follow-up"
+        elif individual_three_month_followup_active:
+            fasting_reason = "3-month follow-up"
+        elif couple_followup_flow_active:
+            fasting_reason = "follow-up"
+        else:
+            generic_record = get_stored_generic_appointment_record(
+                lookup_first, lookup_last
+            )
+            if generic_record and generic_record.get("reason"):
+                fasting_reason = generic_record["reason"]
+        if not fasting_reason:
+            fasting_reason = _derive_generic_appointment_reason()
+        if fasting_reason:
+            fasting_response = generate_fasting_lab_answer(fasting_reason)
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": fasting_response}
+            )
+            return jsonify({"response": fasting_response})
+
     # ── Sprint 14: Wellness / MAW / CHA / Refill / Lab-Order Workflow ──
     # Activated only once pre-chart is complete and no PHF conversation
     # is already in progress - mirrors the Sprint13 activation guard
@@ -6335,6 +7155,39 @@ def chat():
         existing_generic_record = get_stored_generic_appointment_record(
             lookup_first, lookup_last
         )
+
+        # Dual NEW-PATIENT household reschedule continuation (the caller
+        # has never been seen at the office, so the spouse has never had
+        # a chance to add them to a HIPAA form - collect the spouse's
+        # name/DOB/original appointment first, reschedule the spouse,
+        # then the caller). Must run ahead of late-arrival/other
+        # handlers because the caller's slot-pick replies won't contain
+        # a reschedule trigger phrase.
+        if generic_newpatient_household_reschedule_pending:
+            household_response = _handle_household_reschedule_continuation(
+                user_message, existing_generic_record
+            )
+            if household_response is not None:
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": household_response}
+                )
+                return jsonify({"response": household_response})
+
+        if generic_newpatient_household_cancel_pending:
+            household_cancel_response = _handle_household_cancel_continuation(
+                user_message
+            )
+            if household_cancel_response is not None:
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": household_cancel_response}
+                )
+                return jsonify({"response": household_cancel_response})
 
         # Patient-running-late workflow: the patient calls to say they
         # will be late for their appointment. Steve asks how many
@@ -6463,6 +7316,32 @@ def chat():
                     {"role": "assistant", "content": wait_support_response}
                 )
                 return jsonify({"response": wait_support_response})
+
+        # Virtual-visit paywall bypass: the patient does not want to
+        # provide credit card / payment information through the virtual
+        # visit portal (for any reason) or asks for a way around the
+        # payment screen. Steve bypasses the virtual visit paywall with
+        # a fixed business script. Deterministic - never delegated to
+        # the LLM - mirroring the virtual-wait workflow above and
+        # leaving all virtual-visit scheduling behavior untouched.
+        if detect_virtual_visit_paywall_bypass(message_lower):
+            virtual_visit_paywall_bypass_response = (
+                "I can help with that. I have bypassed the payment "
+                "screen for your virtual visit. Please refresh your "
+                "virtual visit link. After refreshing the page, you "
+                "should be able to continue completing your virtual "
+                "visit check-in without providing payment "
+                "information. Please let us know if you continue "
+                "having any issues."
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant",
+                 "content": virtual_visit_paywall_bypass_response}
+            )
+            return jsonify({"response": virtual_visit_paywall_bypass_response})
 
         # Provider-cancelled appointment: patient wants to know WHY it
         # was cancelled. Deterministic - never delegated to the LLM.
@@ -6755,6 +7634,43 @@ def chat():
         if existing_generic_record and any(
                 trigger in message_lower for trigger in RESCHEDULE_ACUTE_VISIT_TRIGGERS
         ):
+            # Dual NEW-PATIENT household reschedule (e.g. "Actually my
+            # spouse and myself are scheduled to establish care with Dr.
+            # Mitchell and we need to reschedule those appointments").
+            # Because the caller has never been seen at the office, the
+            # spouse has never had a chance to add the caller to a HIPAA
+            # form - the office cannot pull up or change the spouse's
+            # appointment on the caller's authority alone. Collect the
+            # spouse's first/last name, date of birth, and ORIGINALLY
+            # scheduled appointment day/time before any slot is offered.
+            # Must run before the single-appointment availability offer
+            # below, or the household request is silently reduced to
+            # just the caller.
+            household_match = _HOUSEHOLD_RELATION_PATTERN.search(message_lower)
+            caller_new_patient = (
+                (existing_generic_record.get("reason") or "").strip().lower()
+                == "new patient appointment"
+            )
+            if household_match and caller_new_patient:
+                relation = (
+                    household_match.group(1) or household_match.group(2)
+                ).lower()
+                generic_newpatient_household_reschedule_pending = True
+                generic_household_reschedule_stage = "spouse_info"
+                generic_household_spouse_relation = relation
+                possessive = _household_reschedule_possessive(relation)
+                generic_response = (
+                    f"I can take care of that for you. May I have your "
+                    f"{relation}'s first and last name, date of birth, and "
+                    f"date and time of {possessive} appointment?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": generic_response}
+                )
+                return jsonify({"response": generic_response})
             schedule = generate_weekly_availability()
             # Bug fix: the routine six-month follow-up flow is the only
             # flow that stores a concrete calendar date in the record
@@ -6810,6 +7726,45 @@ def chat():
                 {"role": "assistant", "content": generic_response}
             )
             return jsonify({"response": generic_response})
+
+        if existing_generic_record and any(
+                trigger in message_lower for trigger in (
+                    CANCEL_ACUTE_VISIT_TRIGGERS + HOUSEHOLD_CANCEL_TRIGGERS
+                )
+        ):
+            # Dual NEW-PATIENT household cancellation (e.g. "Actually my
+            # spouse and myself are scheduled to establish care with Dr.
+            # Mitchell and we need to cancel those appointments"). Same
+            # HIPAA rationale as the household reschedule branch above -
+            # the office cannot cancel the spouse's separate appointment
+            # on the caller's authority alone, so collect the spouse's
+            # name/DOB/original slot first, then remove both records.
+            # Must run before the single-appointment generic cancel
+            # below, or only the caller's own record is cancelled.
+            household_match = _HOUSEHOLD_RELATION_PATTERN.search(message_lower)
+            caller_new_patient = (
+                (existing_generic_record.get("reason") or "").strip().lower()
+                == "new patient appointment"
+            )
+            if household_match and caller_new_patient:
+                relation = (
+                    household_match.group(1) or household_match.group(2)
+                ).lower()
+                generic_newpatient_household_cancel_pending = True
+                generic_household_cancel_stage = "spouse_info"
+                generic_household_cancel_spouse_relation = relation
+                generic_response = (
+                    f"I can take care of that for you. Can I get your "
+                    f"{relation}'s first and last name, date of birth, and "
+                    f"date and time of their appointment?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": generic_response}
+                )
+                return jsonify({"response": generic_response})
 
         if generic_joint_cancel_pending:
             generic_joint_cancel_pending = False
