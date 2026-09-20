@@ -123,7 +123,8 @@ lab_order_fax_destination = None
 # opening isn't soon enough.
 couple_stage = None                        # None | "collect_spouse" | "collect_spouse_dob" | "locate_existing" | "eligibility" | "offer_pcp" | "offer_janet" | "await_callback" | "complete"
 couple_existing_located = False            # True once the couple's on-file appointments were surfaced ("located")
-couple_is_reschedule = False               # True when the caller said "reschedule" (not "schedule")
+couple_is_reschedule = False
+couple_is_cancel = False                   # True when the couple flow was entered to CANCEL both visits (not book/reschedule)
 couple_reschedule_old_days = None          # (day1, day2) of the couple's existing visits once a move is confirmed
 couple_patient1_first = None               # caller/husband-or-wife (from app.py pre-chart globals)
 couple_patient1_last = None
@@ -440,6 +441,7 @@ def reset_state():
     global couple_pcp_earliest_offset
     global couple_existing_located
     global couple_is_reschedule
+    global couple_is_cancel
     global couple_reschedule_old_days
 
     wellness_flow_active = False
@@ -504,6 +506,7 @@ def reset_state():
     couple_pcp_earliest_offset = 1
     couple_existing_located = False
     couple_is_reschedule = False
+    couple_is_cancel = False
     couple_reschedule_old_days = None
 
 
@@ -1547,6 +1550,7 @@ def _execute_pivot_handoff(reason, message_lower=""):
     global couple_pcp_earliest_offset
     global couple_existing_located
     global couple_is_reschedule
+    global couple_is_cancel
     global couple_reschedule_old_days
 
     wellness_flow_active = False
@@ -1588,6 +1592,7 @@ def _execute_pivot_handoff(reason, message_lower=""):
     couple_pcp_earliest_offset = 1
     couple_existing_located = False
     couple_is_reschedule = False
+    couple_is_cancel = False
     couple_reschedule_old_days = None
     if reason == "paperwork":
         # Unlike acute/chronic ("I'm sick" / "my diabetes is acting
@@ -2723,6 +2728,7 @@ def _handle_couple_wellness_flow(message, message_lower):
     global couple_pcp_earliest_offset
     global couple_existing_located
     global couple_is_reschedule
+    global couple_is_cancel
     global couple_reschedule_old_days
     global wellness_stage, wellness_flow_active
     global wellness_work_in_requested
@@ -2740,6 +2746,21 @@ def _handle_couple_wellness_flow(message, message_lower):
     if not couple_is_reschedule and "reschedule" in message_lower:
         couple_is_reschedule = True
 
+    # Bug fix: a couple cancellation request ("I need to cancel wellness
+    # visits for my spouse and myself") previously fell straight into the
+    # back-to-back booking flow and got answered with "Wonderful - I'd be
+    # happy to schedule your spouse's visit back-to-back with yours".
+    # Recorded once at entry (couple_stage is None) and only when the
+    # caller is NOT rescheduling, so a later reply containing "cancel"
+    # (e.g. declining an offered date) can't flip mid-stream.
+    if (
+            couple_stage is None
+            and not couple_is_reschedule
+            and not couple_is_cancel
+            and "cancel" in message_lower
+    ):
+        couple_is_cancel = True
+
     provider_label = wellness_patient_pcp or "your provider"
 
     # Shared insurance determination happens exactly once and applies
@@ -2752,6 +2773,79 @@ def _handle_couple_wellness_flow(message, message_lower):
             couple_visit_type = "maw"
         else:
             couple_visit_type = "wellness"
+
+    # ── Cancel-intent couple path (bug fix) ────────────────────────
+    # A "we need to cancel" request is routed through its own miniature
+    # state machine: collect the spouse's name, then the spouse's DOB,
+    # then remove BOTH stored wellness visits and confirm. Runs BEFORE
+    # the fresh-booking init block below so the "Wonderful - I'd be
+    # happy to schedule your spouse's visit back-to-back with yours"
+    # wording can never leak into a cancellation request.
+    if couple_is_cancel:
+        if couple_stage is None:
+            couple_stage = "cancel_spouse_info"
+        if couple_stage == "cancel_spouse_info":
+            relation = couple_spouse_relation or "spouse"
+            if not couple_patient1_first or not couple_patient1_last:
+                return "Could I get your first and last name, please?"
+            if not couple_patient2_first or not couple_patient2_last:
+                plain_first, plain_last = _extract_plain_reply_names(
+                    message,
+                    exclude_first=couple_patient1_first,
+                )
+                if plain_first and not couple_patient2_first:
+                    couple_patient2_first = plain_first
+                if plain_last and not couple_patient2_last:
+                    couple_patient2_last = plain_last
+            if not couple_patient2_first:
+                return (
+                    "I can take care of that for you. Could I get "
+                    f"your {relation}'s first and last name?"
+                )
+            if not couple_patient2_last:
+                return (
+                    f"Thank you. Could I get {couple_patient2_first}'s "
+                    f"last name?"
+                )
+            couple_stage = "cancel_spouse_dob"
+            return _handle_couple_wellness_flow(message, message_lower)
+        if couple_stage == "cancel_spouse_dob":
+            if not couple_patient2_dob and detect_dob_in_message(message):
+                couple_patient2_dob = extract_dob_from_message(message)
+                couple_patient2_age = calculate_age_from_dob(couple_patient2_dob)
+            if not couple_patient2_dob:
+                return (
+                    f"Thank you. And could I get "
+                    f"{couple_patient2_first}'s date of birth, please?"
+                )
+            caller = f"{couple_patient1_first} {couple_patient1_last}".strip()
+            spouse = f"{couple_patient2_first} {couple_patient2_last}".strip()
+            caller_rec = cancel_appointment_for_patient(caller)
+            spouse_rec = cancel_appointment_for_patient(spouse)
+            cancelled_parts = []
+            if caller_rec:
+                cancelled_parts.append(
+                    f"your visit on {caller_rec.get('appointment_day')}"
+                )
+            if spouse_rec:
+                cancelled_parts.append(
+                    f"{couple_patient2_first}'s visit "
+                    f"on {spouse_rec.get('appointment_day')}"
+                )
+            couple_is_cancel = False
+            couple_stage = "complete"
+            wellness_stage = "complete"
+            wellness_flow_active = False
+            if not cancelled_parts:
+                return (
+                    "I couldn't find any wellness visits on file for "
+                    f"{couple_patient2_first} or yourself to cancel. "
+                    "Is there anything else I can help you with today?"
+                )
+            return (
+                f"I've cancelled {' and '.join(cancelled_parts)}. "
+                "Is there anything else I can help you with today?"
+            )
 
     if couple_stage is None:
         if not couple_patient2_first or not couple_patient2_last:
