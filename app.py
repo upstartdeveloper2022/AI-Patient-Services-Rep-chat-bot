@@ -304,6 +304,19 @@ generic_household_cancel_spouse_dob = None
 generic_household_cancel_spouse_old_slot = None
 generic_household_cancel_spouse_relation = None
 
+# Generic couple joint-cancellation ("Please cancel appointments for my
+# wife and myself"): a household-size cancellation with no specialized
+# flow (not a six-month follow-up, not a new-patient household, not a
+# Sprint13/14 request) previously fell through to the LLM, which
+# improvised a HIPAA decline for the spouse plus an individual
+# date/time ask for the caller. Instead the spouse's first/last name
+# and DOB are collected first (never cancel a spouse's appointment on
+# the caller's authority alone), then BOTH stored records are removed.
+generic_couple_cancel_pending = False
+generic_couple_cancel_spouse_first = None
+generic_couple_cancel_spouse_last = None
+generic_couple_cancel_spouse_dob = None
+
 # Virtual-visit wait workflow: the patient is awaiting a scheduled
 # virtual visit and reports the PCP hasn't joined (or shows any sign of
 # annoyance with the wait). Steve explains the provider is running
@@ -332,6 +345,25 @@ late_arrival_reschedule_schedule = None
 couple_followup_flow_active = False
 couple_followup_previous_visit_date = None
 couple_followup_available_pairs = None
+# Spouse leg of the couple six-month follow-up: when the CALLER is the
+# patient themself ("myself and my wife"), the spouse is only ever
+# referenced by relation - Steve cannot book/announce an unnamed spouse,
+# so the caller's own slot is persisted immediately and the spouse's
+# first/last name + DOB are collected on subsequent turns before their
+# leg is booked (name-first -> DOB -> schedule, mirroring the individual
+# six-month flow's household machine).
+couple_followup_spouse_stage = None
+couple_followup_spouse_first_name = None
+couple_followup_spouse_last_name = None
+couple_followup_spouse_slot = None
+couple_followup_spouse_relation = None
+# Couple six-month follow-up CANCELLATION branch ("I need to cancel the
+# 6 month follow up appointments for myself and my wife"). The entrance
+# request used to be answered with the back-to-back SCHEDULING offer;
+# this flag routes it into a cancel machine instead (spouse name -> DOB
+# -> remove both stored records -> confirm), mirroring Sprint14's
+# couple-wellness cancel.
+couple_followup_cancel_active = False
 individual_six_month_followup_active = False
 individual_six_month_followup_previous_visit_date = None
 individual_six_month_followup_days_since = None
@@ -646,7 +678,25 @@ _JOINT_APPOINTMENT_REFERENCE_PATTERN = re.compile(
     # are/am" as the joint verb - not the "would like to"/"want to"/
     # "need to" + action-verb phrasing a caller naturally uses when
     # asking to cancel or reschedule on behalf of both of them.
-    r"|\bwe\s+(?:would\s+like\s+to|want\s+to|need\s+to)\b",
+    r"|\bwe\s+(?:would\s+like\s+to|want\s+to|need\s+to)\b"
+    # Bug fix: "I need to schedule follow up appointments for myself and
+    # my wife" still fired third-party detection - "my wife" is a
+    # THIRD_PARTY_PHRASES entry, and the pattern above only recognized the
+    # spouse-FIRST ordering ("my wife and I ... have"). A caller who books
+    # for themselves AND their spouse, with the self-reference first, is
+    # equally joint and unambiguously the patient speaking about their own
+    # care, so reject that ordering too. Mirror shape of the existing
+    # alternations.
+    r"|\b(?:for\s+)?(?:myself|me)\s+and\s+(?:my\s+)?"
+    r"(?:husband|wife|spouse|son|daughter|partner)\b"
+    # Bug fix: "Please cancel appointments for my wife and myself" (the
+    # sporadic self-LAST ordering) failed every alternation above - the
+    # "my <relative> ... and i/myself" forms require a following verb,
+    # and the self-first alternation only reads "myself and my wife".
+    # Mirror the self-first shape so self-last joint phrasing is not
+    # misread as a third-party call or left to the LLM fallback.
+    r"|\b(?:my\s+)?(?:husband|wife|spouse|son|daughter|partner)\s+"
+    r"and\s+(?:for\s+)?(?:myself|me)\b",
     re.IGNORECASE
 )
 
@@ -1178,7 +1228,14 @@ def _derive_generic_appointment_reason():
         if turn.get("role") != "assistant":
             continue
         a_lower = turn.get("content", "").lower()
-        if "reason" in a_lower and "appointment" in a_lower and "?" in a_lower:
+        if (
+            ("reason" in a_lower and "appointment" in a_lower and "?" in a_lower)
+            # LLM-authored asks can omit the question mark entirely
+            # ("Thank you. What is the reason for the appointment" without
+            # a trailing "?"). Without this, Pass 1 was skipped and the
+            # reason fell back to the caller's preamble phrase.
+            or "what is the reason" in a_lower
+        ):
             for nxt in conversation_history[i + 1:]:
                 if nxt.get("role") != "user":
                     continue
@@ -1369,6 +1426,26 @@ def _trim_to_complete_sentence(text):
     if last_end is None:
         return text
     return text[:last_end].rstrip()
+
+
+def _complete_truncated_close(text):
+    """Root-cause fix: Steve's standard call-closing phrase ("Is there
+    anything else I can help you with?") is LLM-authored and can be cut
+    off mid-sentence ("...Is there anything else I" with no ending). The
+    finish_reason="length" guard in chat() only fires when Groq reports
+    that the token budget was exhausted, so a dangling close can still
+    reach the patient. Complete the close deterministically whenever the
+    reply tail is an incomplete "anything else I ..." fragment. No-op for
+    any reply that ends with a genuine sentence-ending punctuation."""
+    if not text:
+        return text
+    if re.search(r"\banything\s+else\s+I[^.!?]*$", text, re.IGNORECASE):
+        return re.sub(
+            r"\banything\s+else\s+I[^.!?]*$",
+            "anything else I can help you with.",
+            text, count=1, flags=re.IGNORECASE
+        )
+    return text
 
 
 def _extract_generic_appointment_confirmation(assistant_text):
@@ -1603,7 +1680,7 @@ def detect_dob_in_message(message):
     dob_pattern = re.compile(
         r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b|'
         r'\b(january|february|march|april|may|june|july|august|'
-        r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b',
+        r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{4}\b',
         re.IGNORECASE
     )
     return bool(dob_pattern.search(message))
@@ -1783,7 +1860,7 @@ def extract_dob_from_message(message):
     dob_pattern = re.compile(
         r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b|'
         r'\b(january|february|march|april|may|june|july|august|'
-        r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b',
+        r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{4}\b',
         re.IGNORECASE
     )
     match = dob_pattern.search(message)
@@ -2199,6 +2276,24 @@ VIRTUAL_WAIT_DIRECT_PHRASES = [
     "join the virtual visit", "join my virtual visit",
     "join the video visit", "join the video call",
     "virtual visit hasn't started",
+    # Bug fix: "My virtual appointment was supposed to start already."
+    # uses the subject "appointment" - which appears in
+    # VIRTUAL_WAIT_SCHEDULING_WORDS - so only the heuristic branch of
+    # detect_virtual_wait_annoyance ever ran, and its scheduling-word
+    # exclusion returned False, silently routing a textbook virtual-wait
+    # complaint into the generic LLM path (where Steve improvised an MA
+    # contact-note with no reschedule-or-wait offer). These appointment-
+    # subject start/begin wait phrasings are matched as DIRECT phrases
+    # (checked before the scheduling exclusion) so the patient still gets
+    # the provider-running-late / reschedule-or-wait script.
+    "appointment was supposed to start", "appointment was supposed to begin",
+    "appointment supposed to start", "appointment supposed to begin",
+    "appointment should have started", "appointment should have begun",
+    "appointment should start", "appointment should begin",
+    "appointment hasn't started", "appointment has not started",
+    "virtual appointment was supposed to start",
+    "virtual appointment was supposed to begin",
+    "virtual appointment should have started",
     "waiting for the doctor to join", "waiting for the pcp to join",
 ]
 
@@ -2723,6 +2818,45 @@ def _find_time_in_text(text):
     return None
 
 
+def _find_all_times_in_text(text):
+    """Returns every time expression in text as (normalized, start)
+    tuples, in order of first appearance (deduplicated by normalized
+    value), where start is the RAW token's offset in text - so the
+    caller can also correlate a time with nearby words. Distinct from
+    _find_time_in_text, which returns only ONE time (favoring the
+    compact/colon token) - so a message that assigns two back-to-back
+    slots ("...my wife the 9AM appointment and me for the 930AM
+    appointment") was only ever understood as "9:30 AM", silently
+    dropping the caller's primary "9AM" pick. Hour-only matches that
+    overlap a colon/compact time (the "30" inside "9:30 AM") are
+    dropped so a colon time never yields a spurious "30:00 AM"."""
+    authoritative = []
+    for pattern in (_TIME_COLON_PATTERN, _TIME_COMPACT_PATTERN):
+        for match in pattern.finditer(text):
+            hour, minute, meridiem = match.groups()
+            authoritative.append((
+                match.start(), match.end(),
+                f"{hour}:{minute} {meridiem.upper()}",
+            ))
+    spotted = []
+    for match in _TIME_HOUR_ONLY_PATTERN.finditer(text):
+        if any(
+            match.start() < end and match.end() > start
+            for start, end, _ in authoritative
+        ):
+            continue
+        hour, meridiem = match.groups()
+        spotted.append((match.start(), match.end(), f"{hour}:00 {meridiem.upper()}"))
+    merged = sorted(authoritative + spotted, key=lambda item: item[0])
+    seen = set()
+    ordered = []
+    for start, _, norm in merged:
+        if norm not in seen:
+            seen.add(norm)
+            ordered.append((norm, start))
+    return ordered
+
+
 def _extract_slot_from_text(text, fallback_day=None):
     """Pulls a 'Weekday H:MM AM/PM' slot out of free text. Falls back
     to fallback_day if no weekday name is found in this specific
@@ -2894,6 +3028,12 @@ def calculate_age_from_dob(dob_string):
     # "May 15, 1965"). Numeric formats are unaffected (no ordinals).
     normalized_dob = re.sub(
         r"\b(\d{1,2})(?:st|nd|rd|th)\b", r"\1", dob_string.strip()
+    )
+    # Day-year without a space after the comma ("May 3,1965") — the DOB
+    # detectors accept it, so strptime must too. Insert the space before
+    # the %B %d, %Y path (numeric forms are untouched, no comma there).
+    normalized_dob = re.sub(
+        r"(\b\d{1,2}),(\d{4}\b)", r"\1, \2", normalized_dob
     )
     dob_patterns = [
         "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
@@ -3108,6 +3248,29 @@ def is_couple_six_month_followup_request(message_lower):
     )
 
 
+def is_generic_couple_cancel_request(message_lower):
+    """Detect a couple-size joint cancellation that has no specialized
+    flow of its own: "Please cancel appointments for my wife and myself"
+    (or "for myself and my wife"). Satisfying all of: a cancel intent,
+    joint spouse-and-self phrasing, NO six-month follow-up phrase (the
+    couple six-month flow owns that wording), NO new-patient household
+    phrasing (generic_joint_cancel_pending owns that), and NOT a
+    Sprint13/14 or Form-1823 phrasing. Note the joint pattern carries a
+    self-last mirror alternation precisely so "my wife and myself"
+    registers here instead of falling through to the LLM fallback."""
+    if "cancel" not in message_lower:
+        return False
+    if not _JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower):
+        return False
+    if is_six_month_followup_request(message_lower):
+        return False
+    if re.search(r"\bour\s+new[\s-]patient\s+appointments?\b", message_lower):
+        return False
+    if re.search(r"\b(?:wellness|hospital|(?:form\s+)?1823)\b", message_lower):
+        return False
+    return True
+
+
 def generate_couple_followup_previous_visit_date():
     """Generate one shared prior visit that makes both spouses eligible
     for their routine six-month follow-up."""
@@ -3133,6 +3296,12 @@ def generate_couple_followup_availability():
 def handle_couple_six_month_followup_flow(message):
     global couple_followup_flow_active, couple_followup_previous_visit_date
     global couple_followup_available_pairs
+    global couple_followup_spouse_stage
+    global couple_followup_spouse_first_name
+    global couple_followup_spouse_last_name
+    global couple_followup_spouse_slot
+    global couple_followup_spouse_relation
+    global couple_followup_cancel_active
     global individual_six_month_followup_active
     global individual_six_month_followup_previous_visit_date
     global individual_six_month_followup_days_since
@@ -3145,7 +3314,29 @@ def handle_couple_six_month_followup_flow(message):
 
     if couple_followup_previous_visit_date is None:
         couple_followup_previous_visit_date = generate_couple_followup_previous_visit_date()
-    if couple_followup_available_pairs is None:
+    if not couple_followup_cancel_active and couple_followup_available_pairs is None:
+        # Entry turn. A couple six-month request that is a CANCELLATION
+        # ("I need to cancel the 6 month follow up appointments for
+        # myself and my wife") must NOT be answered with the back-to-back
+        # SCHEDULING offer. Route it into the cancel machine below: the
+        # spouse's first/last name and DOB are collected first (a spouse's
+        # appointment is never cancelled on the caller's authority alone),
+        # then BOTH stored records are removed and confirmed. Mirrors
+        # Sprint14's couple-wellness cancel wording.
+        _entry_lower = message.lower()
+        if "cancel" in _entry_lower:
+            _cancel_cue = re.search(
+                r"my\s+(wife|husband|spouse)", _entry_lower
+            )
+            couple_followup_cancel_active = True
+            couple_followup_spouse_stage = "cancel_name"
+            couple_followup_spouse_relation = (
+                _cancel_cue.group(1) if _cancel_cue else "spouse"
+            )
+            return (
+                "I can take care of that for you. Could I get your "
+                f"{couple_followup_spouse_relation}'s first and last name?"
+            )
         couple_followup_available_pairs = generate_couple_followup_availability()
         choices = "; ".join(
             f"{day}: {first_time} and {second_time}"
@@ -3158,28 +3349,339 @@ def handle_couple_six_month_followup_flow(message):
             f"{choices}. Which day and starting time works best?"
         )
 
-    selected_slot = _extract_slot_from_text(message)
-    if selected_slot:
-        for day, first_time, second_time in couple_followup_available_pairs:
-            if selected_slot == f"{day} {first_time}":
-                store_generic_appointment_record(
-                    caller_first_name, caller_last_name,
-                    f"{day} {first_time}",
-                    reason=_derive_generic_appointment_reason(),
+    # Couple six-month CANCELLATION machine (spouse name -> DOB -> cancel
+    # both stored records -> confirm). Mirrors Sprint14's couple-wellness
+    # cancel staging. Uses distinct stage values from the scheduling
+    # spouse-name/DOB stages so the two can never cross-trigger.
+    if couple_followup_cancel_active:
+        if couple_followup_spouse_stage == "cancel_name":
+            _cancel_name_m = re.search(
+                r"\b(?:my|her|his|your|their)\s+"
+                r"(?:(?:wife|husband|spouse|partner|son|daughter)'s\s+)?"
+                r"name\s+is\s+([A-Za-z]+)\s+([A-Za-z]+)",
+                message, re.IGNORECASE
+            )
+            if _cancel_name_m:
+                spouse_first = _cancel_name_m.group(1)
+                spouse_last = _cancel_name_m.group(2)
+            else:
+                spouse_first, spouse_last = aggressive_name_extraction(message)
+                if not spouse_first or not spouse_last:
+                    parts = message.strip().split()
+                    if len(parts) >= 2:
+                        spouse_first, spouse_last = parts[0], parts[1]
+            if spouse_first and spouse_last:
+                couple_followup_spouse_first_name = spouse_first
+                couple_followup_spouse_last_name = spouse_last
+                couple_followup_spouse_stage = "cancel_dob"
+                possessive = _household_pronoun_possessive(
+                    couple_followup_spouse_relation
                 )
-                store_generic_appointment_record(
-                    patient_first_name, patient_last_name,
-                    f"{day} {second_time}",
-                    reason=_derive_generic_appointment_reason(),
+                return f"Thank you. Could I get {possessive} date of birth?"
+            relation = couple_followup_spouse_relation or "spouse"
+            return f"What is your {relation}'s first and last name?"
+
+        if couple_followup_spouse_stage == "cancel_dob":
+            possessive = _household_pronoun_possessive(
+                couple_followup_spouse_relation
+            )
+            if not detect_dob_in_message(message):
+                return f"Could I get {possessive} date of birth?"
+            spouse_first = couple_followup_spouse_first_name
+            cancelled_parts = []
+            caller_record = get_stored_generic_appointment_record(
+                caller_first_name, caller_last_name
+            )
+            if caller_record is not None:
+                cancel_generic_appointment_record(
+                    caller_first_name, caller_last_name
                 )
-                couple_followup_flow_active = False
+                cancelled_parts.append(
+                    f"your visit on {caller_record['appointment_day']}"
+                )
+            spouse_record = get_stored_generic_appointment_record(
+                spouse_first, couple_followup_spouse_last_name
+            )
+            if spouse_record is not None:
+                cancel_generic_appointment_record(
+                    spouse_first, couple_followup_spouse_last_name
+                )
+                cancelled_parts.append(
+                    f"{spouse_first}'s visit on "
+                    f"{spouse_record['appointment_day']}"
+                )
+            couple_followup_flow_active = False
+            couple_followup_cancel_active = False
+            couple_followup_spouse_stage = None
+            if not cancelled_parts:
                 return (
-                    f"Based on your shared previous appointment on "
-                    f"{couple_followup_previous_visit_date}, I have you "
-                    f"scheduled for {day} {first_time} and "
-                    f"{patient_first_name} scheduled for {day} {second_time}."
+                    f"I couldn't find any upcoming six-month follow-up "
+                    f"appointments on file for {spouse_first} or yourself "
+                    f"to cancel. Is there anything else I can help you "
+                    f"with today?"
                 )
-    return "Please choose one of the offered days and starting times."
+            return (
+                "I've cancelled "
+                + " and ".join(cancelled_parts)
+                + ". Is there anything else I can help you with today?"
+            )
+
+    # Spouse-identity collection stages. Entered after the caller's own
+    # leg is booked but the spouse was only referenced by relation - a
+    # couple booking cannot be announced for an unnamed spouse, so their
+    # first/last name and DOB are collected deterministically here before
+    # their record is persisted (mirrors the individual six-month flow's
+    # name-first -> DOB -> schedule household machine).
+    if couple_followup_spouse_stage == "name":
+        _name_m = re.search(
+            r"\b(?:my|her|his|your|their)\s+"
+            r"(?:(?:wife|husband|spouse|partner|son|daughter)'s\s+)?"
+            r"name\s+is\s+([A-Za-z]+)\s+([A-Za-z]+)",
+            message, re.IGNORECASE
+        )
+        if _name_m:
+            spouse_first, spouse_last = _name_m.group(1), _name_m.group(2)
+        else:
+            spouse_first, spouse_last = aggressive_name_extraction(message)
+            if not spouse_first or not spouse_last:
+                parts = message.strip().split()
+                if len(parts) >= 2:
+                    spouse_first, spouse_last = parts[0], parts[1]
+        if spouse_first and spouse_last:
+            couple_followup_spouse_first_name = spouse_first
+            couple_followup_spouse_last_name = spouse_last
+            couple_followup_spouse_stage = "dob"
+            possessive = _household_pronoun_possessive(
+                couple_followup_spouse_relation
+            )
+            return f"Thank you. Could I get {possessive} date of birth?"
+        relation = couple_followup_spouse_relation or "spouse"
+        return f"What is your {relation}'s first and last name?"
+
+    if couple_followup_spouse_stage == "dob":
+        possessive = _household_pronoun_possessive(
+            couple_followup_spouse_relation
+        )
+        if not detect_dob_in_message(message):
+            return f"Could I get {possessive} date of birth?"
+        store_generic_appointment_record(
+            couple_followup_spouse_first_name,
+            couple_followup_spouse_last_name,
+            couple_followup_spouse_slot,
+            reason=_derive_generic_appointment_reason(),
+        )
+        couple_followup_flow_active = False
+        couple_followup_spouse_stage = None
+        return (
+            f"Thank you. I have {couple_followup_spouse_first_name} "
+            f"scheduled for {couple_followup_spouse_slot} back-to-back "
+            f"with yours. Is there anything else I can help you with today?"
+        )
+
+    message_lower = message.lower()
+    day_match = _DAY_NAME_PATTERN.search(message)
+    message_times = _find_all_times_in_text(message)
+    chosen_pair = None
+    if day_match and message_times:
+        selected_day = day_match.group(1).capitalize()
+        for day, first_time, second_time in couple_followup_available_pairs:
+            if day == selected_day and any(
+                norm in (first_time, second_time)
+                for norm, _ in message_times
+            ):
+                chosen_pair = (day, first_time, second_time)
+                break
+    if chosen_pair is None:
+        return "Please choose one of the offered days and starting times."
+
+    day, first_time, second_time = chosen_pair
+
+    # Bug fix: "Please schedule us for Thursday. Please give my wife the
+    # 9AM appointment and me for the 930AM appointment." was rejected as
+    # "Please choose one of the offered days and starting times." - the
+    # old single-slot parse (_extract_slot_from_text -> _find_time_in_text)
+    # only ever returned ONE time and favored the compact token, so the
+    # message yielded just "9:30 AM", never equalled the pair's first
+    # time, and Steve re-asked. The split above now recognizes the
+    # chosen day + either of that pair's two times. Below, when the
+    # caller explicitly assigns the two offered slots to "my <partner>"
+    # vs themselves ("my wife the 9AM ... me for the 930AM"), honor
+    # that assignment; otherwise keep the historical contract (caller
+    # leads at first_time, the patient follows at second_time).
+    partner_cue = None
+    partner_time = None
+    for norm, start in message_times:
+        window = message_lower[max(0, start - 40):start]
+        cue = re.search(r"my\s+(wife|husband|spouse)", window)
+        if cue:
+            partner_cue = cue.group(1)
+            partner_time = norm
+            break
+
+    same_person = bool(
+        caller_first_name and patient_first_name
+        and caller_first_name.lower() == patient_first_name.lower()
+        and caller_last_name and patient_last_name
+        and caller_last_name.lower() == patient_last_name.lower()
+    )
+    if partner_time in (first_time, second_time):
+        caller_time = second_time if partner_time == first_time else first_time
+        spouse_slot = f"{day} {partner_time}"
+    else:
+        caller_time = first_time
+        spouse_slot = f"{day} {second_time}"
+
+    if same_person:
+        # Bug fix: when the caller IS the patient themself ("...six month
+        # follow up appointments for myself and my wife"), the spouse is
+        # only ever referenced by relation - Steve announced "your wife
+        # scheduled for ... back-to-back" without ever collecting the
+        # spouse's first/last name or DOB, booking a leg for an
+        # unverified person. Persist only the caller's own leg now and
+        # collect the spouse's identity (name -> DOB) before booking
+        # them on the following turns.
+        store_generic_appointment_record(
+            caller_first_name, caller_last_name,
+            f"{day} {caller_time}",
+            reason=_derive_generic_appointment_reason(),
+        )
+        couple_followup_spouse_stage = "name"
+        couple_followup_spouse_first_name = None
+        couple_followup_spouse_last_name = None
+        couple_followup_spouse_slot = spouse_slot
+        couple_followup_spouse_relation = partner_cue or "spouse"
+        relation = partner_cue or "spouse"
+        return (
+            f"I have you scheduled for {day} {caller_time}. What is your "
+            f"{relation}'s first and last name?"
+        )
+
+    if partner_time in (first_time, second_time):
+        store_generic_appointment_record(
+            caller_first_name, caller_last_name,
+            f"{day} {caller_time}",
+            reason=_derive_generic_appointment_reason(),
+        )
+        store_generic_appointment_record(
+            patient_first_name, patient_last_name,
+            f"{day} {partner_time}",
+            reason=_derive_generic_appointment_reason(),
+        )
+        couple_followup_flow_active = False
+        return (
+            f"Based on your shared previous appointment on "
+            f"{couple_followup_previous_visit_date}, I have you "
+            f"scheduled for {day} {caller_time} and "
+            f"{patient_first_name} scheduled for {day} {partner_time}."
+        )
+
+    store_generic_appointment_record(
+        caller_first_name, caller_last_name,
+        f"{day} {first_time}",
+        reason=_derive_generic_appointment_reason(),
+    )
+    store_generic_appointment_record(
+        patient_first_name, patient_last_name,
+        f"{day} {second_time}",
+        reason=_derive_generic_appointment_reason(),
+    )
+    couple_followup_flow_active = False
+    return (
+        f"Based on your shared previous appointment on "
+        f"{couple_followup_previous_visit_date}, I have you "
+        f"scheduled for {day} {first_time} and "
+        f"{patient_first_name} scheduled for {day} {second_time}."
+    )
+
+
+def handle_generic_couple_cancel(message, message_lower):
+    """Generic couple joint-cancellation machine ("Please cancel
+    appointments for my wife and myself"). Runs at the LLM fallback so
+    the model can never answer a couple cancellation with a HIPAA
+    third-party decline plus an individual date/time ask. The spouse's
+    first/last name and DOB are collected first (a spouse's appointment
+    is never cancelled on the caller's authority alone - mirrors
+    Sprint14's couple cancel), then BOTH stored generic records are
+    removed and confirmed by day/time. Returns the reply text, or None
+    when the message belongs to no joint-cancel machine and the caller
+    should fall through to the LLM."""
+    global generic_couple_cancel_pending
+    global generic_couple_cancel_spouse_first, generic_couple_cancel_spouse_last
+    global generic_couple_cancel_spouse_dob
+    if not generic_couple_cancel_pending:
+        if is_generic_couple_cancel_request(message_lower):
+            generic_couple_cancel_pending = True
+        else:
+            return None
+    # The very message that STARTED the machine (no identity collected
+    # yet and this is still a cancel request) is answered with the
+    # identity ask - never parsed as if it were the spouse's name.
+    if (not generic_couple_cancel_spouse_first
+            and not generic_couple_cancel_spouse_last
+            and is_generic_couple_cancel_request(message_lower)):
+        return "May I have your spouse's first and last name and date of birth?"
+    if not generic_couple_cancel_spouse_first or not generic_couple_cancel_spouse_last:
+        _spouse_m = re.search(
+            r"\b(?:my|her|his|your|their)\s+"
+            r"(?:(?:wife|husband|spouse|partner|son|daughter)'s\s+)?"
+            r"name\s+is\s+([A-Za-z]+)\s+([A-Za-z]+)",
+            message, re.IGNORECASE
+        )
+        if _spouse_m:
+            spouse_first, spouse_last = _spouse_m.group(1), _spouse_m.group(2)
+        else:
+            spouse_first, spouse_last = aggressive_name_extraction(message)
+            if not spouse_first or not spouse_last:
+                parts = message.strip().split()
+                if len(parts) >= 2:
+                    spouse_first, spouse_last = parts[0], parts[1]
+        if not spouse_first or not spouse_last:
+            return "May I have your spouse's first and last name and date of birth?"
+        generic_couple_cancel_spouse_first = spouse_first
+        generic_couple_cancel_spouse_last = spouse_last
+    if not generic_couple_cancel_spouse_dob:
+        if detect_dob_in_message(message):
+            generic_couple_cancel_spouse_dob = extract_dob_from_message(message)
+        else:
+            return (
+                f"And could I get {generic_couple_cancel_spouse_first}'s "
+                "date of birth, please?"
+            )
+    spouse_first = generic_couple_cancel_spouse_first
+    caller_record = get_stored_generic_appointment_record(
+        caller_first_name, caller_last_name
+    )
+    spouse_record = get_stored_generic_appointment_record(
+        spouse_first, generic_couple_cancel_spouse_last
+    )
+    cancelled_parts = []
+    if caller_record is not None:
+        cancel_generic_appointment_record(caller_first_name, caller_last_name)
+        cancelled_parts.append(
+            f"your visit on {caller_record['appointment_day']}"
+        )
+    if spouse_record is not None:
+        cancel_generic_appointment_record(
+            spouse_first, generic_couple_cancel_spouse_last
+        )
+        cancelled_parts.append(
+            f"{spouse_first}'s visit on {spouse_record['appointment_day']}"
+        )
+    generic_couple_cancel_pending = False
+    generic_couple_cancel_spouse_first = None
+    generic_couple_cancel_spouse_last = None
+    generic_couple_cancel_spouse_dob = None
+    if not cancelled_parts:
+        return (
+            "I couldn't find any upcoming appointments on file for "
+            f"{spouse_first} or yourself to cancel. Is there anything "
+            "else I can help you with today?"
+        )
+    return (
+        "I've cancelled "
+        + " and ".join(cancelled_parts)
+        + ". Is there anything else I can help you with today?"
+    )
 
 
 def generate_weekly_availability(force_has_availability=None):
@@ -3368,6 +3870,35 @@ def is_conversation_closing_reply(message_lower):
     normalized = re.sub(r"[.,!?]", "", message_lower).strip()
     normalized = re.sub(r"\s+", " ", normalized)
     return normalized in CONVERSATION_CLOSING_PHRASES
+
+
+def active_speaker_first_name():
+    """Returns the first name of the person Steve is CURRENTLY speaking
+    to - the ACTIVE SPEAKER, not the patient - for use in closing /
+    farewell messages. The closing block previously used
+    patient_first_name unconditionally, which mis-addressed the
+    farewell in every third-party workflow where the person on the phone
+    was not the patient (a daughter/spouse/caregiver calling about a
+    loved one, or a parent/guardian confirming for a minor on the line).
+
+    Resolution order:
+      1. Guardian confirmed (established-minor flow): the parent/
+         guardian is the speaker and their name is carried in
+         caller_first_name once confirmed. Never use the MINOR's name
+         here, even though caller_is_patient can still be True from the
+         minor's own earlier self-introduction.
+      2. Third-party caller still on the line (not the patient
+         speaking): address the caller, not the patient they called
+         about. If the caller's name was never captured, omit the name
+         rather than address an absent patient.
+      3. Patient on the line / self-caller (caller_is_patient True, no
+         guardian involved): address the patient.
+      4. Ambiguous: fall back to patient, then caller (legacy)."""
+    if established_patient_minor_guardian_confirmed:
+        return caller_first_name or None
+    if third_party_detected and not caller_is_patient:
+        return caller_first_name or None
+    return patient_first_name or caller_first_name
 
 
 def detect_self_pay_intent(message_lower):
@@ -4748,8 +5279,8 @@ def extract_names_from_message(message):
         "patient_first": None, "patient_last": None
     }
     caller_patterns = [
-        r"(?i:this\s+is)\s+([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
-        r"(?i:my\s+name\s+is)\s+([A-Za-z][a-z]+)\s+([A-Za-z][a-z]+)",
+        r"(?i:this\s+is)\s+([A-Za-z][a-z]+)\s+([A-Za-z][A-Za-z]+)",
+        r"(?i:my\s+name\s+is)\s+([A-Za-z][a-z]+)\s+([A-Za-z][A-Za-z]+)",
         # Avoid matching verbs like 'calling' after "I'm" or "I am".
         # Use a negative lookahead to skip common phrases such as
         # "I'm calling for" or "I'm calling about".
@@ -6105,6 +6636,11 @@ def home():
     global generic_covering_weekly_schedule_snapshot
     global couple_followup_flow_active, couple_followup_previous_visit_date
     global couple_followup_available_pairs
+    global couple_followup_spouse_stage
+    global couple_followup_spouse_first_name
+    global couple_followup_spouse_last_name
+    global couple_followup_spouse_slot
+    global couple_followup_spouse_relation
     global controlled_substance_appt_pending, controlled_substance_appt_medication_word
     global controlled_substance_appt_schedule, controlled_substance_bridge_awaiting_days
     global controlled_substance_appt_day_name, controlled_substance_appt_date
@@ -6176,6 +6712,10 @@ def home():
     generic_household_cancel_spouse_dob = None
     generic_household_cancel_spouse_old_slot = None
     generic_household_cancel_spouse_relation = None
+    generic_couple_cancel_pending = False
+    generic_couple_cancel_spouse_first = None
+    generic_couple_cancel_spouse_last = None
+    generic_couple_cancel_spouse_dob = None
     virtual_wait_active = False
     virtual_wait_choice_pending = False
     virtual_wait_reschedule_pending = False
@@ -6191,6 +6731,12 @@ def home():
     couple_followup_flow_active = False
     couple_followup_previous_visit_date = None
     couple_followup_available_pairs = None
+    couple_followup_spouse_stage = None
+    couple_followup_spouse_first_name = None
+    couple_followup_spouse_last_name = None
+    couple_followup_spouse_slot = None
+    couple_followup_spouse_relation = None
+    couple_followup_cancel_active = False
     individual_six_month_followup_active = False
     individual_six_month_followup_previous_visit_date = None
     individual_six_month_followup_days_since = None
@@ -6331,6 +6877,8 @@ def chat():
     global generic_household_cancel_stage, generic_household_cancel_spouse_first
     global generic_household_cancel_spouse_last, generic_household_cancel_spouse_dob
     global generic_household_cancel_spouse_old_slot, generic_household_cancel_spouse_relation
+    global generic_couple_cancel_pending, generic_couple_cancel_spouse_first
+    global generic_couple_cancel_spouse_last, generic_couple_cancel_spouse_dob
     global virtual_wait_active, virtual_wait_choice_pending
     global virtual_wait_reschedule_pending, virtual_wait_reschedule_schedule
     global virtual_wait_reschedule_provider
@@ -6406,6 +6954,20 @@ def chat():
             and _JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower)
     ):
         generic_joint_cancel_pending = True
+
+    # Capture a generic couple joint-CANCELLATION intent the moment it is
+    # ever stated ("Please cancel appointments for my wife and myself"),
+    # even if this turn is intercepted by an earlier-return path (e.g.
+    # pre-chart identification completing in the same message). Mirrors
+    # the joint-cancel capture above; excludes the specialized flows that
+    # have their own cancellation machines (six-month couples,
+    # new-patient households, Sprint13/14). Recorded once so a later
+    # message cannot flip the flag back on after the machine completes.
+    if (
+            not generic_couple_cancel_pending
+            and is_generic_couple_cancel_request(message_lower)
+    ):
+        generic_couple_cancel_pending = True
 
     if is_couple_six_month_followup_request(message_lower):
         couple_followup_flow_active = True
@@ -8126,7 +8688,7 @@ def chat():
                 break
 
         if last_assistant_offered_closing and is_conversation_closing_reply(message_lower):
-            closing_name = patient_first_name or caller_first_name
+            closing_name = active_speaker_first_name()
             patient_expressed_thanks = "thank" in message_lower
             if patient_expressed_thanks:
                 closing_response = (
@@ -8330,6 +8892,49 @@ def chat():
                 {"role": "assistant", "content": consent_gate_response}
             )
             return jsonify({"response": consent_gate_response})
+
+    # HIPAA Consent Hand-back Gate (deterministic).
+    # After the patient has given verbal consent, the ORIGINAL third-party
+    # caller resumes the line ("This is David"). caller_is_patient is still
+    # True from the patient's earlier self-announcement and nothing ever
+    # flipped it back, so the caller's re-introduction fell through to the
+    # LLM, which improvised a generic greeting ("Hello David. Is there
+    # anything...") instead of a deterministic hand-off. When the current
+    # message is a BARE self-introduction by the recorded caller (NOT the
+    # patient), hand control back to the caller. Matching is anchored so a
+    # greeting PLUS an actual request ("This is David and I need to...")
+    # still flows through to the normal consent-aware handling below.
+    if (
+        third_party_consent_obtained
+        and third_party_detected
+        and caller_is_patient is True
+        and caller_first_name
+        and re.search(
+            r"^(?:hi|hello|yes|ha)?\s*(?:this is|i am|i'm|it's|it is)\s+"
+            + re.escape(caller_first_name)
+            + r"(?:\s+\S+)?[.!?\s]*$",
+            message_lower, re.IGNORECASE
+        )
+        and not (
+            patient_first_name
+            and re.search(
+                r"(?:this is|i am|i'm|it's|it is)\s+"
+                + re.escape(patient_first_name) + r"\b",
+                message_lower, re.IGNORECASE
+            )
+        )
+    ):
+        caller_is_patient = False
+        hand_back_response = (
+            f"Hello {caller_first_name}. How can I help you today?"
+        )
+        conversation_history.append(
+            {"role": "user", "content": user_message}
+        )
+        conversation_history.append(
+            {"role": "assistant", "content": hand_back_response}
+        )
+        return jsonify({"response": hand_back_response})
 
     if caller_is_patient is False:
         third_party_detected = True
@@ -9065,12 +9670,91 @@ def chat():
         if turn.get("role") == "assistant":
             last_assistant_lower = turn.get("content", "").lower()
             if (
-                    "reason" in last_assistant_lower
-                    and "appointment" in last_assistant_lower
-                    and "?" in last_assistant_lower
+                    ("reason" in last_assistant_lower
+                     and "appointment" in last_assistant_lower
+                     and "?" in last_assistant_lower)
+                    or "what is the reason" in last_assistant_lower
             ):
                 appointment_reason_just_requested = True
             break
+
+    # Surgical fix (form 1823 derailment): the static system prompt always
+    # carries the LAB ORDER PICKUP script with an exact quoted question.
+    # On the turn right after the caller states the appointment reason, the
+    # model would occasionally misfire that always-present script instead of
+    # continuing the scheduling flow. Inject an explicit override so that
+    # turn deterministically stays in APPOINTMENT SCHEDULING -- but only
+    # when no real lab-order pickup or fax request is actually present.
+    booking_reason_provided_context = ""
+    if (
+            appointment_reason_just_requested
+            and not lab_order_pickup
+            and not patient_explicitly_requested_fax
+    ):
+        booking_reason_provided_context = (
+            "APPOINTMENT REASON JUST PROVIDED - SCHEDULING IN PROGRESS:\n"
+            "The caller just stated the appointment reason. This is an "
+            "APPOINTMENT SCHEDULING call, NOT a lab order pickup or fax "
+            "request.\n"
+            "Do NOT ask the caller about faxing lab orders, do NOT ask "
+            "about picking up lab orders, and do NOT quote any lab order "
+            "wording.\n"
+            "Acknowledge the reason briefly, then continue scheduling: "
+            "using the WEEKLY AVAILABILITY INJECTED BY SYSTEM above, offer "
+            "the available day/time (asking in-person or virtual visit "
+            "first if the patient has not yet chosen).\n"
+        )
+
+    # Surgical fix (authorized third-party scheduling refusal): the static
+    # system prompt carries the SITUATION B script verbatim ("I would
+    # recommend having [patient name] call us directly..."), and the model
+    # occasionally applies it to a caller who IS verified on the patient's
+    # HIPAA form, refusing a scheduling request it should accept. The
+    # THIRD PARTY AUTHORIZED (ON HIPAA) override runs on every ON-HIPAA
+    # turn and can still lose to that static quote on the first scheduling
+    # request (same failure class as the lab-order derailment fixed above).
+    # Nail it down on exactly that turn - only injected for an authorized
+    # ON-HIPAA third party actively requesting to schedule for the patient,
+    # before the reason has been asked, and only when no specialized flow
+    # (controlled substance / follow-up / nurse visit / same day / lab /
+    # fax) is active so those workflows are untouched.
+    authorized_scheduling_request_context = ""
+    if (
+            third_party_detected
+            and dob_collected
+            and pcp_collected
+            and not is_medical_professional_caller
+            and not caller_is_patient
+            and hipaa_status_determined
+            and current_hipaa_status == "ON_HIPAA"
+            and not appointment_reason_just_requested
+            and not lab_order_pickup
+            and not patient_explicitly_requested_fax
+            and not controlled_substance_schedule
+            and not controlled_substance_appt_pending
+            and not individual_six_month_followup_active
+            and not individual_three_month_followup_active
+            and not nurse_visit_active
+            and not is_same_day
+            and "appointment" in message_lower
+            and ("schedule" in message_lower or "book" in message_lower)
+    ):
+        authorized_scheduling_request_context = (
+            "AUTHORIZED HIPAA THIRD PARTY - SCHEDULING REQUEST:\n"
+            "This caller is verified ON the patient's HIPAA form and has "
+            "just asked to schedule an appointment for the patient. Do NOT "
+            "quote or apply the SITUATION B script "
+            "(\"I would recommend having [patient name] call us directly\""
+            "): it does NOT apply to a caller verified on the patient's "
+            "HIPAA form, so do NOT tell them to have the patient call us "
+            "directly.\n"
+            "Treat this scheduling request exactly as if the patient made "
+            "it themselves: if no reason for the visit has been stated yet, "
+            "respond with exactly \"Thank you. What is the reason for the "
+            "appointment\". Once a reason is stated, continue with the "
+            "WEEKLY AVAILABILITY INJECTED BY SYSTEM above and proceed to "
+            "booking. Do NOT re-run or re-ask HIPAA verification.\n"
+        )
 
     availability_context = ""
     if (
@@ -9912,6 +10596,15 @@ def chat():
     # "talk about" alone, which can also appear in genuine clinical
     # questions phrased conversationally). Any interrogative wording
     # always overrides this and keeps the deflection active.
+    # Bug fix: the same applies on the reason-answer turn - when Steve
+    # just asked "What is the reason for the appointment?" and the
+    # patient answers with a medication-related REASON ("discuss dosage
+    # increase for Lisinopril", "refill for Adderall"), the drug-name
+    # trigger below (e.g. "lisinopril" in the detection list) must not
+    # deflect the appointment to the clinical callback; the answer to a
+    # reason question is a reason, not a clinical question. Interrogative
+    # wording ("what is it for", "how does it work", "side effects")
+    # still overrides and keeps the deflection active.
     narrow_new_med_reason = any(p in message_lower for p in [
         "being put on", "put me on", "start me on", "start on",
         "started on", "starting a", "starting on",
@@ -9922,7 +10615,7 @@ def chat():
     interrogative_override = any(p in message_lower for p in [
         "what", "why", "how", "side effect", "safe", "does it", "is it", "?"
     ])
-    if narrow_new_med_reason and not interrogative_override:
+    if (narrow_new_med_reason or appointment_reason_just_requested) and not interrogative_override:
         medication_inquiry_detected = False
 
     medication_inquiry_context = ""
@@ -10534,6 +11227,28 @@ def chat():
 
     conversation_history.append({"role": "user", "content": user_message})
 
+    # ── Generic couple joint-cancellation (LLM-fallback guard) ──────
+    # "Please cancel appointments for my wife and myself" used to reach
+    # the model here, which improvised "I would recommend having your
+    # wife call us directly so under HIPAA I may make the necessary
+    # changes to her record. Regarding your own appointment, for which
+    # date and time shall I proceed with the cancellation?" - a HIPAA
+    # decline for the spouse plus an individual ask for the caller's own
+    # record. A joint household cancellation must instead collect the
+    # spouse's identity first, then cancel BOTH records. By the time this
+    # fallback is reached, every dedicated flow (six-month couples,
+    # new-patient households, Sprint13/14, acute visits) has already
+    # returned, so this cannot preempt them.
+    if pre_chart_complete and not is_medical_professional_caller:
+        _generic_couple_cancel_reply = handle_generic_couple_cancel(
+            user_message, message_lower
+        )
+        if _generic_couple_cancel_reply:
+            conversation_history.append(
+                {"role": "assistant", "content": _generic_couple_cancel_reply}
+            )
+            return jsonify({"response": _generic_couple_cancel_reply})
+
     phf_context = Sprint13.build_context()
     wellness_context = Sprint14.build_context()
 
@@ -10552,6 +11267,8 @@ def chat():
             nurse_visit_context + "\n" +
             lab_order_fax_to_facility_context + "\n" +
             lab_order_pickup_context + "\n" +
+            booking_reason_provided_context + "\n" +
+            authorized_scheduling_request_context + "\n" +
             patient_presence_context + "\n" +
             lab_work_context + "\n" +
             lab_result_inquiry_context + "\n" +
@@ -10584,6 +11301,11 @@ def chat():
         )
         first_choice = response.choices[0]
         assistant_message = first_choice.message.content or ""
+        # Root cause fix: a completed call-closing phrase that was cut
+        # off mid-sentence ("...anything else I" with no ending) must be
+        # finished deterministically BEFORE the length-trim below, so the
+        # completed close survives as a clean final sentence.
+        assistant_message = _complete_truncated_close(assistant_message)
         # Root cause fix: the completion above is hard-capped at
         # max_completion_tokens=900. When the model exhausts that budget
         # Groq returns finish_reason="length" with the reply cut off
