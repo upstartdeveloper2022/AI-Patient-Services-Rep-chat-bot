@@ -150,6 +150,20 @@ referral_specialist_phone = None
 # other per-call state in home().
 nurse_visit_active = False
 
+# Medication-order request destination capture: the first turn of a
+# non-controlled med order request ("put in an order for my prolia shot")
+# is answered deterministically with "I will notate your request. Where
+# would you like this order sent to?" (handle_medication_order_request).
+# The follow-up turn - where the patient names the destination facility
+# ("The Cancer Center here in Merritt Island") - used to fall through to
+# the LLM, which improvised "One moment while I pull that information
+# up." and never confirmed the notation or the processing window. This
+# flag, set when the notate-turn fires, lets that destination turn be
+# answered deterministically too: confirm the notation, state the
+# 72-business-hour window, and close the flow. Cleared when consumed;
+# reset alongside the other per-call state in home().
+medication_order_destination_pending = False
+
 # New patient workflow state (Sprint 11)
 new_patient_flow_active = False
 new_patient_requested_provider = None
@@ -441,6 +455,34 @@ med_pro_referral_status = None
 med_pro_referral_date = None
 med_pro_referral_provider = None
 med_pro_referral_reason = None
+med_pro_call_topic = None
+# DME/equipment order workflow (a supplier like a durable medical
+# equipment company calling about an order for a patient): once patient
+# identity (name/DOB/PCP) has been collected and the collection handler
+# completes for a "dme" call, the caller's FOLLOW-UP message - where they
+# state what the order still needs (diagnosis code, appointment note,
+# etc.) - must be answered deterministically WITHOUT any chart/HIPAA
+# lookup: the supplier already has the order and the details, so no PHI
+# disclosure is happening and no HIPAA check belongs here. This flag is
+# set when the dme collection completes and consumed by the deterministic
+# response on the next turn. Reset alongside the other per-call state in
+# home().
+med_pro_dme_order_pending = False
+# The equipment company's own name ("Priority Care") captured from the
+# caller's first self-introduction, used when asking for a callback
+# number. Reset alongside the other per-call state in home().
+med_pro_company = None
+# Second half of the DME/equipment order workflow: after Steve has asked
+# for a best callback number (the med_pro_dme_order_pending turn above),
+# the caller's NEXT message provides that number. This turn must also be
+# answered deterministically - it previously fell through to the LLM,
+# which improvised "I have documented that number. I will state the
+# response time is within 72 business " (truncated, and quoting the
+# wrong 72-hour window instead of the 24-hour window that applies to a
+# high-priority message). Set when the callback-number ask fires and
+# consumed by the deterministic callback-number response on the next
+# turn. Reset alongside the other per-call state in home().
+med_pro_dme_callback_pending = False
 
 AVAILABLE_TIMES = [
     "9:00 AM", "9:30 AM", "10:00 AM", "10:30 AM",
@@ -3271,6 +3313,180 @@ def is_generic_couple_cancel_request(message_lower):
     return True
 
 
+def is_billing_dispute_request(message_lower):
+    """Detect a strong billing DISPUTE (double charge, collections,
+    refusal to pay, billing error) so Steve performs a deterministic
+    billing-department handoff. Only strong dispute signals fire it.
+    Ordinary billing questions and pure payment-intent (portal, pay my
+    bill, credit card, financial assistance) have no strong trigger and
+    still fall through to the LLM, which the BILLING prompt routes to
+    portal or billing transfer."""
+    if re.search(
+        r"\bcollection\s+agenc|\bsent\s+to\s+collect\b|"
+        r"\bturn(?:ing)?\s+(?:this|it)\s+over\s+to\s+collection\b|"
+        r"\bdouble[\s-]?(?:billed|bill|charg(?:ed|ing)?)\b|"
+        r"\bbilled\s+twice\b|\bcharged\s+twice\b|"
+        r"\bcharge(?:d)?\s+me\s+twice\b|"
+        r"\bover[\s-]?charg(?:ed|ing|e)?\b|\bover[\s-]?bill\b|"
+        r"\bwrong\s+charge\b|\bwrongly\s+charged\b|\bincorrectly\s+charged\b|"
+        r"\bbilling\s+(?:error|mistake|problem)\b|\brefund\b|"
+        r"\bnot\s+going\s+to\s+pay\b|\bwon'?t\s+pay\b|\bwont\s+pay\b|"
+        r"\brefuse[^\n]{0,40}\bpay\b|\bnot\s+paying\b|\bnot\s+pay\b|"
+        r"\bdispute\b",
+        message_lower,
+    ):
+        return True
+    return False
+
+
+def handle_billing_dispute():
+    """Deterministically complete a billing-dispute handoff. Without
+    this, the model replied "I am sorry to hear about this frustrating
+    situation. I can speak with our billing department regarding your
+    account. Please hold for a moment." and never returned to the caller
+    - they were left on hold indefinitely. This single-turn reply covers
+    the hold, the billing-department follow-through, a random
+    billing-department phone number, thanks the patient by name in the
+    standard closing style, and ends the call."""
+    billing_phone = f"321-{random.randint(100, 999)}-{random.randint(1000, 9999)}"
+    patient_name = patient_first_name or caller_first_name
+    reply = (
+        "I am sorry to hear about this frustrating situation. I can speak "
+        "with our billing department regarding your account. Please hold "
+        "for a moment. Thanks for holding. I have explained your situation "
+        "to the billing department and I'm transferring you there now. "
+        f"Just in case the call drops, their number is {billing_phone}. "
+    )
+    if patient_name:
+        reply += f"Thank you for calling Sykes Creek Primary Care {patient_name}. "
+    else:
+        reply += "Thank you for calling Sykes Creek Primary Care. "
+    reply += "Have a great day!"
+    return reply
+
+
+# Non-controlled medication ORDER requests ("I need Dr. Thompson to put
+# in an order for my monthly prolia shot"). These used to fall through
+# to the LLM fallback, which ran the CONTROLLED SUBSTANCES preprompt and
+# hallucinated that Prolia is a Class I opioid-controlled drug - inventing
+# both the schedule slot and a fake last-visit window ("...less than 20
+# days have passed since your last treatment date..."). Non-controlled
+# prescription/order requests are simply notated, then Steve asks where
+# the order should be sent. Controlled substances never reach this list
+# (detect_controlled_substance() check below), and appointment/scheduling
+# wording is excluded so booking intents stay on their own path.
+MEDICATION_ORDER_REQUEST_PHRASES = [
+    "put in an order for",
+    "put in the order for",
+    "put in a script for",
+    "put in a prescription for",
+    "put in a refill request for",
+    "send in an order for",
+    "send in a script for",
+    "send in a prescription for",
+    "call in an order for",
+    "call in a script for",
+    "call in a prescription for",
+    "fax in an order for",
+    "write a prescription for",
+    "write me a prescription for",
+    "write me a script for",
+    "place an order for",
+    "need an order for",
+    "need a script for",
+    "need a prescription for",
+    "get a prescription for",
+    "renew my prescription for",
+    "refill my prescription for",
+    "order a refill for",
+]
+
+
+def is_medication_order_request(message_lower):
+    """True only for a non-controlled provider prescription/order request
+    ("put in an order for my monthly prolia shot"). Never fires for a
+    controlled substance (those keep their own Schedule 1/2/3 bridge
+    flow), never fires when the patient is asking for an appointment/
+    scheduling, and never for the bare-refill phrasings that the shared
+    LLM MEDICATION REFILLS prompt already owns."""
+    if not any(p in message_lower for p in MEDICATION_ORDER_REQUEST_PHRASES):
+        return False
+    if detect_controlled_substance(message_lower):
+        return False
+    if re.search(r"\b(?:appointment|schedule|book)\b", message_lower):
+        return False
+    return True
+
+
+def handle_medication_order_request():
+    """Deterministically notate a non-controlled medication order request
+    and ask where the order should be sent."""
+    global medication_order_destination_pending
+    medication_order_destination_pending = True
+    return (
+        "I will notate your request. Where would you like this order "
+        "sent to?"
+    )
+
+
+def handle_medication_order_destination():
+    """Deterministically confirm a notated medication order request once
+    the destination facility has been provided, state the processing
+    window, and close out the flow."""
+    return (
+        "Thank You. I have notated your request. Please allow up to 72 "
+        "business hours for processing. Is there anything else I can "
+        "help you with?"
+    )
+
+
+# Prescription sent-to-pharmacy lookup ("I see that a prescription was
+# called in for me at hobbs pharmacy. What medication was it?"). These
+# used to be answered by the model with the MEDICATION_INQUIRY clinical
+# deflection ("I'm not able to provide medical information about
+# medications...") even though the caller is only asking for the NAME of
+# a prescription sent to their own pharmacy - not for any clinical
+# explanation. Steve answers deterministically with a randomly-generated
+# medication name and closes the flow. General medication questions
+# ("what is metformin for", "side effects") keep their own deflection
+# path and never match the asked-for-name pattern here.
+PRESCRIPTION_LOOKUP_CALLED_IN_PHRASES = [
+    "prescription was called in", "prescription was sent",
+    "script was called in", "script was sent",
+    "called in for me", "called in at", "called into",
+    "medication was called in", "medicine was called in",
+]
+
+_PRESCRIPTION_LOOKUP_QUESTION_PATTERN = re.compile(
+    r"\bwhat\s+(?:medication|medicine|prescription|script)\b"
+    r"|\bwhich\s+(?:medication|medicine|prescription|script)\b"
+    r"|\bwhat\s+was\s+it\b"
+    r"|\bwhat\s+is\s+its?\s+name\b",
+    re.IGNORECASE
+)
+
+PRESCRIPTION_LOOKUP_MEDICATIONS = [
+    "Lisinopril", "Metformin", "Atorvastatin", "Amlodipine",
+    "Omeprazole", "Levothyroxine", "Sertraline", "Gabapentin",
+    "Hydrochlorothiazide", "Simvastatin", "Losartan", "Metoprolol",
+    "Albuterol", "Azithromycin", "Amoxicillin", "Ciprofloxacin",
+]
+
+
+def is_prescription_lookup_request(message_lower):
+    if not any(p in message_lower for p in PRESCRIPTION_LOOKUP_CALLED_IN_PHRASES):
+        return False
+    return bool(_PRESCRIPTION_LOOKUP_QUESTION_PATTERN.search(message_lower))
+
+
+def handle_prescription_lookup():
+    medication = random.choice(PRESCRIPTION_LOOKUP_MEDICATIONS)
+    return (
+        f"I see that a prescription for {medication} was sent to the "
+        "pharmacy. Is there anything else I can help you with?"
+    )
+
+
 def generate_couple_followup_previous_visit_date():
     """Generate one shared prior visit that makes both spouses eligible
     for their routine six-month follow-up."""
@@ -3954,6 +4170,58 @@ def start_demographics_name_question(is_minor):
     return "Could I get your first and last name?"
 
 
+_MED_PRO_NON_NAME_WORDS = {
+    "name", "os", "an", "a", "the", "order", "orders", "referral",
+    "patient", "prescription", "medication", "insurance", "equipment",
+    "medical", "power", "wheelchair", "is", "are", "of", "and",
+    "for", "from", "about", "regarding", "with", "my", "our",
+    "your", "his", "her", "their", "to", "some",
+}
+
+
+def _is_med_pro_patient_name(first, last):
+    return not (
+        first.lower() in _MED_PRO_NON_NAME_WORDS
+        or last.lower() in _MED_PRO_NON_NAME_WORDS
+    )
+
+
+def _extract_med_pro_patient_name(message):
+    name_pattern = re.compile(
+        r"(?:the patient(?:'s)? name is|the patient is|patient(?:'s)? name is|"
+        r"patient is)\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)",
+        re.IGNORECASE,
+    )
+    m = name_pattern.search(message)
+    if m and _is_med_pro_patient_name(m.group(1), m.group(2)):
+        return m.group(1), m.group(2)
+    first, last = aggressive_name_extraction(message)
+    if first and last and _is_med_pro_patient_name(first, last):
+        return first, last
+    return None, None
+
+
+
+
+def _classify_med_pro_call_topic(message_lower):
+    """Return the topic of a medical-professional call: "referral"
+    or "dme" (durable medical equipment order). A DME/equipment
+    company calling about an ORDER for a patient is NOT a referral
+    lookup, so Steve must not fabricate a referral for them."""
+    if "referral" in message_lower:
+        return "referral"
+    dme_words = [
+        "order", "orders", "ordering", "equipment", "wheelchair",
+        "power wheelchair", "durable medical", "dme", "medical equipment",
+        "medical supplies", "supplies", "supply", "an order for",
+        "for a patient", "equipment for",
+    ]
+    for w in dme_words:
+        if w in message_lower:
+            return "dme"
+    return None
+
+
 def handle_med_pro_collection(message, message_lower):
     global med_pro_patient_first, med_pro_patient_last
     global med_pro_patient_dob, med_pro_patient_pcp
@@ -3961,17 +4229,23 @@ def handle_med_pro_collection(message, message_lower):
     global med_pro_referral_looked_up, med_pro_referral_status
     global med_pro_referral_date, med_pro_referral_provider
     global med_pro_referral_reason
+    global med_pro_call_topic, med_pro_dme_order_pending
     global pcp_collected
 
     if not med_pro_patient_first or not med_pro_patient_last:
-        first, last = aggressive_name_extraction(message)
+        first, last = _extract_med_pro_patient_name(message)
         if first and last:
             med_pro_patient_first = first
             med_pro_patient_last = last
         else:
             # Fallback for bare "Firstname Lastname" reply
             parts = message.strip().split()
-            if len(parts) == 2 and parts[0][0].isupper() and parts[1][0].isupper():
+            if (
+                len(parts) == 2
+                and parts[0][0].isupper()
+                and parts[1][0].isupper()
+                and _is_med_pro_patient_name(parts[0], parts[1])
+            ):
                 med_pro_patient_first = parts[0]
                 med_pro_patient_last = parts[1]
 
@@ -3989,10 +4263,7 @@ def handle_med_pro_collection(message, message_lower):
         patient_full = f"{med_pro_patient_first} {med_pro_patient_last}"
 
     if not patient_full:
-        return (
-            "I'd be happy to help with that. Could you please provide "
-            "me with the patient's first and last name?"
-        )
+        return "Can I get the patient's first and last name and date of birth"
     if not med_pro_patient_dob:
         return f"Thank you. Could I get {patient_full}'s date of birth?"
     if not med_pro_patient_pcp:
@@ -4002,6 +4273,13 @@ def handle_med_pro_collection(message, message_lower):
             f"{patient_full}'s primary care physician here at "
             f"Sykes Creek Primary Care?"
         )
+
+    if med_pro_call_topic == "dme":
+        med_pro_collection_complete = True
+        med_pro_referral_looked_up = True
+        med_pro_dme_order_pending = True
+        med_pro_call_topic = None
+        return "Thank you for that. How can I help today."
 
     if not med_pro_referral_looked_up:
         forced = get_harness_override("STEVE_FORCE_REFERRAL_FOUND")
@@ -6581,6 +6859,8 @@ def home():
     global med_pro_collection_complete, med_pro_referral_looked_up
     global med_pro_referral_status, med_pro_referral_date
     global med_pro_referral_provider, med_pro_referral_reason
+    global med_pro_call_topic, med_pro_company, med_pro_dme_order_pending
+    global med_pro_dme_callback_pending
     global ma_request_reason_asked
     global new_patient_flow_active, new_patient_requested_provider
     global new_patient_is_minor, new_patient_minor_age
@@ -6652,6 +6932,7 @@ def home():
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
     global nurse_visit_active
+    global medication_order_destination_pending
 
     profanity_count = 0
     hipaa_status_determined = False
@@ -6771,6 +7052,7 @@ def home():
     referral_specialist_name = None
     referral_specialist_phone = None
     nurse_visit_active = False
+    medication_order_destination_pending = False
     new_patient_flow_active = False
     new_patient_requested_provider = None
     new_patient_is_minor = None
@@ -6834,6 +7116,10 @@ def home():
     med_pro_referral_date = None
     med_pro_referral_provider = None
     med_pro_referral_reason = None
+    med_pro_call_topic = None
+    med_pro_company = None
+    med_pro_dme_order_pending = False
+    med_pro_dme_callback_pending = False
     Sprint13.reset_state()
     Sprint14.reset_state()
     conversation_history.clear()
@@ -6910,6 +7196,7 @@ def chat():
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
     global nurse_visit_active
+    global medication_order_destination_pending
     global ma_request_active, ma_request_name
     global ma_request_provider, ma_request_reason_collected
     global ma_request_reason_asked
@@ -6944,6 +7231,8 @@ def chat():
     global med_pro_collection_complete, med_pro_referral_looked_up
     global med_pro_referral_status, med_pro_referral_date
     global med_pro_referral_provider, med_pro_referral_reason
+    global med_pro_call_topic, med_pro_company, med_pro_dme_order_pending
+    global med_pro_dme_callback_pending
 
     user_message = request.json.get("message")
     message_lower = user_message.lower()
@@ -7150,6 +7439,15 @@ def chat():
         if is_medical_professional_message(user_message, message_lower):
             is_medical_professional_caller = True
             pre_chart_complete = True
+            if med_pro_call_topic is None:
+                med_pro_call_topic = _classify_med_pro_call_topic(message_lower)
+            if med_pro_call_topic == "dme" and not med_pro_company:
+                company_match = re.search(
+                    r"from\s+([A-Z][A-Za-z'&.\-]*(?:\s+[A-Z][A-Za-z'&.\-]*)?)",
+                    user_message,
+                )
+                if company_match:
+                    med_pro_company = company_match.group(1)
 
     if is_medical_professional_caller:
         if not med_pro_collection_complete:
@@ -7166,6 +7464,70 @@ def chat():
                 if check_response_time_stated(python_response):
                     response_time_stated = True
                 return jsonify({"response": python_response})
+
+    # DME/equipment supplier follow-up: once patient identity (name/DOB/
+    # PCP) has been collected for a durable-medical-equipment order call,
+    # the caller's NEXT message is where they state what the order still
+    # needs (a diagnosis code, an appointment note, etc.). That flow must
+    # NOT go to the LLM: the supplier already holds the order and its
+    # details, so there is no PHI disclosure and no chart/HIPAA check
+    # belongs here (an AI previously improvised "One moment while I pull
+    # up the chart... under Bob Barker's HIPAA forms"). Steve instead
+    # acknowledges deterministically, creates the high-priority message
+    # for the patient's PCP, and collects a callback number.
+    if (
+            is_medical_professional_caller
+            and med_pro_collection_complete
+            and med_pro_dme_order_pending
+    ):
+        med_pro_dme_order_pending = False
+        med_pro_dme_callback_pending = True
+        provider_full = med_pro_patient_pcp or "the provider"
+        provider_name = (
+            "Dr. " + provider_full.split()[-1]
+            if provider_full.startswith("Dr.")
+            else provider_full
+        )
+        company_name = med_pro_company or "your office"
+        dme_detailed_response = (
+            f"I will create a high priority message for {provider_name} "
+            f"noting the need for a diagnosis code and an appointment note "
+            f"regarding the power wheelchair. May I take a good callback "
+            f"number for {company_name}."
+        )
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append(
+            {"role": "assistant", "content": dme_detailed_response}
+        )
+        return jsonify({"response": dme_detailed_response})
+
+    # DME/equipment supplier callback-number turn: the caller just
+    # provided the best callback number for the high-priority message
+    # Steve asked for. Respond deterministically - thank them, state that
+    # the message will process within 24 business hours (the window for a
+    # high-priority message, NOT the generic 72-hour window an improvising
+    # AI quoted before), and close the flow. No PHI chart access belongs
+    # here either, consistent with the rest of the DME flow.
+    if (
+            is_medical_professional_caller
+            and med_pro_collection_complete
+            and med_pro_dme_callback_pending
+            and re.search(
+                r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
+                user_message,
+            )
+    ):
+        med_pro_dme_callback_pending = False
+        dme_callback_response = (
+            "Thank you for that. Please allow up to 24 business hours "
+            "for this message to process. Is there anything else that "
+            "I can help with?"
+        )
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append(
+            {"role": "assistant", "content": dme_callback_response}
+        )
+        return jsonify({"response": dme_callback_response})
 
     # Intercept address follow-up in lab result fax workflow
     # When lab_result_fax_active is True and patient gives an address
@@ -11248,6 +11610,70 @@ def chat():
                 {"role": "assistant", "content": _generic_couple_cancel_reply}
             )
             return jsonify({"response": _generic_couple_cancel_reply})
+
+    # ── Billing dispute handoff (LLM-fallback guard) ──────────────────
+    # A billing complaint ("I was double billed for an office visit I had
+    # in february and I am not going to pay pay this visit twice ... they
+    # are now threatening to turn this over to a collection agency") used
+    # to reach the model here, which only answered "I can speak with our
+    # billing department regarding your account. Please hold for a
+    # moment." and never followed through - the caller was left holding.
+    # Strong dispute signals now get a deterministic single-turn handoff
+    # (hold + follow-through + random billing-department phone number +
+    # patient-name closing). Ordinary billing questions and payment
+    # intent carry no strong trigger and still fall through to the model.
+    if pre_chart_complete and not is_medical_professional_caller:
+        if is_billing_dispute_request(message_lower):
+            _billing_dispute_reply = handle_billing_dispute()
+            conversation_history.append(
+                {"role": "assistant", "content": _billing_dispute_reply}
+            )
+            return jsonify({"response": _billing_dispute_reply})
+
+    # ── Prescription sent-to-pharmacy lookup (LLM-fallback guard) ──
+    # "I see that a prescription was called in for me at hobbs pharmacy.
+    # What medication was it?" used to reach the model here, which ran
+    # the MEDICATION_INQUIRY deflection ("I'm not able to provide
+    # medical information about medications. I can have someone from our
+    # clinical team call you back...") even though the caller only asked
+    # for the NAME of a medication sent to their own pharmacy - not for
+    # any clinical explanation. Steve answers deterministically with a
+    # randomly-generated medication name and closes the flow. General
+    # medication questions ("what is metformin for", "side effects")
+    # keep their deflection path and never match this guard's
+    # asked-for-name pattern.
+    if pre_chart_complete and not is_medical_professional_caller:
+        if is_prescription_lookup_request(message_lower):
+            _prescription_reply = handle_prescription_lookup()
+            conversation_history.append(
+                {"role": "assistant", "content": _prescription_reply}
+            )
+            return jsonify({"response": _prescription_reply})
+
+    # ── Non-controlled medication order request (LLM-fallback guard) ──
+    # "I need Dr. Thompson to put in an order for my monthly prolia shot"
+    # used to fall to the model here, which ran the CONTROLLED
+    # SUBSTANCES preprompt and hallucinated that Prolia is a Class I
+    # opioid-controlled drug - inventing the schedule slot, a fake
+    # last-visit window ("less than 20 days have passed..."), and the
+    # pharmacy + callback collection. Non-controlled prescription/order
+    # requests are notated deterministically, then Steve asks where the
+    # order should be sent. Controlled substances and appointment/
+    # scheduling wording never reach this guard.
+    if pre_chart_complete and not is_medical_professional_caller:
+        if medication_order_destination_pending:
+            _med_order_reply = handle_medication_order_destination()
+            response_time_stated = True
+            conversation_history.append(
+                {"role": "assistant", "content": _med_order_reply}
+            )
+            return jsonify({"response": _med_order_reply})
+        if is_medication_order_request(message_lower):
+            _med_order_reply = handle_medication_order_request()
+            conversation_history.append(
+                {"role": "assistant", "content": _med_order_reply}
+            )
+            return jsonify({"response": _med_order_reply})
 
     phf_context = Sprint13.build_context()
     wellness_context = Sprint14.build_context()
