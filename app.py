@@ -27,6 +27,7 @@ from flask import Flask, render_template, request, jsonify
 from groq import Groq
 import Sprint13
 import Sprint14
+import Sprint16
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -138,6 +139,7 @@ ma_request_name = None
 ma_request_provider = None
 ma_request_reason_collected = False
 ma_request_reason_asked = False
+ma_request_returning = False
 referral_lookup_done = False
 referral_lookup_result = None
 referral_specialist_name = None
@@ -483,6 +485,20 @@ med_pro_company = None
 # consumed by the deterministic callback-number response on the next
 # turn. Reset alongside the other per-call state in home().
 med_pro_dme_callback_pending = False
+# Critical-lab workflow: set once a critical lab result is announced for
+# the collected patient so the critical-lab routing (get ahold of the
+# patient's provider's medical assistant - ALWAYS available for critical
+# labs) fires exactly once, whether the phrase is announced before or
+# after patient identity finishes being collected. Reset in home().
+med_pro_critical_lab_announced = False
+
+# Outside-provider insurance question answered: set when Steve
+# deterministically tells the patient he cannot know whether an outside
+# provider accepts their insurance, so the immediately-following
+# closing turn ("No Sir. I will get ahold of my insurance a call. Thanks
+# anyway.") can be answered with the scripted close instead of letting
+# the AI improvise a scheduling postscript. Reset in home().
+outside_provider_insurance_responded = False
 
 AVAILABLE_TIMES = [
     "9:00 AM", "9:30 AM", "10:00 AM", "10:30 AM",
@@ -777,6 +793,11 @@ MEDICAL_PROFESSIONAL_KEYWORDS = [
     "doctor's office", "dr.'s office",
     "physician", "practitioner",
     "office manager", "referral coordinator",
+    # A lab representative calling in (e.g. "this is the lab",
+    # "lab calling", "calling from the lab") - a critical-lab caller is
+    # a medical-professional caller, handled by the med_pro flow.
+    "this is the lab", "lab calling", "calling from the lab",
+    "laboratory calling",
 ]
 
 NURSE_MA_REQUEST_PHRASES = [
@@ -799,6 +820,18 @@ NURSE_MA_REQUEST_PHRASES = [
     "i would like to speak to the medical assistant"
 ]
 
+# Generic phrasings of a caller RETURNING a call (the MA's, the office's,
+# or the nurse's). MA-name-specific phrasings like "returning Rachel's call"
+# are matched dynamically in detect_returning_ma_call.
+RETURNING_MA_CALL_PHRASES = [
+    "returning the call", "returning a call",
+    "returning your call", "returning his call",
+    "returning her call", "returning the call",
+    "returning the nurse's call", "returning the ma's call",
+    "returning dr. foster's call", "returning the office's call",
+    "calling back", "call you back", "called me back"
+]
+
 LAB_RESULT_INQUIRY_TRIGGERS = [
     "are the results in", "are my results in", "did my results come in",
     "did the results come in", "have my results come in",
@@ -810,6 +843,14 @@ LAB_RESULT_INQUIRY_TRIGGERS = [
     "lab results", "get his results", "get her results",
     "get my results", "get the results", "recent lab results",
     "recent results"
+]
+
+CRITICAL_LAB_PHRASES = [
+    "critical lab", "critical labs", "critical lab result",
+    "critical lab results", "critical value", "critical result",
+    "critical values", "critical results", "stat lab", "stat labs",
+    "stat result", "stat results",
+    "panic value", "panic values",
 ]
 
 LAB_RESULT_FAX_TO_OUTSIDE_TRIGGERS = [
@@ -1927,12 +1968,57 @@ def detect_nurse_ma_request(message_lower):
     return any(phrase in message_lower for phrase in NURSE_MA_REQUEST_PHRASES)
 
 
+def detect_returning_ma_call(message_lower):
+    """True when the caller says they are RETURNING a call - either the
+    MA's call by name, or the office's/nurse's call generically."""
+    if any(
+        phrase in message_lower for phrase in RETURNING_MA_CALL_PHRASES
+    ):
+        return True
+    if "returning" in message_lower:
+        for ma_name in MA_NAME_TO_PROVIDER:
+            if f"returning {ma_name}'s call" in message_lower:
+                return True
+            if f"returning {ma_name} call" in message_lower:
+                return True
+    return False
+
+
 def detect_nurse_visit(message_lower):
     """True when the patient is asking for a nurse visit (injection,
     B12/flu shot, vaccine, etc.) - a service that must be performed in
     the office and is scheduled by the medical assistant, never by Steve
     and never virtually."""
     return any(phrase in message_lower for phrase in NURSE_VISIT_TRIGGERS)
+
+
+def detect_critical_lab_call(message_lower):
+    """True when a caller (a lab representative) reports a critical lab
+    / critical value / stat lab result for a patient."""
+    return any(phrase in message_lower for phrase in CRITICAL_LAB_PHRASES)
+
+
+def _is_lab_representative_caller(message_lower=None):
+    """True when the med-pro caller's first self-introduction identified
+    them as a lab representative (e.g. "this is the lab calling" /
+    "calling from the lab" / "from Quest Diagnostics"). Used to keep a
+    lab caller out of the default referral-lookup path until a critical
+    lab is actually announced."""
+    sources = [m.get("content", "").lower() for m in conversation_history]
+    if message_lower:
+        sources.append(message_lower)
+    for content in sources:
+        if any(
+            marker in content for marker in (
+                "this is the lab", "the lab calling", "lab calling",
+                "calling from the lab", "from the lab",
+                "from the laboratory", "laboratory calling",
+                "reference laboratory", "we are the lab",
+                "this is a lab", "clinical laboratory",
+            )
+        ):
+            return True
+    return False
 
 
 def detect_lab_order_pickup(message_lower):
@@ -3154,6 +3240,103 @@ def is_employer_sponsored_insurance_phrasing(message_lower):
     return bool(_EMPLOYER_SPONSORED_WORD_PATTERN.search(message_lower))
 
 
+# ── Outside-provider insurance-acceptance question ──────────────────
+# A patient who was referred to (or is asking about) an OUTSIDE
+# provider - a specialist, or a doctor who is not one of this
+# practice's PCPs - often asks whether that provider accepts their
+# insurance ("Does he accept my insurance?"). Steve has no way to know
+# an outside provider's in-network status, and the AI was observed
+# improvising a phone-note + callback-number response for it. These
+# questions are answered deterministically instead.
+OUTSIDE_PROVIDER_INSURANCE_PATTERNS = [
+    re.compile(
+        r"\baccept(?:s|ed)?\s+(?:my|this|that|our)\s+"
+        r"(?:insurance|coverage|plan)\b"
+    ),
+    re.compile(
+        r"\btake\s+(?:my|this|that|our)\s+(?:insurance|coverage|plan)\b"
+    ),
+    re.compile(r"\bcover(?:ed)?\s+(?:by|under)\s+(?:my|this|that|our)\s+insurance\b"),
+    re.compile(r"\bin[- ]network\b"),
+    re.compile(r"\bout[- ]of[- ]network\b"),
+]
+
+OUTSIDE_PROVIDER_SPECIALTY_WORDS = [
+    "endocrinologist", "cardiologist", "dermatologist", "urologist",
+    "neurologist", "oncologist", "hematologist", "orthopedic",
+    "orthopedist", "gastroenterologist", "gynecologist",
+    "obstetrician", "rheumatologist", "allergist", "pulmonologist",
+    "nephrologist", "ophthalmologist", "otolaryngologist", "podiatrist",
+    "psychiatrist", "surgeon", "radiologist", "audiologist", "specialist",
+]
+
+_OUTSIDE_PROVIDER_DOCTOR_NAME_RE = re.compile(
+    r"\b(?:dr|doctor)\.?\s+([a-z]+(?:[-\s][a-z]+)?)"
+)
+
+
+def references_outside_provider(text_lower):
+    """True if the text names a provider who is NOT one of this
+    practice's PCPs: either a specialty title (endocrinologist, etc.)
+    or a "Dr. <Name>" whose last name is not in PROVIDER_LAST_NAMES."""
+    if any(word in text_lower for word in OUTSIDE_PROVIDER_SPECIALTY_WORDS):
+        return True
+    for _m in _OUTSIDE_PROVIDER_DOCTOR_NAME_RE.finditer(text_lower):
+        if _m.group(1).split()[-1] not in PROVIDER_LAST_NAMES:
+            return True
+    return False
+
+
+def detect_outside_provider_insurance_question(message_lower, history=None):
+    """True when the caller asks whether an OUTSIDE provider (a
+    specialist, or a doctor who is not one of this practice's PCPs)
+    accepts their insurance. The provider may be named in this message
+    or in the recent conversation history (a follow-up "does he accept
+    my insurance?" asked after the referral was stated earlier in the
+    same call)."""
+    if not any(
+            pattern.search(message_lower)
+            for pattern in OUTSIDE_PROVIDER_INSURANCE_PATTERNS
+    ):
+        return False
+    if references_outside_provider(message_lower):
+        return True
+    if history:
+        _recent = " ".join(m["content"] for m in history[-4:]).lower()
+        return references_outside_provider(_recent)
+    return False
+
+
+# Closing-turn detection scoped to the outside-provider insurance
+# question. After Steve answers deterministically ("...Is there anything
+# else I can help you with today?"), the patient usually ends the call
+# with a thanks / "no sir" statement - sometimes long-winded ("No Sir. I
+# will get ahold of my insurance a call. Thanks anyway.") that the
+# general closed-phrase list below cannot match. Fires only when the
+# turn clearly closes and does NOT begin a follow-up request.
+_INSURANCE_CLOSING_ACK_PHRASES = [
+    "no sir", "no ma'am", "no mam", "no miss", "thank", "thanks",
+    "goodbye", "good bye", "bye", "all set", "that's all", "thats all",
+    "nothing else", "no problem", "that's it", "thats it",
+    "have a good day", "have a great day",
+]
+_INSURANCE_CLOSING_CONTINUATION_MARKERS = [
+    "can you", "could you", "would you", "do you", "does the",
+    "is there", "are there", "what's", "what is", "what are",
+    "how can", "how do", "have you", "will you", "one more",
+    "another question", "quick question", "actually wait",
+]
+
+
+def is_call_closing_message_after_insurance(message_lower):
+    text = message_lower.lower()
+    if "?" in text:
+        return False
+    if any(w in text for w in _INSURANCE_CLOSING_CONTINUATION_MARKERS):
+        return False
+    return any(w in text for w in _INSURANCE_CLOSING_ACK_PHRASES)
+
+
 def generate_referral_lookup():
     """
     Randomly determines if a past referral can be found in the chart.
@@ -4189,12 +4372,25 @@ def _is_med_pro_patient_name(first, last):
 def _extract_med_pro_patient_name(message):
     name_pattern = re.compile(
         r"(?:the patient(?:'s)? name is|the patient is|patient(?:'s)? name is|"
-        r"patient is)\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)",
+        r"patient is|(?:the|his|her|their)\s+name\s+is)\s+"
+        r"([A-Z][a-z]+)\s+([A-Z][a-z]+)",
         re.IGNORECASE,
     )
     m = name_pattern.search(message)
     if m and _is_med_pro_patient_name(m.group(1), m.group(2)):
         return m.group(1), m.group(2)
+    # Dense single-message med-pro intro ("...a critical lab for Gene
+    # Stanley dob 6/4/1970..."): the patient name immediately precedes a
+    # "dob"/"date of birth" token. Mirrors Sprint16's DOB-guarded
+    # "_PATIENT_FOR_NAME_PATTERN" - the dob adjacency makes this a
+    # precise signal, so "for the referral"/"for Dr Foster" cannot match.
+    dense = re.search(
+        r"(?:for|about)\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)"
+        r"\s+(?:dob|date\s+of\s+birth)\b",
+        message, re.IGNORECASE,
+    )
+    if dense and _is_med_pro_patient_name(dense.group(1), dense.group(2)):
+        return dense.group(1), dense.group(2)
     first, last = aggressive_name_extraction(message)
     if first and last and _is_med_pro_patient_name(first, last):
         return first, last
@@ -4208,6 +4404,8 @@ def _classify_med_pro_call_topic(message_lower):
     or "dme" (durable medical equipment order). A DME/equipment
     company calling about an ORDER for a patient is NOT a referral
     lookup, so Steve must not fabricate a referral for them."""
+    if detect_critical_lab_call(message_lower):
+        return "critical_lab"
     if "referral" in message_lower:
         return "referral"
     dme_words = [
@@ -4231,6 +4429,14 @@ def handle_med_pro_collection(message, message_lower):
     global med_pro_referral_reason
     global med_pro_call_topic, med_pro_dme_order_pending
     global pcp_collected
+
+    # The topic is normally classified from the FIRST med-pro message at
+    # interception time. A caller who only announces themselves up front
+    # ("this is the lab calling") and states the critical lab later must
+    # still be routed to the critical-lab flow once the phrase appears,
+    # so re-classify here any time it is detected.
+    if detect_critical_lab_call(message_lower):
+        med_pro_call_topic = "critical_lab"
 
     if not med_pro_patient_first or not med_pro_patient_last:
         first, last = _extract_med_pro_patient_name(message)
@@ -4274,6 +4480,52 @@ def handle_med_pro_collection(message, message_lower):
             f"Sykes Creek Primary Care?"
         )
 
+    if med_pro_call_topic == "critical_lab":
+        med_pro_collection_complete = True
+        med_pro_referral_looked_up = True
+        med_pro_call_topic = None
+        med_pro_critical_lab_announced = True
+        provider = med_pro_patient_pcp
+        ma_name = PROVIDER_MA_MAP.get(provider)
+        if not ma_name:
+            ma_name = "the medical assistant"
+        provider_short = provider
+        if provider_short.startswith("Dr."):
+            provider_short = "Dr. " + provider_short.split()[-1]
+        # For critical labs the MA is always available - no 50/50
+        # availability check applies here. Steve gets ahold of the MA
+        # for the patient's provider and connects the caller to them.
+        return (
+            f"Understood - a critical lab result for {patient_full}. "
+            f"Please hold while I get ahold of {ma_name}, "
+            f"{provider_short}'s medical assistant. (pause) "
+            f"{ma_name} is available. Let me connect you."
+        )
+
+    # A lab representative who has finished providing the patient's
+    # name/DOB/provider but has NOT yet stated the critical lab result
+    # must not be routed into the default referral-lookup path (which
+    # would fabricate a referral and ask if that is what they are calling
+    # about). Hold and let them state the result; once "critical lab" /
+    # "critical value" / "stat lab" is said, the re-classification at the
+    # top of this function routes them to the critical-lab flow above.
+    if med_pro_call_topic is None and _is_lab_representative_caller(message_lower):
+        return (
+            f"Thank you for that. What lab result do you have for "
+            f"{patient_full} today?"
+        )
+
+    # A medical-professional caller who still has no specific topic
+    # (e.g. a pharmacy rep "calling about a mutual patient") must not be
+    # routed into the default referral-lookup path below, which would
+    # fabricate a referral. Identity collection is complete, so ask how
+    # Steve can help instead of re-classifying.
+    if med_pro_call_topic is None:
+        med_pro_collection_complete = True
+        med_pro_referral_looked_up = True
+        med_pro_call_topic = None
+        return "Thank you for that. How can I help today?"
+
     if med_pro_call_topic == "dme":
         med_pro_collection_complete = True
         med_pro_referral_looked_up = True
@@ -4286,9 +4538,13 @@ def handle_med_pro_collection(message, message_lower):
         if forced is not None:
             med_pro_referral_status = "FOUND" if forced else "NOT_FOUND"
         else:
-            med_pro_referral_status = (
-                "FOUND" if random.randint(0, 1) == 0 else "NOT_FOUND"
-            )
+            # Steve is ALWAYS able to locate a referral in the system.
+            # The 75/25 random generation belongs exclusively to the
+            # Sprint 16 fax-inquiry workflow (whether the additional-info
+            # request fax was received), NOT to the referral lookup
+            # itself - a med-pro caller asking about a referral must never
+            # be told it cannot be found.
+            med_pro_referral_status = "FOUND"
         med_pro_referral_looked_up = True
         if med_pro_referral_status == "FOUND":
             med_pro_referral_date, med_pro_referral_provider, \
@@ -6860,8 +7116,10 @@ def home():
     global med_pro_referral_status, med_pro_referral_date
     global med_pro_referral_provider, med_pro_referral_reason
     global med_pro_call_topic, med_pro_company, med_pro_dme_order_pending
-    global med_pro_dme_callback_pending
+    global med_pro_dme_callback_pending, med_pro_critical_lab_announced
+    global outside_provider_insurance_responded
     global ma_request_reason_asked
+    global ma_request_returning
     global new_patient_flow_active, new_patient_requested_provider
     global new_patient_is_minor, new_patient_minor_age
     global new_patient_parent_on_line_pending
@@ -7047,6 +7305,7 @@ def home():
     ma_request_provider = None
     ma_request_reason_collected = False
     ma_request_reason_asked = False
+    ma_request_returning = False
     referral_lookup_done = False
     referral_lookup_result = None
     referral_specialist_name = None
@@ -7120,8 +7379,11 @@ def home():
     med_pro_company = None
     med_pro_dme_order_pending = False
     med_pro_dme_callback_pending = False
+    med_pro_critical_lab_announced = False
+    outside_provider_insurance_responded = False
     Sprint13.reset_state()
     Sprint14.reset_state()
+    Sprint16.reset_state()
     conversation_history.clear()
     return render_template("index.html")
 
@@ -7200,6 +7462,7 @@ def chat():
     global ma_request_active, ma_request_name
     global ma_request_provider, ma_request_reason_collected
     global ma_request_reason_asked
+    global ma_request_returning
     global new_patient_flow_active, new_patient_requested_provider
     global new_patient_is_minor, new_patient_minor_age
     global new_patient_parent_on_line_pending
@@ -7232,7 +7495,8 @@ def chat():
     global med_pro_referral_status, med_pro_referral_date
     global med_pro_referral_provider, med_pro_referral_reason
     global med_pro_call_topic, med_pro_company, med_pro_dme_order_pending
-    global med_pro_dme_callback_pending
+    global med_pro_dme_callback_pending, med_pro_critical_lab_announced
+    global outside_provider_insurance_responded
 
     user_message = request.json.get("message")
     message_lower = user_message.lower()
@@ -7398,6 +7662,47 @@ def chat():
     ):
         Sprint14.lab_order_intent_detected = True
 
+    # Sprint 16: Capture third-party fax-inquiry intent early, before the
+    # medical-professional intercept below can route the caller into
+    # handle_med_pro_collection (which has no fax branch). Deliberately
+    # gated on no other specialized flow already owning this call (an
+    # active DME/referral/PHF/wellness conversation must keep its own
+    # flow even if a later message mentions records or a fax).
+    #
+    # Callers already being handled as a medical professional are normally
+    # excluded too, EXCEPT for the referral follow-up case: once a referral
+    # call has completed collection ("Is that the referral you are calling
+    # about?" answered), the office often follows up about a separately
+    # faxed request for additional info ("we faxed over a request for the
+    # latest EKG, the last appointment note, latest labs, and any calcium
+    # scoring test that you may have on file - did the office receive that
+    # request?"). That must engage the deterministic Sprint16 flow instead
+    # of leaking to the LLM (which improvised "I am not able to view
+    # specific fax logs..."). Only the referral topic qualifies here - the
+    # DME flow (med_pro_call_topic reset to None + dme_order_pending) and
+    # PHF/wellness flows must keep their own routing.
+    _sprint16_gate = (
+        not is_medical_professional_caller
+        or (
+            is_medical_professional_caller
+            and med_pro_collection_complete
+            and med_pro_call_topic == "referral"
+        )
+    )
+    if (
+            not Sprint16.fax_flow_active
+            and not Sprint16.fax_intent_detected
+            and not Sprint13.phf_flow_active
+            and not Sprint13.phf_intent_detected
+            and not Sprint14.wellness_flow_active
+            and not Sprint14.wellness_intent_detected
+            and not med_pro_dme_order_pending
+            and not med_pro_dme_callback_pending
+            and _sprint16_gate
+            and Sprint16.detect_fax_inquiry_intent(message_lower)
+    ):
+        Sprint16.fax_intent_detected = True
+
     # --- Profanity check ---
     profanity_words = [
         "shit", "fuck", "fucking", "cunt", "bitch",
@@ -7422,6 +7727,26 @@ def chat():
             return jsonify({"response": termination, "terminated": True})
 
         # --- Medical professional intercept ---
+    # ── Sprint 16: Third-party fax inquiry workflow ──
+    # Runs BEFORE the medical-professional intercept so a fax-inquiry
+    # caller ("...we sent a fax requesting the patient's records, did you
+    # receive it?") is handled deterministically by Sprint16 instead of
+    # being captured as a generic med-pro referral/dme caller. Every stage
+    # is answered by handle_fax_flow (it never returns None while active),
+    # so an active fax conversation always short-circuits here.
+    if Sprint16.fax_flow_active or Sprint16.fax_intent_detected:
+        Sprint16.fax_flow_active = True
+        Sprint16.fax_intent_detected = False
+        fax_response = Sprint16.handle_fax_flow(user_message, message_lower)
+        if fax_response is not None:
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": fax_response}
+            )
+            return jsonify({"response": fax_response})
+
     # Bug fix: skip this intercept when the SAME message has already
     # signaled post-hospital-follow-up intent (Sprint13.phf_intent_detected,
     # set just above at the "Sprint 13" capture block). Without this
@@ -7435,7 +7760,9 @@ def chat():
     # patient's first and last name.
     if (not is_medical_professional_caller and not Sprint13.phf_flow_active
             and not Sprint13.phf_intent_detected
-            and not Sprint14.wellness_flow_active):
+            and not Sprint14.wellness_flow_active
+            and not Sprint16.fax_flow_active
+            and not Sprint16.fax_intent_detected):
         if is_medical_professional_message(user_message, message_lower):
             is_medical_professional_caller = True
             pre_chart_complete = True
@@ -7516,7 +7843,7 @@ def chat():
                 r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
                 user_message,
             )
-    ):
+):
         med_pro_dme_callback_pending = False
         dme_callback_response = (
             "Thank you for that. Please allow up to 24 business hours "
@@ -9006,6 +9333,34 @@ def chat():
             return jsonify({"response": clarify_response})
 
     # ─────────────────────────────────────────
+    # Outside-provider insurance answer then closing
+    # ─────────────────────────────────────────
+    # After the deterministic outside-provider insurance response above
+    # ("...Is there anything else that I can help you with today?"), the
+    # patient usually ends the call. The long-winded close ("No Sir. I
+    # will get ahold of my insurance a call. Thanks anyway.") falls past
+    # the general closing-phrase list, and the AI was observed answering
+    # with a wrong scheduling postscript. Handle the closing
+    # deterministically. Only fires while the flag from the insurance
+    # answer is still set, and only on a genuine closing turn (a
+    # follow-up request falls through untouched).
+    if (
+            outside_provider_insurance_responded
+            and not is_medical_professional_caller
+            and is_call_closing_message_after_insurance(message_lower)
+    ):
+        outside_provider_insurance_responded = False
+        _insurance_close_reply = (
+            "No problem at all. If you have any trouble scheduling "
+            "with the specialist, please give us a call back. "
+            "Have a good day!"
+        )
+        conversation_history.append(
+            {"role": "assistant", "content": _insurance_close_reply}
+        )
+        return jsonify({"response": _insurance_close_reply})
+
+    # ─────────────────────────────────────────
     # General conversation-closing detection
     # ─────────────────────────────────────────
     # RT13 conversation-closing defect: after Steve's own "anything else
@@ -9337,19 +9692,25 @@ def chat():
     # --- Detect nurse/MA request ---
     nurse_ma_requested = detect_nurse_ma_request(message_lower)
     ma_name_requested, ma_provider = detect_ma_name_in_message(message_lower)
+    returning_ma_call = detect_returning_ma_call(message_lower)
     # Set persistent MA request state so follow-up messages retain context
     if ma_name_requested and not ma_request_active:
         ma_request_active = True
         ma_request_name = ma_name_requested
         ma_request_provider = ma_provider
+        ma_request_returning = returning_ma_call
         # Reset MA availability so each new request gets fresh determination
         ma_availability_determined = False
         current_ma_availability = None
     elif nurse_ma_requested and not ma_request_active:
         ma_request_active = True
+        ma_request_returning = returning_ma_call
         # Reset MA availability so each new request gets fresh determination
         ma_availability_determined = False
         current_ma_availability = None
+    elif returning_ma_call and ma_request_active and not ma_request_returning:
+        # Follow-up message reveals the caller is returning the MA's call
+        ma_request_returning = True
     # Detect if patient just gave reason for MA call
     # Only mark reason collected if:
     # 1. MA request is active
@@ -9358,7 +9719,10 @@ def chat():
     # 4. The reason-asked flag confirms we already asked the question
     # This prevents marking reason collected on the SAME message Diana is mentioned
     if ma_request_active and not ma_request_reason_collected:
-        if not nurse_ma_requested and not ma_name_requested:
+        if returning_ma_call:
+            # Caller is returning the MA's call - no reason question needed.
+            ma_request_reason_collected = True
+        elif not nurse_ma_requested and not ma_name_requested:
             if ma_request_reason_asked:
                 ma_request_reason_collected = True
             else:
@@ -9681,7 +10045,16 @@ def chat():
             f"PCP: {med_pro_patient_pcp or 'collected'}\n"
             f"Referral: {med_pro_referral_status or 'pending'}\n"
         )
-        if med_pro_referral_status == "FOUND":
+        if med_pro_critical_lab_announced:
+            medical_professional_context += (
+                "CRITICAL LAB REPORTED: the caller reported a critical "
+                "lab result for the patient and has been connected to "
+                "the patient's provider's medical assistant (who is "
+                "always available for critical labs). Do NOT fabricate "
+                "or ask about a referral. Do NOT ask for lab values again. "
+                "Acknowledge and close politely.\n"
+            )
+        elif med_pro_referral_status == "FOUND":
             medical_professional_context += "Referral has been located. Do NOT state 72 business hours for completed referrals.\n"
         else:
             medical_professional_context += "All follow-up timeframes: 72 business hours.\n"
@@ -9731,7 +10104,26 @@ def chat():
             pass
         elif effective_ma_name and effective_ma_provider:
             # Patient asked by name — they already know who it is
-            if ma_request_reason_collected:
+            if ma_request_returning and ma_request_reason_collected:
+                # Returning the MA's call — reason not needed per design
+                nurse_ma_context = (
+                    f"RETURNING_MA_CALL_ROUTING INJECTED BY SYSTEM:\n"
+                    f"Patient is RETURNING {effective_ma_name}'s call.\n"
+                    f"MA_AVAILABILITY: "
+                    f"{'AVAILABLE' if ma_avail else 'NOT AVAILABLE'}\n"
+                    f"Say EXACTLY: 'Please hold while I see if "
+                    f"{effective_ma_name} is available.'\n"
+                    f"Then complete the routing based on MA_AVAILABILITY:\n"
+                    f"If AVAILABLE: Say 'Let me go ahead and connect you with "
+                    f"{effective_ma_name} now. Please hold for one moment.'\n"
+                    f"If NOT AVAILABLE: Say 'I will put in a message for "
+                    f"{effective_ma_name} that you called back. "
+                    f"May I get a good callback number for you?'\n"
+                    f"Never go silent. Never ask why they are calling.\n"
+                    f"Never check lab results. Never run HIPAA.\n"
+                    f"Do NOT ask for patient name — already collected.\n"
+                )
+            elif ma_request_reason_collected:
                 # Reason already given - now complete the routing
                 nurse_ma_context = (
                     f"NURSE_MA_ROUTING INJECTED BY SYSTEM:\n"
@@ -9756,7 +10148,6 @@ def chat():
                     f"Do NOT re-introduce {effective_ma_name}.\n"
                     f"MA_AVAILABILITY: "
                     f"{'AVAILABLE' if ma_avail else 'NOT AVAILABLE'}\n"
-                    f"If patient says they are RETURNING {effective_ma_name}'s call:\n"
                     f"Ask ONLY: 'Do you know what it's about?'\n"
                     f"Do NOT ask what they want to discuss.\n"
                     f"Do NOT check lab results. Do NOT run HIPAA.\n"
@@ -9767,30 +10158,70 @@ def chat():
             # Patient asked generically — introduce MA name here and only here
             ma_name, provider_for_ma = get_ma_for_patient()
             if ma_name:
-                nurse_ma_context = (
-                    f"NURSE_MA_REQUEST_GENERIC INJECTED BY SYSTEM:\n"
-                    f"Patient asked to speak with the nurse or MA.\n"
-                    f"Patient's MA is {ma_name}.\n"
-                    f"Ask ONLY: 'Do you know what it's about?'\n"
-                    f"MA_AVAILABILITY: "
-                    f"{'AVAILABLE' if ma_avail else 'NOT AVAILABLE'}\n"
-                    f"Say: 'I will see if {ma_name} is available.'\n"
-                    f"Ask reason for the call.\n"
-                    f"Then route based on availability.\n"
-                    f"Do NOT ask for patient name — already collected.\n"
-                )
+                if ma_request_returning:
+                    nurse_ma_context = (
+                        f"RETURNING_MA_CALL_ROUTING INJECTED BY SYSTEM:\n"
+                        f"Patient is RETURNING a call to the office's nurse/MA.\n"
+                        f"Patient's MA is {ma_name}.\n"
+                        f"MA_AVAILABILITY: "
+                        f"{'AVAILABLE' if ma_avail else 'NOT AVAILABLE'}\n"
+                        f"Say EXACTLY: 'Please hold while I see if "
+                        f"{ma_name} is available.'\n"
+                        f"Then complete the routing based on MA_AVAILABILITY:\n"
+                        f"If AVAILABLE: Say 'Let me go ahead and connect you with "
+                        f"{ma_name} now. Please hold for one moment.'\n"
+                        f"If NOT AVAILABLE: Say 'I will put in a message for "
+                        f"{ma_name} that you called back. "
+                        f"May I get a good callback number for you?'\n"
+                        f"Never go silent. Never ask why they are calling.\n"
+                        f"Never check lab results. Never run HIPAA.\n"
+                        f"Do NOT ask for patient name — already collected.\n"
+                    )
+                else:
+                    nurse_ma_context = (
+                        f"NURSE_MA_REQUEST_GENERIC INJECTED BY SYSTEM:\n"
+                        f"Patient asked to speak with the nurse or MA.\n"
+                        f"Patient's MA is {ma_name}.\n"
+                        f"Ask ONLY: 'Do you know what it's about?'\n"
+                        f"MA_AVAILABILITY: "
+                        f"{'AVAILABLE' if ma_avail else 'NOT AVAILABLE'}\n"
+                        f"Say: 'I will see if {ma_name} is available.'\n"
+                        f"Ask reason for the call.\n"
+                        f"Then route based on availability.\n"
+                        f"Do NOT ask for patient name — already collected.\n"
+                    )
             else:
-                nurse_ma_context = (
-                    f"NURSE_MA_REQUEST_GENERIC INJECTED BY SYSTEM:\n"
-                    f"Patient asked to speak with the nurse or MA.\n"
-                    f"PCP not yet confirmed — MA name unknown.\n"
-                    f"MA_AVAILABILITY: "
-                    f"{'AVAILABLE' if ma_avail else 'NOT AVAILABLE'}\n"
-                    f"Say: 'Let me check on the medical assistant for you.'\n"
-                    f"Ask reason for the call.\n"
-                    f"Then route based on availability.\n"
-                    f"Do NOT ask for patient name — already collected.\n"
-                )
+                if ma_request_returning:
+                    nurse_ma_context = (
+                        f"RETURNING_MA_CALL_ROUTING INJECTED BY SYSTEM:\n"
+                        f"Patient is RETURNING a call to the office's nurse/MA.\n"
+                        f"PCP not yet confirmed — MA name unknown.\n"
+                        f"MA_AVAILABILITY: "
+                        f"{'AVAILABLE' if ma_avail else 'NOT AVAILABLE'}\n"
+                        f"Say EXACTLY: 'Please hold while I see if the medical "
+                        f"assistant is available.'\n"
+                        f"Then complete the routing based on MA_AVAILABILITY:\n"
+                        f"If AVAILABLE: Say 'Let me go ahead and connect you with "
+                        f"the medical assistant now. Please hold for one moment.'\n"
+                        f"If NOT AVAILABLE: Say 'I will put in a message for the "
+                        f"medical assistant that you called back. "
+                        f"May I get a good callback number for you?'\n"
+                        f"Never go silent. Never ask why they are calling.\n"
+                        f"Never check lab results. Never run HIPAA.\n"
+                        f"Do NOT ask for patient name — already collected.\n"
+                    )
+                else:
+                    nurse_ma_context = (
+                        f"NURSE_MA_REQUEST_GENERIC INJECTED BY SYSTEM:\n"
+                        f"Patient asked to speak with the nurse or MA.\n"
+                        f"PCP not yet confirmed — MA name unknown.\n"
+                        f"MA_AVAILABILITY: "
+                        f"{'AVAILABLE' if ma_avail else 'NOT AVAILABLE'}\n"
+                        f"Say: 'Let me check on the medical assistant for you.'\n"
+                        f"Ask reason for the call.\n"
+                        f"Then route based on availability.\n"
+                        f"Do NOT ask for patient name — already collected.\n"
+                    )
 
     # Lab order fax to facility — patient explicitly asked to fax to a location
     lab_order_fax_to_facility_context = ""
@@ -11675,8 +12106,28 @@ def chat():
             )
             return jsonify({"response": _med_order_reply})
 
+    # ── Outside-provider insurance acceptance (LLM-fallback guard) ──
+    # "I was referred to endocrinologist Dr. David Gilmore. Does he
+    # accept my insurance?" used to reach the model here, which
+    # improvised a phone-note + callback-number response. Steve has no
+    # way to know an outside provider's in-network status, so these
+    # questions are answered deterministically.
+    if pre_chart_complete and not is_medical_professional_caller:
+        if detect_outside_provider_insurance_question(message_lower, conversation_history):
+            outside_provider_insurance_responded = True
+            _insurance_question_reply = (
+                "We don't have that information available. I recommend "
+                "giving your insurance a call. Is there anything else that "
+                "I can help you with today?"
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": _insurance_question_reply}
+            )
+            return jsonify({"response": _insurance_question_reply})
+
     phf_context = Sprint13.build_context()
     wellness_context = Sprint14.build_context()
+    fax_context = Sprint16.build_context()
 
     system_with_context = (
             system_prompt + "\n" +
@@ -11712,7 +12163,8 @@ def chat():
             urgent_context + "\n" +
             hipaa_context + "\n" +
             phf_context + "\n" +
-            wellness_context
+            wellness_context + "\n" +
+            fax_context
     )
 
     messages = [{"role": "system", "content": system_with_context}] + \
