@@ -1,12 +1,12 @@
 import os
 import sys
 
-# Root-cause fix: when this file is launched directly (`python app.py`),
+# Root-cause fix: when this file is launched directly (`python appbeforeclaude9272026.py`),
 # Python loads it as the module `__main__`, NOT as a module named
 # `app`. Sprint13.py and Sprint14.py both do `import app` internally
 # (to read this file's live conversation_history/patient_first_name/
 # etc.) - without this registration, that `import app` doesn't find
-# this already-running module, so Python loads app.py from disk AGAIN
+# this already-running module, so Python loads appbeforeclaude9272026.py from disk AGAIN
 # as a brand-new, second, disconnected module object with its own
 # fresh globals (conversation_history=[], patient_first_name=None...)
 # that no HTTP request ever touches. That phantom copy is what
@@ -74,13 +74,21 @@ def _collect_groq_api_keys():
             candidate = candidate.strip()
             if candidate and candidate not in keys:
                 keys.append(candidate)
+    # Numbered keys are normally contiguous (_2, _3, _4...). Scan a bounded
+    # range and tolerate a gap rather than stopping at the first empty
+    # slot, so a missing GROQ_API_KEY_2 cannot silently hide a configured
+    # GROQ_API_KEY_3. Contiguous setups resolve exactly as before; the
+    # scan stops after 3 consecutive empty slots or at index 50.
     index = 2
-    while True:
+    misses = 0
+    while index <= 50 and misses < 3:
         candidate = os.environ.get(f"GROQ_API_KEY_{index}", "").strip()
         if not candidate:
-            break
-        if candidate not in keys:
-            keys.append(candidate)
+            misses += 1
+        else:
+            misses = 0
+            if candidate not in keys:
+                keys.append(candidate)
         index += 1
     return keys
 
@@ -90,15 +98,35 @@ groq_clients = [Groq(api_key=key) for key in GROQ_API_KEYS]
 client = groq_clients[0] if groq_clients else None
 
 
+class GroqServiceUnavailable(RuntimeError):
+    """Raised when no configured Groq client could serve the request.
+
+    The message is a short internal slug only. It deliberately never
+    carries the provider's error text, status code, model name, org id or
+    quota numbers, so a caller can log or surface it without leaking
+    anything: patients get GROQ_SAFE_FALLBACK instead.
+    """
+
+
+def _groq_error_status(error):
+    """Best-effort HTTP status for diagnostics. Never raises."""
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(getattr(error, "response", None), "status_code", None)
+    return getattr(status, "value", status)
+
+
 def groq_create_completion(messages, **kwargs):
     """Call the Groq API, rotating through all configured keys on any
-    error.  The *last* error is re-raised so real failures still surface
-    once every key has been tried."""
+    error. Clients are stateless, so a failing key is simply retried on
+    the next request and never poisons the ones after it. Once every key
+    has been tried a GroqServiceUnavailable is raised; the underlying
+    error is chained for server-side debugging but is not part of the
+    message, and the per-key failures are logged with their slot number
+    and exception class only - never the key value and never the
+    provider's error body (which carries org ids and quota figures)."""
     if not groq_clients:
-        raise RuntimeError(
-            "No Groq API key configured. Set GROQ_API_KEY in the "
-            "environment or in the project's .env file."
-        )
+        raise GroqServiceUnavailable("no_groq_key_configured")
     last_error = None
     for idx, groq_client in enumerate(groq_clients):
         try:
@@ -109,9 +137,23 @@ def groq_create_completion(messages, **kwargs):
             last_error = e
             print(
                 f"[groq_create_completion] key#{idx + 1}/{len(groq_clients)} "
-                f"failed: {e}"
+                f"failed ({type(e).__name__}, status={_groq_error_status(e)})"
             )
-    raise last_error
+    raise GroqServiceUnavailable(
+        f"all_{len(groq_clients)}_groq_keys_failed"
+    ) from last_error
+
+
+# Single patient-safe reply for ANY failure to reach the model (quota,
+# network, auth, or an unexpected error). It intentionally contains no
+# status code, model name, org id, token limit or exception text, and it
+# never claims a workflow step was completed, so a failed turn cannot
+# advance or fabricate a healthcare workflow.
+GROQ_SAFE_FALLBACK = (
+    "I'm sorry, I'm having trouble connecting to our system right now. "
+    "Please try again in a moment, or call the office directly and we'll "
+    "be happy to help you."
+)
 
 conversation_history = []
 profanity_count = 0
@@ -485,12 +527,38 @@ med_pro_company = None
 # consumed by the deterministic callback-number response on the next
 # turn. Reset alongside the other per-call state in home().
 med_pro_dme_callback_pending = False
+# DME/equipment supplier fax-inquiry branch: when a completed DME order
+# call continues with a fax inquiry ("...we faxed a request for the
+# patient's latest sleep study, a diagnosis code, and the appointment
+# note... Have you received that fax?"), Steve answers with a fax offer
+# (echoing the actual items and equipment the caller listed) instead of
+# the hardcoded "power wheelchair" high-priority-message response.
+# med_pro_dme_fax_pending marks the turn that waits for the caller's fax
+# number, and med_pro_dme_fax_items holds the echoed items for the
+# closing turn. Reset alongside the other per-call state in home().
+med_pro_dme_fax_pending = False
+med_pro_dme_fax_items = None
 # Critical-lab workflow: set once a critical lab result is announced for
 # the collected patient so the critical-lab routing (get ahold of the
 # patient's provider's medical assistant - ALWAYS available for critical
 # labs) fires exactly once, whether the phrase is announced before or
 # after patient identity finishes being collected. Reset in home().
 med_pro_critical_lab_announced = False
+# Medication not-in-stock / substitution request from a pharmacy caller
+# ("We do not have that in stock ... put in a script for carvedilol
+# instead"). After Steve promises a high-priority phone message, the
+# caller's NEXT message provides the pharmacy's callback number; that
+# turn is answered deterministically too (mirrors the DME callback
+# pattern - no PHI chart access or clinical claims belong here). Set
+# when the high-priority-message ask fires and consumed on the next
+# turn. Reset alongside the other per-call state in home().
+med_not_in_stock_callback_pending = False
+# Pharmacist/med-pro caller asking to speak directly with the patient's
+# PCP ("Can I speak with Dr. Mitchell?") after identity collection
+# completes. Stage machine: None | "regarding" (waiting for the reason)
+# | "await_callback" (provider was unavailable, waiting for the pharmacy's
+# callback number). Reset alongside the other per-call state in home().
+med_pro_speak_stage = None
 
 # Outside-provider insurance question answered: set when Steve
 # deterministically tells the patient he cannot know whether an outside
@@ -1349,6 +1417,41 @@ def _derive_generic_appointment_reason():
     return None
 
 
+# Placeholder values that _derive_generic_appointment_reason() produces
+# when the patient has NOT actually stated a reason. It is a persistence
+# helper, so a bare request ("I need to schedule an appointment") is
+# trimmed down to the request noun itself and returned as the "reason"
+# (Pass 2). That placeholder means "no reason captured", NOT "a reason was
+# given", so callers that need the latter must not treat it as one.
+_DEGENERATE_APPOINTMENT_REASONS = frozenset({
+    "", "a", "an", "the", "my",
+    "appointment", "an appointment", "a appointment", "the appointment",
+    "my appointment", "appointments", "a appointments", "an appointments",
+    "visit", "a visit", "an visit", "the visit", "my visit",
+    "a new appointment", "an new appointment", "the new appointment",
+    "an new one", "a new one", "the new one", "new appointment",
+    "new patient appointment", "new patient",
+    "doctor", "a doctor", "the doctor", "my doctor",
+    "provider", "a provider", "the provider", "my provider",
+    "time", "a time", "the time", "my time",
+})
+
+
+def _appointment_reason_already_stated():
+    """True only when the patient has genuinely said WHY they want the
+    visit. Unlike a raw "_derive_generic_appointment_reason() is not
+    None" test, this rejects the degenerate placeholders that helper
+    returns for a bare scheduling request, so a patient who has only said
+    "I need to schedule an appointment" is correctly treated as still
+    owing a reason."""
+    reason = _derive_generic_appointment_reason()
+    if reason is None:
+        return False
+    return reason.strip().strip(".,!?").lower() not in (
+        _DEGENERATE_APPOINTMENT_REASONS
+    )
+
+
 # Deterministic condensation of a captured appointment reason so the
 # persisted record reads as a concise phrase instead of a verbatim
 # transcription of what the caller typed (e.g. "I want to discuss
@@ -1761,7 +1864,7 @@ def get_next_business_day():
 
 def detect_dob_in_message(message):
     dob_pattern = re.compile(
-        r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b|'
+        r'\b(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})\b|'
         r'\b(january|february|march|april|may|june|july|august|'
         r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{4}\b',
         re.IGNORECASE
@@ -1941,7 +2044,7 @@ def _established_parent_last_name_from_message(message, known_first=None):
 
 def extract_dob_from_message(message):
     dob_pattern = re.compile(
-        r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b|'
+        r'\b(\d{1,2}[\/\.\-]\d{1,2}[\/\.\-]\d{2,4})\b|'
         r'\b(january|february|march|april|may|june|july|august|'
         r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{4}\b',
         re.IGNORECASE
@@ -3165,6 +3268,7 @@ def calculate_age_from_dob(dob_string):
     )
     dob_patterns = [
         "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
+        "%m.%d.%Y", "%m.%d.%y",
         "%B %d, %Y", "%B %d %Y",
     ]
     for fmt in dob_patterns:
@@ -3548,6 +3652,49 @@ def handle_billing_dispute():
     return reply
 
 
+def is_billing_transfer_request(message_lower):
+    """Detect an explicit request to be transferred/connected to the
+    billing department ("Can you transfer me to the billing department",
+    "connect me to billing", "put me through to billing"). Only plain
+    transfer/connect intent fires it. Ordinary billing questions ("what
+    is my balance", "why did I get this bill") carry no such ask and still
+    fall through to the model, strong billing disputes keep their own
+    dedicated handler, and med-pro callers are excluded upstream."""
+    if re.search(
+        r"\b(?:transfer(?:red|ring)?|connect(?:ed|ing)?)\b"
+        r".{0,60}\bbilling\b",
+        message_lower,
+    ):
+        return True
+    if re.search(
+        r"\b(?:put|send|route|get|take)\s+me\s+"
+        r"(?:through\s+to|over\s+to|to)\b"
+        r".{0,40}\bbilling\b",
+        message_lower,
+    ):
+        return True
+    return False
+
+
+def handle_billing_transfer():
+    """Deterministically complete a billing-department transfer request
+    ("Can you transfer me to the billing department", "put me through to
+    billing"). Previously such requests reached the model, which deflected
+    with the billing-portal suggestion ("I cannot collect payments or send
+    you directly to billing to discuss dispute details here. I recommend
+    logging in to the billing portal..."), leaving the caller without the
+    promised transfer. This single-turn reply confirms the transfer,
+    provides a randomly-generated billing-department phone number in case
+    the call drops, and ends the call in the standard closing style."""
+    billing_phone = f"321-{random.randint(100, 999)}-{random.randint(1000, 9999)}"
+    return (
+        "I'm transferring you to billing now. Should the call disconnect "
+        f"their number is {billing_phone}. "
+        "Thank you for calling the Sykes Creek Primary Care office. "
+        "Have a great day!"
+    )
+
+
 # Non-controlled medication ORDER requests ("I need Dr. Thompson to put
 # in an order for my monthly prolia shot"). These used to fall through
 # to the LLM fallback, which ran the CONTROLLED SUBSTANCES preprompt and
@@ -3638,6 +3785,11 @@ PRESCRIPTION_LOOKUP_CALLED_IN_PHRASES = [
     "script was called in", "script was sent",
     "called in for me", "called in at", "called into",
     "medication was called in", "medicine was called in",
+    "called in a prescription for", "called in a script for",
+    "called in a prescription", "called in a script",
+    "called in my prescription", "called in my script",
+    "called my prescription in", "called my script in",
+    "phoned in a prescription for", "phoned in a script for",
 ]
 
 _PRESCRIPTION_LOOKUP_QUESTION_PATTERN = re.compile(
@@ -3655,6 +3807,11 @@ PRESCRIPTION_LOOKUP_MEDICATIONS = [
     "Albuterol", "Azithromycin", "Amoxicillin", "Ciprofloxacin",
 ]
 
+PRESCRIPTION_LOOKUP_DOSAGES = [
+    "50 mg", "100 mg", "25 mg", "5 mg", "10 mg", "20 mg", "40 mg",
+    "500 mg",
+]
+
 
 def is_prescription_lookup_request(message_lower):
     if not any(p in message_lower for p in PRESCRIPTION_LOOKUP_CALLED_IN_PHRASES):
@@ -3664,9 +3821,10 @@ def is_prescription_lookup_request(message_lower):
 
 def handle_prescription_lookup():
     medication = random.choice(PRESCRIPTION_LOOKUP_MEDICATIONS)
+    dosage = random.choice(PRESCRIPTION_LOOKUP_DOSAGES)
     return (
-        f"I see that a prescription for {medication} was sent to the "
-        "pharmacy. Is there anything else I can help you with?"
+        f"I see that a prescription for {medication} {dosage} was sent "
+        "to the pharmacy. Is there anything else I can help you with?"
     )
 
 
@@ -4408,16 +4566,103 @@ def _classify_med_pro_call_topic(message_lower):
         return "critical_lab"
     if "referral" in message_lower:
         return "referral"
+    # Diagnostic-imaging orders (MRI, CT, x-ray, ultrasound, etc.) are
+    # NOT durable medical equipment. A radiology/imaging center calling
+    # about an imaging order ("an order for an MRI of the neck that was
+    # sent for [patient]") is a generic med-pro inquiry - without this,
+    # the bare word "order" below would fake a DME topic, and the caller
+    # would be funneled into the DME equipment flow and asked for order
+    # details instead of a simple "How can I help today?".
+    imaging_words = [
+        "mri", "ct scan", "cat scan", "x-ray", "xray", "ultrasound",
+        "echocardiogram", "mammogram", "radiology", "imaging",
+        "imaging study", "imaging studies",
+    ]
+    if any(w in message_lower for w in imaging_words):
+        return None
+    # A pharmacy calling about a prescription is NOT durable medical
+    # equipment, and the same exclusion shape applies: without this, a
+    # pharmacy "prescription order ... for a patient" call matched the
+    # generic commerce words below, got med_pro_dme_order_pending set at
+    # identity completion, and then the DME branch at the fax-inquiry
+    # follow-up answered the caller's "did you receive our fax?" with a
+    # hardcoded "Yes. We have received the fax" - a third outcome that
+    # never runs the Sprint 16 75/25 and echoes invented items ("I can fax
+    # the your office"). Excluding the pharmacy here keeps the call in the
+    # generic med-pro path so the Sprint 16 fax workflow owns that turn.
+    pharmacy_words = [
+        "pharmacy", "pharmacist", "prescription", "medication",
+        "script", "refill", "dispense", "dispensed",
+    ]
+    if any(w in message_lower for w in pharmacy_words):
+        return None
+    # Durable medical equipment requires actual equipment evidence. The
+    # bare transaction words "order"/"supply"/"for a patient" are not DME
+    # evidence - a prescription order, a supply order, or an imaging order
+    # all match them - so they are no longer sufficient on their own.
     dme_words = [
-        "order", "orders", "ordering", "equipment", "wheelchair",
-        "power wheelchair", "durable medical", "dme", "medical equipment",
-        "medical supplies", "supplies", "supply", "an order for",
-        "for a patient", "equipment for",
+        "equipment", "wheelchair", "power wheelchair", "durable medical",
+        "dme", "medical equipment", "medical supplies", "equipment for",
     ]
     for w in dme_words:
         if w in message_lower:
             return "dme"
     return None
+
+
+# Trailing subclauses that end a DME fax-inquiry follow-up ("...and the
+# appointment note addressing why the patient needs a CPAP machine. Have
+# you received that fax?") and must not leak into the items Steve echoes
+# back when he offers to fax the documentation over.
+_DME_FAX_TAIL_CUTS = (
+    " have you received", " did you receive", " did you all receive",
+    " did you get", " did the office receive", " did your office receive",
+    " receive that request", " receive the request",
+    " receive this request", " did you", " do you",
+)
+
+
+def _extract_dme_fax_items(message, message_lower):
+    """Pull the documentation items a DME/equipment supplier requested in
+    a fax-inquiry follow-up ("...we faxed a request for the patient's
+    latest sleep study, a diagnosis code, and the appointment
+    note... Have you received that fax?") so Steve's fax offer echoes the
+    ACTUAL items and equipment the caller listed - not the hardcoded
+    "power wheelchair / diagnosis code / appointment note" phrase. Cuts
+    the trailing inquiry frame, anchors on "request for", strips leading
+    patient-possessive connectives, and (only for the first item) prefaces
+    it with "the" if it lacks an article or possessive. Falls back to
+    "the requested documentation" when nothing parseable is found."""
+    low = message_lower
+    for cut in _DME_FAX_TAIL_CUTS:
+        idx = low.find(cut)
+        if idx != -1:
+            message = message[:idx]
+            low = low[:idx]
+            break
+    marker = "request for"
+    idx = low.rfind(marker)
+    if idx == -1:
+        idx = low.rfind("request")
+    if idx != -1:
+        tail = message[idx + len(marker):]
+    else:
+        tail = message
+    tail = tail.strip().strip(".,!?()\"'")
+    for lead in (
+        "the patient's", "for the patient's", "for the patient",
+        "the patient", "for him", "for her", "his", "her",
+        "some", "the", "a", "an",
+    ):
+        if tail.lower().startswith(lead):
+            tail = tail[len(lead):].lstrip()
+            break
+    if not tail:
+        return "the requested documentation"
+    first_word = tail.split()[0].lower().strip(".,!?(\"'")
+    if first_word not in ("the", "a", "an", "his", "her", "their"):
+        tail = "the " + tail
+    return tail
 
 
 def handle_med_pro_collection(message, message_lower):
@@ -4574,6 +4819,74 @@ def handle_med_pro_collection(message, message_lower):
             f"follow up with you. May I get your fax number and "
             f"best callback number?"
         )
+
+
+# Medication not-in-stock / substitution request from a pharmacy/med-pro
+# caller ("We do not have that in stock ... put in a script for
+# carvedilol instead"). These used to fall through to the LLM fallback,
+# which ran the CONTROLLED SUBSTANCES / MEDICATION REFILLS preprompt and
+# doubled down on two wrong turns of phrase: calling a non-controlled
+# beta blocker a "controlled substance", and demanding the full new-
+# refill intake (dosage, days remaining, pharmacy name) for the
+# substitute. A substitution is a provider phone message, not a patient
+# refill: it is notated at high priority and Steve takes a pharmacy
+# callback number - the same shape as the DME/equipment workflow.
+_NOT_IN_STOCK_PHRASES = [
+    "not in stock", "out of stock", "out-of-stock",
+    "don't have it in stock", "do not have it in stock",
+    "don't have that in stock", "do not have that in stock",
+    "don't have this in stock", "do not have this in stock",
+    "no longer carry", "can't fill", "cannot fill", "unable to fill",
+    "cannot get it", "backordered", "on backorder", "back order",
+]
+
+_SUBSTITUTION_CUE_PHRASES = [
+    "instead", "substitute", "substitution", "swap", "in place of",
+    "switch to", "switch it to", "change to", "replace with",
+    "alternative", "put in a script for", "put in a prescription for",
+    "write a script for", "send a script for", "call in a script for",
+]
+
+
+def detect_med_not_in_stock_substitution(message_lower):
+    """True only when BOTH a not-in-stock cue AND a substitution cue are
+    present - the pharmacy's out-of-stock / alternative-medication
+    request. Requiring both keeps this from firing on a plain
+    availability question or on a patient's bare refill request."""
+    if not any(p in message_lower for p in _NOT_IN_STOCK_PHRASES):
+        return False
+    return any(p in message_lower for p in _SUBSTITUTION_CUE_PHRASES)
+
+
+# Pharmacist asking to speak directly with the patient's PCP ("can I
+# speak with Dr. Mitchell" / "I'd like to talk to the provider"). A
+# verb (speak/talk/connect/get ahold of) must combine with a provider
+# target (provider/doctor/dr/physician) - a bare "the doctor is" or "a
+# patient of Dr. X" never matches.
+_SPEAK_VERB_PHRASES = [
+    "speak with", "speak to", "talk with", "talk to",
+    "connect me with", "connect me to", "put me through to",
+    "get ahold of", "get on the phone with",
+]
+
+_SPEAK_TARGET_WORDS = ("provider", "doctor", "dr.", "dr ", "physician")
+
+
+def detect_speak_with_provider(message_lower):
+    if not any(p in message_lower for p in _SPEAK_VERB_PHRASES):
+        return False
+    return any(t in message_lower for t in _SPEAK_TARGET_WORDS)
+
+
+def provider_is_available():
+    """Random availability check for a pharmacist asking to speak with
+    the patient's PCP: 25% available / 75% not. Env override
+    STEVE_FORCE_PROVIDER_AVAILABLE=true/false for deterministic UAT,
+    mirroring the STEVE_FORCE_REFERRAL_FOUND harness pattern."""
+    forced = os.environ.get("STEVE_FORCE_PROVIDER_AVAILABLE")
+    if forced is not None and forced.lower() in ("true", "false", "1", "0", "yes", "no"):
+        return forced.lower() in ("true", "1", "yes")
+    return random.random() < 0.25
 
 
 def _new_patient_after_consent_response():
@@ -5813,8 +6126,8 @@ def extract_names_from_message(message):
         "patient_first": None, "patient_last": None
     }
     caller_patterns = [
-        r"(?i:this\s+is)\s+([A-Za-z][a-z]+)\s+([A-Za-z][A-Za-z]+)",
-        r"(?i:my\s+name\s+is)\s+([A-Za-z][a-z]+)\s+([A-Za-z][A-Za-z]+)",
+        r"(?i:this\s+is)\s+([A-Za-z][A-Za-z]+)\s+([A-Za-z][A-Za-z]+)",
+        r"(?i:my\s+name\s+is)\s+([A-Za-z][A-Za-z]+)\s+([A-Za-z][A-Za-z]+)",
         # Avoid matching verbs like 'calling' after "I'm" or "I am".
         # Use a negative lookahead to skip common phrases such as
         # "I'm calling for" or "I'm calling about".
@@ -6632,10 +6945,14 @@ Weekend: closed, offer Monday, urgent care if cannot wait.
 APPOINTMENT SCHEDULING — FUTURE:
 If the patient has not already stated a reason for the visit (via a
 symptom, refill, follow-up, or other context already given earlier in
-this conversation), first ask: "What is the reason for the
-appointment?" The reason determines appointment length, whether it is
-a wellness/routine visit, and which workflow-specific scheduling
-rules apply, so it must be collected before presenting availability.
+this conversation), ask exactly: "What is the reason for the
+appointment?" Do NOT reword or prepend a time/date question to it
+(never ask "What time is the reason for the appointment?" or any
+similar variant) - ask only for the reason; times come later, after
+availability is presented. The reason determines appointment length,
+whether it is a wellness/routine visit, and which workflow-specific
+scheduling rules apply, so it must be collected before presenting
+availability.
 Once the reason is known, offer future availability directly and
 proceed to scheduling - do NOT route to a medical assistant callback
 or state a follow-up timeframe (e.g. "72 business hours") for a
@@ -7117,6 +7434,8 @@ def home():
     global med_pro_referral_provider, med_pro_referral_reason
     global med_pro_call_topic, med_pro_company, med_pro_dme_order_pending
     global med_pro_dme_callback_pending, med_pro_critical_lab_announced
+    global med_pro_dme_fax_pending, med_pro_dme_fax_items
+    global med_not_in_stock_callback_pending, med_pro_speak_stage
     global outside_provider_insurance_responded
     global ma_request_reason_asked
     global ma_request_returning
@@ -7379,7 +7698,11 @@ def home():
     med_pro_company = None
     med_pro_dme_order_pending = False
     med_pro_dme_callback_pending = False
+    med_pro_dme_fax_pending = False
+    med_pro_dme_fax_items = None
     med_pro_critical_lab_announced = False
+    med_not_in_stock_callback_pending = False
+    med_pro_speak_stage = None
     outside_provider_insurance_responded = False
     Sprint13.reset_state()
     Sprint14.reset_state()
@@ -7496,6 +7819,8 @@ def chat():
     global med_pro_referral_provider, med_pro_referral_reason
     global med_pro_call_topic, med_pro_company, med_pro_dme_order_pending
     global med_pro_dme_callback_pending, med_pro_critical_lab_announced
+    global med_pro_dme_fax_pending, med_pro_dme_fax_items
+    global med_not_in_stock_callback_pending, med_pro_speak_stage
     global outside_provider_insurance_responded
 
     user_message = request.json.get("message")
@@ -7669,25 +7994,60 @@ def chat():
     # active DME/referral/PHF/wellness conversation must keep its own
     # flow even if a later message mentions records or a fax).
     #
-    # Callers already being handled as a medical professional are normally
-    # excluded too, EXCEPT for the referral follow-up case: once a referral
-    # call has completed collection ("Is that the referral you are calling
-    # about?" answered), the office often follows up about a separately
-    # faxed request for additional info ("we faxed over a request for the
-    # latest EKG, the last appointment note, latest labs, and any calcium
-    # scoring test that you may have on file - did the office receive that
-    # request?"). That must engage the deterministic Sprint16 flow instead
-    # of leaking to the LLM (which improvised "I am not able to view
-    # specific fax logs..."). Only the referral topic qualifies here - the
-    # DME flow (med_pro_call_topic reset to None + dme_order_pending) and
-    # PHF/wellness flows must keep their own routing.
-    _sprint16_gate = (
-        not is_medical_professional_caller
-        or (
-            is_medical_professional_caller
-            and med_pro_collection_complete
-            and med_pro_call_topic == "referral"
-        )
+# Callers already being handled as a medical professional are normally
+    # excluded too, EXCEPT for the completed-collection follow-up cases:
+    # the referral follow-up ("...we faxed over a request for the latest
+    # EKG, the last appointment note, latest labs, and any calcium
+    # scoring test that you may have on file - did the office receive
+    # that request?") and a generic completed med-pro call that continues
+    # with an explicit fax inquiry ("Did you receive our fax that ... we
+    # will need the recent X ray ...?"). Both must engage the
+    # deterministic Sprint16 flow instead of leaking to the LLM (which
+    # improvised "I do not have access to our incoming fax logs...").
+    # The active DME (med_pro_dme_order_pending), PHF, wellness,
+    # speak-with-provider, and not-in-stock-callback flows keep their own
+    # routing (excluded below).
+    #
+    # A message that is ITSELF a fresh medical-professional introduction
+    # ("This is Melissa from Coastal Imaging...") is excluded from the
+    # Sprint16 capture unless it carries explicit fax language, so the
+    # med-pro intercept owns it. Without this, a company name containing a
+    # doc-request word ("...Imaging" or "...Labs") plus a framing word in
+    # the message ("...an order... that was sent for [patient]") would fake
+    # a fax intent and misroute a genuine imaging-facility order call into
+    # handle_fax_flow, which then can't extract the patient and wrongly
+    # re-asks for name/DOB. Callers who DO mention a fax ("...checking on a
+    # fax we faxed over with a records request") still reach Sprint16.
+    _med_pro_intro_msg = is_medical_professional_message(
+        user_message, message_lower
+    )
+    _fax_language_msg = any(
+        w in message_lower for w in ("fax", "faxed", "facsimile")
+    )
+    # RT16-11 fix: single fax-precedence rule, replacing the prior
+    # reactive three-branch gate (_sprint16_gate) plus its own
+    # phrase-dependent _fax_receipt_question check. That gate only ever
+    # granted Sprint16 ownership for an ALREADY-ESTABLISHED
+    # medical-professional caller (is_medical_professional_caller
+    # already True from a prior turn) when the message ALSO matched
+    # Sprint16.detect_fax_inquiry_intent()'s closed phrase lists
+    # (_FAX_INQUIRY_FRAMING / _DOC_REQUEST_WORDS+_DOC_REQUEST_FRAMING).
+    # Those lists were built around DME/imaging/referral fax scenarios
+    # and contain no pharmacy/prescription vocabulary, so a pharmacy
+    # caller's immediate follow-up ("...did you receive that fax?" /
+    # any wording not enumerated in the lists) could silently miss the
+    # gate and leak to the LLM, which then improvised or refused to
+    # answer. The fix: once a caller is an ALREADY-ESTABLISHED medical
+    # professional, bare fax/faxed/facsimile language is sufficient on
+    # its own to give Sprint16 ownership of this turn - no dependence
+    # on the narrower receipt-question phrase lists. The phrase-based
+    # detector is still consulted (and still governs ownership for a
+    # caller who is NOT yet an established medical professional), so
+    # every previously-passing routing (RT16-01 through RT16-10) is
+    # unaffected - this only ADDS coverage, it narrows nothing.
+    _fax_owns_turn = (
+        Sprint16.detect_fax_inquiry_intent(message_lower)
+        or (is_medical_professional_caller and _fax_language_msg)
     )
     if (
             not Sprint16.fax_flow_active
@@ -7698,10 +8058,28 @@ def chat():
             and not Sprint14.wellness_intent_detected
             and not med_pro_dme_order_pending
             and not med_pro_dme_callback_pending
-            and _sprint16_gate
-            and Sprint16.detect_fax_inquiry_intent(message_lower)
+            and not med_not_in_stock_callback_pending
+            # A caller not yet established as a medical professional whose
+            # message is itself a fresh med-pro introduction is left to the
+            # med-pro intercept below, UNLESS fax language is present (or
+            # the phrase detector already fired via _fax_owns_turn) - a
+            # first message that both introduces the caller and mentions a
+            # fax is still fax-workflow business.
+            and (is_medical_professional_caller or not _med_pro_intro_msg
+                 or _fax_language_msg)
+            # A pharmacist who first asks to speak with the doctor and then
+            # answers Steve's "what is this regarding?" with a fax question
+            # used to be swallowed by the speak-with-provider machine. Fax
+            # ownership takes precedence over that in-progress stage
+            # whenever this turn is fax business, per the single rule above.
+            and (med_pro_speak_stage is None or _fax_owns_turn)
+            and _fax_owns_turn
     ):
         Sprint16.fax_intent_detected = True
+        # Receipt is decided by Sprint16's 75/25 roll for every fax inquiry,
+        # including a medical professional whose identity collection already
+        # completed. fax_verified_receipt (retired) used to force "received"
+        # for those callers, bypassing the roll entirely - never reintroduce it.
 
     # --- Profanity check ---
     profanity_words = [
@@ -7807,6 +8185,33 @@ def chat():
             and med_pro_collection_complete
             and med_pro_dme_order_pending
     ):
+        # DME fax-inquiry branch: the equipment supplier's follow-up is
+        # ITSELF an incoming fax inquiry ("...we faxed a request for the
+        # patient's latest sleep study, a diagnosis code, and the
+        # appointment note... Have you received that fax?"). The office
+        # has the fax on file (a completed DME order call), so Steve
+        # offers to fax the ACTUAL documentation the supplier listed -
+        # echoing the real items and the real equipment (CPAP machine,
+        # never the hardcoded "power wheelchair") - and asks for a good
+        # fax number, instead of creating a high-priority PCP message the
+        # caller never asked for.
+        if Sprint16.detect_fax_inquiry_intent(message_lower):
+            med_pro_dme_order_pending = False
+            med_pro_dme_fax_pending = True
+            med_pro_dme_fax_items = _extract_dme_fax_items(
+                user_message, message_lower
+            )
+            dme_fax_offer_response = (
+                f"Yes. We have received the fax. I can fax "
+                f"{med_pro_dme_fax_items}. What is a good fax number "
+                f"for you?"
+            )
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append(
+                {"role": "assistant", "content": dme_fax_offer_response}
+            )
+            return jsonify({"response": dme_fax_offer_response})
+
         med_pro_dme_order_pending = False
         med_pro_dme_callback_pending = True
         provider_full = med_pro_patient_pcp or "the provider"
@@ -7828,7 +8233,7 @@ def chat():
         )
         return jsonify({"response": dme_detailed_response})
 
-    # DME/equipment supplier callback-number turn: the caller just
+# DME/equipment supplier callback-number turn: the caller just
     # provided the best callback number for the high-priority message
     # Steve asked for. Respond deterministically - thank them, state that
     # the message will process within 24 business hours (the window for a
@@ -7855,6 +8260,159 @@ def chat():
             {"role": "assistant", "content": dme_callback_response}
         )
         return jsonify({"response": dme_callback_response})
+
+    # DME/equipment supplier fax-inquiry closing turn: the caller just
+    # provided the fax number to send the requested documentation to.
+    # Steve confirms he has faxed the items over (echoing what he said he
+    # would fax on the offer turn) and closes the flow, mirroring the
+    # Sprint16 received-path closing so the two fax flows stay consistent.
+    if (
+            is_medical_professional_caller
+            and med_pro_collection_complete
+            and med_pro_dme_fax_pending
+            and re.search(
+                r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
+                user_message,
+            )
+):
+        med_pro_dme_fax_pending = False
+        dme_fax_items = med_pro_dme_fax_items or "the requested information"
+        if dme_fax_items.lower().startswith("for "):
+            dme_fax_items = dme_fax_items[4:]
+        dme_fax_done_response = (
+            f"I have faxed over {dme_fax_items}. Is there anything else "
+            f"that I can help with today?"
+        )
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append(
+            {"role": "assistant", "content": dme_fax_done_response}
+        )
+        return jsonify({"response": dme_fax_done_response})
+
+    # Medication not-in-stock substitution request from a pharmacy caller
+    # ("We do not have that in stock ... would you put in a script for
+    # carvedilol instead"). Answered deterministically - a substitution is
+    # a high-priority provider phone message, NOT a patient refill (the
+    # LLM previously misread this and called a non-controlled medication a
+    # controlled substance while demanding dosage / days remaining /
+    # pharmacy name). Skipped while the speak-with-provider flow owns the
+    # call (the pharmacist's reason for calling is collected there).
+    if is_medical_professional_caller and med_pro_speak_stage is None:
+        if med_not_in_stock_callback_pending:
+            if re.search(
+                r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
+                user_message,
+            ):
+                med_not_in_stock_callback_pending = False
+                med_substitution_callback_response = (
+                    "Thank you for that. Please allow up to 24 business "
+                    "hours for this high priority message to process. "
+                    "Is there anything else I can help with today?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant",
+                     "content": med_substitution_callback_response}
+                )
+                return jsonify(
+                    {"response": med_substitution_callback_response}
+                )
+        elif detect_med_not_in_stock_substitution(message_lower):
+            med_not_in_stock_callback_pending = True
+            med_substitution_response = (
+                "I'm going to put in a high priority phone message. "
+                "May I have a good callback number for the pharmacy?"
+            )
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append(
+                {"role": "assistant", "content": med_substitution_response}
+            )
+            return jsonify({"response": med_substitution_response})
+
+    # Pharmacist asking to speak directly with the patient's PCP ("Can I
+    # speak with Dr. Mitchell?"). Steve asks what it is regarding, then
+    # checks with the medical assistant whether the provider is available:
+    # 25% available (transfer the pharmacist over) / 75% not (high-priority
+    # phone message + pharmacy callback number). Only relevant in the
+    # generic completed-collection phase with no other pending flow.
+    if (
+            is_medical_professional_caller
+            and med_pro_collection_complete
+            and med_pro_call_topic is None
+            and not med_pro_dme_order_pending
+            and not med_pro_dme_callback_pending
+            and not med_not_in_stock_callback_pending
+    ):
+        provider_short = med_pro_patient_pcp or "the provider"
+        if provider_short.startswith("Dr."):
+            provider_short = "Dr. " + provider_short.split()[-1]
+        if med_pro_speak_stage == "await_callback":
+            if re.search(
+                r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
+                user_message,
+            ):
+                med_pro_speak_stage = None
+                speak_callback_response = (
+                    "Thank you for that. Please allow up to 24 business "
+                    "hours for this high priority phone message to "
+                    "process. Is there anything else I can help with "
+                    "today?"
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant",
+                     "content": speak_callback_response}
+                )
+                return jsonify({"response": speak_callback_response})
+        elif med_pro_speak_stage == "regarding":
+            if provider_is_available():
+                med_pro_speak_stage = None
+                speak_transfer_response = (
+                    f"Of course. Please hold while I check with the "
+                    f"medical assistant. (pause) {provider_short} is "
+                    f"available to speak with you now. Let me connect "
+                    f"you."
+                )
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant",
+                     "content": speak_transfer_response}
+                )
+                return jsonify({"response": speak_transfer_response})
+            med_pro_speak_stage = "await_callback"
+            speak_unavailable_response = (
+                f"I'm sorry, {provider_short} is not available to take "
+                f"your call right now. I will put in a high priority "
+                f"phone message. May I have a good callback number for "
+                f"the pharmacy?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant",
+                 "content": speak_unavailable_response}
+            )
+            return jsonify({"response": speak_unavailable_response})
+        elif detect_speak_with_provider(message_lower):
+            med_pro_speak_stage = "regarding"
+            speak_regarding_response = (
+                "Certainly. May I ask what this is regarding?"
+            )
+            conversation_history.append(
+                {"role": "user", "content": user_message}
+            )
+            conversation_history.append(
+                {"role": "assistant",
+                 "content": speak_regarding_response}
+            )
+            return jsonify({"response": speak_regarding_response})
 
     # Intercept address follow-up in lab result fax workflow
     # When lab_result_fax_active is True and patient gives an address
@@ -9711,6 +10269,37 @@ def chat():
     elif returning_ma_call and ma_request_active and not ma_request_returning:
         # Follow-up message reveals the caller is returning the MA's call
         ma_request_returning = True
+    elif (
+            returning_ma_call
+            and not ma_request_active
+            and pre_chart_complete
+            and caller_is_patient
+            and not is_medical_professional_caller
+            and not new_patient_flow_active
+            and not Sprint13.phf_flow_active
+            and not Sprint14.wellness_flow_active
+    ):
+        # Root cause fix: a caller returning the office's/MAs call did not
+        # have to ALSO ask for someone ("can I speak to the nurse", or an
+        # MA first name) to enter this flow. A bare "I'm returning a call
+        # from the nurse about lab results" tripped
+        # detect_returning_ma_call but matched neither request detector
+        # above, so ma_request_active stayed False and the deterministic
+        # RETURNING_MA_CALL_ROUTING context - which already says to check
+        # whether the MA is available and to never check lab results - was
+        # never injected. The turn instead fell through to the
+        # LAB_RESULT_INQUIRY context, which told Steve to announce that
+        # results were received and that the doctor would discuss them at
+        # the upcoming appointment, deflecting a patient who had called
+        # the MA back specifically about those results.
+        # A verified established patient returning a call is an MA
+        # callback regardless of what they mention about it, so activate
+        # the MA flow here (in "returning" mode) to route it correctly.
+        ma_request_active = True
+        ma_request_returning = True
+        # Reset MA availability so each new request gets fresh determination
+        ma_availability_determined = False
+        current_ma_availability = None
     # Detect if patient just gave reason for MA call
     # Only mark reason collected if:
     # 1. MA request is active
@@ -9727,6 +10316,60 @@ def chat():
                 ma_request_reason_collected = True
             else:
                 ma_request_reason_asked = True
+
+    # --- Returning-MA routing: answered deterministically ---
+    # Root cause of the reported regression ("I'm returning a call from the
+    # nurse about lab results" was answered with the generic
+    # connection-failure apology instead of the MA-availability answer):
+    # this turn was LLM-authored from an injected "Say EXACTLY ..." context
+    # (RETURNING_MA_CALL_ROUTING), so ANY Groq failure - the daily token cap
+    # above all - replaced the routing answer with the failure fallback.
+    # Availability is already a Python-computed fact (get_ma_availability)
+    # and the reply was fully scripted, so the same script is authored here
+    # and this turn no longer depends on the model being reachable. The
+    # availability result stays cached in current_ma_availability, so a
+    # later turn of the same call cannot contradict it.
+    # Deliberately scoped to the returning-call flow only: a caller who is
+    # RETURNING a call has already stated the reason, whereas the
+    # ask-for-the-nurse flows still collect a reason and are untouched.
+    if (
+            returning_ma_call
+            and ma_request_active
+            and ma_request_reason_collected
+            and pre_chart_complete
+            and not is_medical_professional_caller
+    ):
+        if ma_request_name:
+            _returning_ma_who = ma_request_name
+        else:
+            _returning_ma_found, _ = get_ma_for_patient()
+            _returning_ma_who = _returning_ma_found or "the medical assistant"
+        # Availability is rolled unconditionally - the real day/time is NOT
+        # consulted for this flow. A caller who is returning the office's
+        # call is treated as reaching the office during business hours so
+        # the 50/50 MA-available roll always happens and this path stays
+        # exercisable on weekends and holidays. Gating it on
+        # is_office_open_today() (as the ask-for-the-nurse context chain
+        # still does) made a weekend caller get the office-closed message
+        # instead of the MA answer.
+        if get_ma_availability():
+            _returning_ma_reply = (
+                f"Please hold while I see if {_returning_ma_who} is "
+                f"available. Let me go ahead and connect you with "
+                f"{_returning_ma_who} now. Please hold for one moment."
+            )
+        else:
+            _returning_ma_reply = (
+                f"Please hold while I see if {_returning_ma_who} is "
+                f"available. I will put in a message for "
+                f"{_returning_ma_who} that you called back. May I get a "
+                f"good callback number for you?"
+            )
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append(
+            {"role": "assistant", "content": _returning_ma_reply}
+        )
+        return jsonify({"response": _returning_ma_reply})
 
     # --- New patient workflow: block LLM from improvising scheduling ---
     if new_patient_flow_active:
@@ -11303,7 +11946,11 @@ def chat():
         )
 
     lab_result_inquiry_context = ""
-    if lab_result_inquiry_detected and not is_medical_professional_caller:
+    if (
+            lab_result_inquiry_detected
+            and not is_medical_professional_caller
+            and not returning_ma_call
+    ):
         results_in_chart = generate_lab_result_status()
         if results_in_chart:
             has_appointment, appt_date = generate_appointment_within_week()
@@ -11367,6 +12014,11 @@ def chat():
         # One-shot: consume the flag now that the inquiry has actually been
         # answered, so it doesn't re-fire and re-randomize the chart lookup
         # result on every subsequent turn of the same call.
+        lab_result_inquiry_active = False
+    elif lab_result_inquiry_detected and returning_ma_call:
+        # Suppressed above because this turn is an MA callback. Consume the
+        # one-shot flag anyway so a later lab-questions turn in the same call
+        # is judged on its own wording rather than this turn's trigger.
         lab_result_inquiry_active = False
     # Detect medication questions
     medication_inquiry_detected = any(phrase in message_lower for phrase in [
@@ -12020,6 +12672,45 @@ def chat():
 
     conversation_history.append({"role": "user", "content": user_message})
 
+    # ── Generic appointment reason question (LLM-fallback guard) ────
+    # Root cause: asking for the appointment reason before times was only
+    # a soft instruction in the system prompt, so the model could ignore
+    # it and jump straight to a time/availability question ("What time is
+    # the reason for the appointment?", "which time would work best?").
+    # That ordering is not a style preference - it is load-bearing:
+    # _derive_generic_appointment_reason() can only capture the patient's
+    # answer when it directly follows a reason question, so skipping the
+    # question loses the reason for the stored record. Answering with the
+    # exact question here makes the ordering deterministic instead of
+    # sampling-dependent.
+    #
+    # This sits in the LM-fallback guard section, so every specialized
+    # flow (PHF/new-patient/wellness, same-day, controlled substance,
+    # follow-up, nurse visit, lab, fax, medication) has already returned
+    # above and cannot be preempted. Gated on:
+    #   - an established patient, chart complete, not a medical professional
+    #   - a plain "schedule/book an appointment" request
+    #   - Steve has not already asked for the reason this turn
+    #   - no reason has been stated anywhere in the conversation yet
+    if (
+            pre_chart_complete
+            and not is_medical_professional_caller
+            and caller_is_patient
+            and "appointment" in message_lower
+            and ("schedule" in message_lower or "book" in message_lower)
+            and not appointment_reason_just_requested
+            and not next_available_options_pending
+            and not virtual_visit_accepted_now
+            and not is_same_day
+            and not _is_appointment_transaction_turn(user_message)
+            and not _appointment_reason_already_stated()
+    ):
+        _reason_question_response = "What is the reason for the appointment?"
+        conversation_history.append(
+            {"role": "assistant", "content": _reason_question_response}
+        )
+        return jsonify({"response": _reason_question_response})
+
     # ── Generic couple joint-cancellation (LLM-fallback guard) ──────
     # "Please cancel appointments for my wife and myself" used to reach
     # the model here, which improvised "I would recommend having your
@@ -12060,6 +12751,12 @@ def chat():
                 {"role": "assistant", "content": _billing_dispute_reply}
             )
             return jsonify({"response": _billing_dispute_reply})
+        if is_billing_transfer_request(message_lower):
+            _billing_transfer_reply = handle_billing_transfer()
+            conversation_history.append(
+                {"role": "assistant", "content": _billing_transfer_reply}
+            )
+            return jsonify({"response": _billing_transfer_reply})
 
     # ── Prescription sent-to-pharmacy lookup (LLM-fallback guard) ──
     # "I see that a prescription was called in for me at hobbs pharmacy.
@@ -12129,42 +12826,48 @@ def chat():
     wellness_context = Sprint14.build_context()
     fax_context = Sprint16.build_context()
 
-    system_with_context = (
-            system_prompt + "\n" +
-            pre_chart_context + "\n" +
-            response_time_context + "\n" +
-            office_hours_context + "\n" +
-            todays_date_context + "\n" +
-            medical_professional_context + "\n" +
-            pcp_context + "\n" +
-            established_guardian_context + "\n" +
-            individual_six_month_followup_context + "\n" +
-            individual_three_month_followup_context + "\n" +
-            nurse_ma_context + "\n" +
-            nurse_visit_context + "\n" +
-            lab_order_fax_to_facility_context + "\n" +
-            lab_order_pickup_context + "\n" +
-            booking_reason_provided_context + "\n" +
-            authorized_scheduling_request_context + "\n" +
-            patient_presence_context + "\n" +
-            lab_work_context + "\n" +
-            lab_result_inquiry_context + "\n" +
-            lab_result_fax_outside_context + "\n" +
-            referral_lookup_context + "\n" +
-            medication_inquiry_context + "\n" +
-            contagious_virtual_refusal_context + "\n" +
-            uti_antibiotic_demand_context + "\n" +
-            same_day_context + "\n" +
-            covering_provider_context + "\n" +
-            same_day_virtual_clinic_context + "\n" +
-            acute_visit_management_context + "\n" +
-            availability_context + "\n" +
-            controlled_substance_context + "\n" +
-            urgent_context + "\n" +
-            hipaa_context + "\n" +
-            phf_context + "\n" +
-            wellness_context + "\n" +
-            fax_context
+    # Only non-empty context blocks are appended. An inactive block
+    # contributed a bare "\n" separator and no text, so filtering it out
+    # removes whitespace only: the injected content and its order are
+    # identical. A typical turn leaves ~28 of these blocks inactive.
+    system_with_context = "\n".join(
+        part for part in (
+            system_prompt,
+            pre_chart_context,
+            response_time_context,
+            office_hours_context,
+            todays_date_context,
+            medical_professional_context,
+            pcp_context,
+            established_guardian_context,
+            individual_six_month_followup_context,
+            individual_three_month_followup_context,
+            nurse_ma_context,
+            nurse_visit_context,
+            lab_order_fax_to_facility_context,
+            lab_order_pickup_context,
+            booking_reason_provided_context,
+            authorized_scheduling_request_context,
+            patient_presence_context,
+            lab_work_context,
+            lab_result_inquiry_context,
+            lab_result_fax_outside_context,
+            referral_lookup_context,
+            medication_inquiry_context,
+            contagious_virtual_refusal_context,
+            uti_antibiotic_demand_context,
+            same_day_context,
+            covering_provider_context,
+            same_day_virtual_clinic_context,
+            acute_visit_management_context,
+            availability_context,
+            controlled_substance_context,
+            urgent_context,
+            hipaa_context,
+            phf_context,
+            wellness_context,
+            fax_context,
+        ) if part
     )
 
     messages = [{"role": "system", "content": system_with_context}] + \
@@ -12299,8 +13002,22 @@ def chat():
                     controlled_substance_appt_schedule = None
         return jsonify({"response": assistant_message})
     except Exception as e:
-        print(f"Groq API error: {e}")
-        return jsonify({"response": f"Error: {str(e)}"})
+        # Never return str(e) here: it carries the provider's status
+        # code, model name, org id, quota numbers and raw JSON, which is
+        # what leaked "Error code: 429 ..." into the patient chat. Log the
+        # exception class for debugging and answer with the safe fallback.
+        print(
+            f"[chat] request failed ({type(e).__name__}); "
+            "returning safe fallback"
+        )
+        # Keep history consistent (user turn is already appended) so the
+        # next turn's conversation_history[-1] is still the new user
+        # message, exactly as on the success path.
+        if conversation_history and conversation_history[-1]["role"] == "user":
+            conversation_history.append(
+                {"role": "assistant", "content": GROQ_SAFE_FALLBACK}
+            )
+        return jsonify({"response": GROQ_SAFE_FALLBACK})
 
 
 if __name__ == "__main__":
