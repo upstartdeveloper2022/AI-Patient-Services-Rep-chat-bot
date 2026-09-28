@@ -13,12 +13,12 @@ documentation, or similar materials.
 ARCHITECTURE (per the Sprint 13/Sprint 14 convention already in this
 codebase):
   - This file is SELF-CONTAINED and ISOLATED from Sprint13.py's PHF and
-    Sprint14.py's wellness workflows. app.py owns routing and session
+    Sprint14.py's wellness workflows. appbeforeclaude9272026.py owns routing and session
     control: it decides WHEN to call into this module (intent detection +
-    dispatch, mirroring the exact pattern app.py already uses for
+    dispatch, mirroring the exact pattern appbeforeclaude9272026.py already uses for
     Sprint13/Sprint14) and calls reset_state() at the start of each new
     call.
-  - This module owns the workflow LOGIC and STATE. Where app.py already
+  - This module owns the workflow LOGIC and STATE. Where appbeforeclaude9272026.py already
     tracks identity that is safe to reuse (patient/caller name already
     collected), this module reads it directly from `app`'s globals the
     same way Sprint14.py does - no new dependency pattern.
@@ -77,6 +77,15 @@ fax_request_details = None
 # completes; used by every subsequent stage.
 fax_received = None
 
+# RETIRED. This used to be set for a fax-inquiry message from a
+# medical-professional caller whose identity collection already completed,
+# and it forced receipt to True instead of rolling the 75/25 - so the roll
+# never actually ran for exactly the pharmacy/professional callers this
+# workflow exists for. Nothing reads it any more; _determine_fax_received
+# always rolls. Kept only so stale references fail loudly rather than
+# silently reintroducing the bypass.
+fax_verified_receipt = False
+
 fax_callback_number = None
 fax_deadline = None
 fax_priority = None  # "high" | "normal"
@@ -124,6 +133,19 @@ _FAX_INQUIRY_FRAMING = [
     "did your practice receive", "did you folks receive",
     "receive that request", "receive the request",
     "receive this request", "did you get that request",
+    # Receipt-confirmation phrasings. A pharmacy asking the office to
+    # confirm a fax it already sent ("...Can you confirm you received that
+    # fax?", "...Just checking on that fax.", "...Has it arrived?") states
+    # the SAME immediate question as "did you receive it" and must be owned
+    # by this workflow, not fall through to the LLM (which was answering
+    # "I cannot verify whether that fax was received"). Deliberately
+    # receipt-only: no "can you fax ..." sending phrasing, so patient-facing
+    # lab phrasing ("can you fax my lab results to Quest") still misses.
+    "can you confirm you received", "confirm you received",
+    "confirm receipt", "confirm that you received",
+    "checking on that fax", "checking on this fax",
+    "did it come through", "come through",
+    "has it arrived", "did it arrive", "have you seen it",
 ]
 
 _DOC_REQUEST_WORDS = [
@@ -150,6 +172,155 @@ _DOC_REQUEST_FRAMING = [
     "looking for",
 ]
 
+# ── Direction: receipt question vs. outbound send request ──
+# The two framing lists above are deliberately broad, so they match BOTH
+# kinds of fax inquiry:
+#
+#   * outbound  "we need the recent x ray faxed over"  -> Steve must offer
+#     to fax something, which requires patient identity + the item first.
+#   * inbound   "we faxed you yesterday, did you receive it?" -> Steve is
+#     only being asked whether something already arrived. Identity and the
+#     requested item are NOT needed to answer that, and asking for them
+#     first is what let this turn escape the workflow (see
+#     handle_fax_flow / is_fax_receipt_question below).
+#
+# So the inbound direction is detected explicitly here, from the
+# receipt-question forms only. This is a direction rule over a closed set of
+# question shapes - not a per-phrasing patch - so a pharmacy/prescription/
+# clarification sentence still resolves through the normal 75/25 roll.
+_RECEIPT_QUESTION_FRAMING = (
+    "did you receive", "did you guys receive", "did you folks receive",
+    "have you received", "did you get", "did you get that request",
+    "did the office receive", "did your office receive",
+    "did the doctor's office receive", "did the team receive",
+    "did your practice receive",
+    "can you confirm you received", "confirm you received",
+    "confirm receipt", "confirm that you received",
+    "did it come through", "come through",
+    "has it arrived", "did it arrive", "have you seen it",
+    "received the fax", "receive the fax", "received our fax",
+    "receive our fax", "receive that request", "receive the request",
+    "receive this request",
+    "the fax we sent", "fax we sent", "fax we faxed", "sent a fax",
+    "sent you a fax", "sent over a fax", "sent us a fax",
+    "we sent over a fax", "sent the fax", "our fax",
+    "regarding the fax", "about the fax", "in reference to the fax",
+    "status of a fax", "status of the fax",
+    "checking on a fax", "checking on the fax", "check on a fax",
+    "check on the fax", "following up on a fax", "follow up on a fax",
+    "follow up on the fax", "followed up on the fax",
+    "checking on that fax", "checking on this fax",
+    "resend", "resending",
+)
+
+# The list above enumerates question PHRASES, so it can only ever answer the
+# question shapes someone already wrote down. Any other spelling of the same
+# question ("Any update on that fax I sent over earlier today?", "Did that
+# fax get through to you?", "Any word on the fax?", "Was the fax received?",
+# "Any chance the fax went through?") fell out of the receipt branch in
+# handle_fax_flow and into the opening intake stages instead - which found
+# the patient's identity already on file and answered a representative who
+# had ALREADY faxed the request, and who had already said what the fax was
+# about, with "Thank you. And what information or documentation are you
+# requesting for this patient?" The 75/25 received/not-received roll never
+# ran for that turn, so the one question Steve was asked went unanswered.
+#
+# So the direction is decided from the turn's EVIDENCE, not from a list of
+# sentences: a turn is inbound (a receipt question) when it ASKS about
+# something and REFERENCES a fax the caller sent, and is not a request for
+# the office to send something. This is a rule over the shape of the turn, so
+# it covers the whole class of receipt questions instead of each wording.
+#
+# 1. _ASK_PATTERN              - the turn asks instead of requesting.
+# 2. _INBOUND_FAX_REFERENCE    - it is about a fax / something the caller
+#                                already sent ("our fax", "the fax i sent",
+#                                "we faxed ...").
+# 3. _OFFICE_SEND_REQUEST      - the outbound direction, where the office is
+#                                being asked to send something and still
+#                                needs the patient identity and the item.
+# A turn that hands over a number is neither: it is data the workflow
+# collects (fax number / callback number), not a question.
+_ASK_PATTERN = re.compile(
+    # an explicit question mark
+    r"\?"
+    # a wh-question
+    r"|\b(?:who|whom|whose|what|when|where|which|why|how)\b"
+    # a yes/no question: interrogative auxiliary followed by a deictic
+    # subject. The subject requirement is what keeps an ordinary statement
+    # from reading as a question - "This is James from Viera Imaging, we
+    # faxed over a records request" contains a copula but is not asking
+    # anything, and treating it as a question answered the opening turn with
+    # the 75/25 roll instead of collecting the patient it never named.
+    r"|\b(?:did|does|do|has|have|had|can|could|will|would|should|shall|"
+    r"may|might|is|are|was|were)\s+"
+    r"(?:you|your|yours|it|its|that|this|these|those|them|they|we|the|"
+    r"our|my|his|her|their|there|any|anyone|anybody|everybody)\b"
+    # a status check with no auxiliary: "any update on the fax?"
+    r"|\bany\s+(?:update|word|news|status|chance|head\s*up|idea)\b",
+    re.IGNORECASE,
+)
+
+_INBOUND_FAX_REFERENCE = re.compile(
+    r"\bfax(?:es|ed)?\b|\bfacsimile\b"
+    # the caller reporting their own completed send
+    r"|\b(?:we|i|our\s+office|they)\s+(?:have\s+|had\s+|also\s+|just\s+|"
+    r"already\s+)*"
+    r"(?:sent|faxed|forwarded|transmitted|submitted|dropped\s+off|"
+    r"put\s+in|made)\b"
+    # a definite reference to what was sent
+    r"|\b(?:sent|faxed|forwarded|transmitted)\s+"
+    r"(?:over|it|that|this|these|those|them|a\s+request|an?\s+"
+    r"(?:fax|request|order)|our|the)\b"
+    r"|\b(?:our|my|his|her|their|the|that)\s+"
+    r"(?:fax|request|message|note|form|order|paperwork)\b"
+    # a status check whose object is the pronoun for what was sent:
+    # "any chance it went through?", "any update on it?"
+    r"|\bany\s+(?:update|word|news|status|chance|head\s*up)\b[^?!.]*"
+    r"\b(?:it|that|those|them|through|arrived|received|there)\b",
+    re.IGNORECASE,
+)
+
+_OFFICE_SEND_REQUEST = re.compile(
+    # "can you fax ...", "please send ...", "we need the X faxed over"
+    r"\b(?:please\s+)?(?:can|could|would|will|would\s+you|you\s+"
+    r"(?:can|could|should|may)|need\s+to|needs?\s+to|need|want|want\s+to|"
+    r"like|would\s+like|help|try|possible|able|ok|okay)\b[^?!.]*?"
+    r"\b(?:fax|faxes|faxed|send|sending|forward|forwarding|email|mail|"
+    r"overnight|courier|upload|copy|copies|transmit|get\s+(?:it|them|these|"
+    r"this|that)\s+over|have\s+\w+\s+faxed|have\s+\w+\s+sent)\b"
+    # "fax it over to us", "send me the records"
+    r"|\b(?:fax|send|forward|email|mail|overnight|courier|upload|transmit)\b"
+    r"[^?!.]*?\bto\s+(?:us|me|my|our|my\s+office)\b"
+    # "we need ...", "we are requesting ...", "I would like ..."
+    r"|\b(?:we|i)\s+(?:need|needs|want|wants|request|requests|"
+    r"are\s+requesting|am\s+requesting|was\s+requesting|"
+    r"are\s+looking\s+for|am\s+looking\s+for|"
+    r"would\s+like|would\s+like\s+to|will\s+be\s+requesting)\b",
+    re.IGNORECASE,
+)
+
+# A knowledge-seeking lead-in is not a request for the office to send
+# anything, even though it carries the same "want"/"like" wording a send
+# request does: "Just want to know - did that fax ever arrive?", "I would
+# like to know if you received it", "I'm curious whether it came through."
+_KNOWLEDGE_ASKING = re.compile(
+    r"\b(?:want|wanted|wants|like|liked|curious|curiosity|hoping|hoped|"
+    r"wonder|wondering|curious\s+to)\b[^?!.]*"
+    r"\b(?:know|whether|if)\b",
+    re.IGNORECASE,
+)
+
+# A turn that supplies a number for the workflow to record, rather than
+# asking it anything: "The fax number is 321-555-8080", "My callback number
+# is ...". These must never be treated as a receipt question.
+_NUMBER_SUPPLY_PATTERN = re.compile(
+    r"\b(?:my\s+|our\s+|the\s+)?(?:fax|callback|call\s+back|phone|"
+    r"contact|mobile)\s+number\s+(?:is|would\s+be)\b"
+    r"|\bnumber\s+is\s+[\d(]"
+    r"|\bis\s+[\d(]\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
+    re.IGNORECASE,
+)
+
 _PATIENT_NAME_PATTERN = re.compile(
     r"(?:the patient(?:'s)? name is|the patient is|patient(?:'s)? name is|"
     r"patient is)\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)",
@@ -166,7 +337,7 @@ _PATIENT_FOR_NAME_PATTERN = re.compile(
 )
 
 # Tokens that are structurally "the name is Bob Barker" scaffolding or
-# common stop words - never a real first/last name (mirrors app.py's own
+# common stop words - never a real first/last name (mirrors appbeforeclaude9272026.py's own
 # _MED_PRO_NON_NAME_WORDS idea).
 _NON_NAME_WORDS = {
     "name", "is", "are", "of", "and", "for", "from", "about",
@@ -225,6 +396,7 @@ def reset_state():
     global fax_request_details, fax_received
     global fax_callback_number, fax_deadline, fax_priority
     global fax_fax_number_provided, fax_office_number
+    global fax_verified_receipt
 
     fax_intent_detected = False
     fax_flow_active = False
@@ -239,10 +411,11 @@ def reset_state():
     fax_priority = None
     fax_fax_number_provided = False
     fax_office_number = None
+    fax_verified_receipt = False
 
 
 # ─────────────────────────────────────────────
-# Intent detection (called by app.py for routing)
+# Intent detection (called by appbeforeclaude9272026.py for routing)
 # ─────────────────────────────────────────────
 
 def detect_fax_inquiry_intent(message_lower):
@@ -257,6 +430,43 @@ def detect_fax_inquiry_intent(message_lower):
     return False
 
 
+def is_fax_receipt_question(message_lower):
+    """True when this turn asks whether a fax Steve was already sent has
+    arrived ("we faxed X, did you receive it?"). Directional sibling of
+    detect_fax_inquiry_intent: true for every inbound fax inquiry, false for
+    the outbound "fax this to me" asks that still need identity + items.
+
+    Decided from the turn's evidence, not from an enumerated set of
+    sentences, because the stages below it are chosen by this answer alone:
+    False routes a representative who just asked whether their fax arrived
+    into documentation intake, where Steve asks them to describe a request
+    they had already faxed, and the 75/25 roll never runs. The enumerated
+    shapes in _RECEIPT_QUESTION_FRAMING are kept as a fast path; the
+    structural rule below covers the same question in any other wording.
+
+    Used by handle_fax_flow to resolve the question with the existing 75/25
+    roll on the turn it is asked, instead of first prompting for a patient
+    name and DOB the answer does not depend on."""
+    if any(f in message_lower for f in _RECEIPT_QUESTION_FRAMING):
+        return True
+    # The workflow's own number-collection turns (fax number, callback
+    # number) are data being handed over, not a question about receipt.
+    if _NUMBER_SUPPLY_PATTERN.search(message_lower) or _PHONE_PATTERN.search(
+        message_lower
+    ):
+        return False
+    # Outbound: the office is being asked to send something, so identity
+    # and the requested item are still needed first.
+    if not _KNOWLEDGE_ASKING.search(
+        message_lower
+    ) and _OFFICE_SEND_REQUEST.search(message_lower):
+        return False
+    return bool(
+        _ASK_PATTERN.search(message_lower)
+        and _INBOUND_FAX_REFERENCE.search(message_lower)
+    )
+
+
 # ─────────────────────────────────────────────
 # UAT / harness override
 # ─────────────────────────────────────────────
@@ -264,8 +474,15 @@ def detect_fax_inquiry_intent(message_lower):
 def _determine_fax_received():
     """Random 75/25 for whether the fax was received, with an environment-
     variable override (STEVE_FORCE_FAX_RECEIVED=true/false) so UAT can
-    test both branches deterministically. Mirrors app.py's
-    STEVE_FORCE_REFERRAL_FOUND harness pattern."""
+    test both branches deterministically. Mirrors appbeforeclaude9272026.py's
+    STEVE_FORCE_REFERRAL_FOUND harness pattern.
+
+    There is deliberately NO "already verified" bypass here. A completed
+    medical-professional call used to force receipt to True, which meant
+    this 75/25 never actually ran for exactly the pharmacy/professional
+    callers this workflow exists for. The requirement is that this roll
+    decides the outcome for every fax inquiry; only the harness override
+    may pre-empt it."""
     forced = os.environ.get("STEVE_FORCE_FAX_RECEIVED")
     if forced is not None and forced.lower() in ("true", "false", "1", "0", "yes", "no"):
         return forced.lower() in ("true", "1", "yes")
@@ -286,7 +503,7 @@ def extract_dob_from_message(message):
 
 
 def _extract_patient_name(message):
-    """Returns (first, last) or (None, None). Mirrors app.py's med-pro
+    """Returns (first, last) or (None, None). Mirrors appbeforeclaude9272026.py's med-pro
     name extraction: named patterns first, then a "for patient X Y" intro
     (guarded by a DOB also being present), then a bare "Firstname
     Lastname" reply."""
@@ -317,7 +534,7 @@ def _extract_phone(message):
 
 
 def _pull_identity_from_app():
-    """Best-effort reuse of identity app.py already collected (pre-chart
+    """Best-effort reuse of identity appbeforeclaude9272026.py already collected (pre-chart
     patient, or an earlier handle_med_pro_collection run)."""
     first = last = dob = None
     try:
@@ -360,10 +577,31 @@ _DESCRIPTION_TAIL_CUTS = (
     " did you receive", " have you received", " did you get",
     " receive that request", " receive the request",
     " receive this request", " date of birth", " for patient", " dob",
+    # Same receipt-confirmation tails as the framing list above. Without
+    # these, Steve's confirmation parroted the question back as one of the
+    # "requested items" ("...fax these over to you: clarification on the
+    # prescription directions. Can you confirm you received that fax.").
+    # Kept specific-before-generic so the existing " did you receive" cut
+    # still wins over the bare " did you" fallback below.
+    " can you confirm", " confirm you received",
+    " confirm that you received", " confirm receipt",
+    " just checking on that fax", " checking on that fax",
+    " checking on this fax", " did it come through",
+    " has it arrived", " did it arrive", " have you seen it",
     " did you", " do you", " when", " if you", " please", " thank you",
     " ok thanks", " okay thanks", " thanks",
     " you may have on file", " may have on file", " have on file",
     " for him", " for her", " on file",
+    # Documentation-request trailers that state WHY the docs are needed
+    # ("...discussing the neck pain as per required by the patient's
+    # insurance?") - not part of what Steve will fax over, so they must not
+    # leak into the stored request details that get echoed back.
+    " as per required by the patient's insurance",
+    " as required by the patient's insurance",
+    " per required by the patient's insurance",
+    " as required by their insurance", " per their insurance",
+    " per the patient's insurance", " as per the insurance",
+    " as required by insurance",
 )
 
 
@@ -521,14 +759,25 @@ def _determine_item_on_chart():
 
 def _compose_received_confirmation(message, message_lower):
     """RECEIVED-path confirmation. Confirms the fax was received and that
-    Steve will fax the requested items over, asking for a good fax
-    number to send them to. For any "any [test] you have on file" item,
-    Steve rolls 50/50 whether that item is on the electronic chart and
-    states the result for each."""
-    parts = [
-        "Yes we did receive it. I can go ahead and fax these over "
-        "to you."
-    ]
+    Steve will fax the requested items over - naming the actual items the
+    caller listed (the cleaned request details, e.g. "the recent X ray of
+    the neck and the appointment note discussing the neck pain") so the
+    acknowledgment works for every fax inquiry, not just the prototype
+    phrasing - then asks for a good fax number to send them to. For any
+    "any [test] you have on file" item, Steve rolls 50/50 whether that
+    item is on the electronic chart and states the result for each."""
+    parts = []
+    stated = (fax_request_details or "").strip()
+    if stated:
+        parts.append(
+            "Yes we did receive it. I can go ahead and fax these over "
+            f"to you: {stated}."
+        )
+    else:
+        parts.append(
+            "Yes we did receive it. I can go ahead and fax these over "
+            "to you."
+        )
     for item in _extract_on_file_items(message, message_lower):
         if _determine_item_on_chart():
             parts.append(
@@ -540,7 +789,7 @@ def _compose_received_confirmation(message, message_lower):
                 f"One note on the {item} you asked about: that is not "
                 f"currently showing on the electronic chart."
             )
-    parts.append("May I have a good fax number for you?")
+    parts.append("What is a good fax number to send these to?")
     return " ".join(parts)
 
 
@@ -549,12 +798,12 @@ def _is_goodbye(message_lower):
 
 
 # ─────────────────────────────────────────────
-# Workflow handler (called by app.py while fax_flow_active)
+# Workflow handler (called by appbeforeclaude9272026.py while fax_flow_active)
 # ─────────────────────────────────────────────
 
 def handle_fax_flow(message, message_lower):
     """Deterministic state machine. Returns the Steve response string, or
-    None to let app.py fall through (never happens while the flow is
+    None to let appbeforeclaude9272026.py fall through (never happens while the flow is
     active - every stage is answered here so the caller never leaks into
     the LLM mid-flow)."""
     global fax_stage
@@ -566,6 +815,37 @@ def handle_fax_flow(message, message_lower):
     patient_full = None
     if fax_patient_first and fax_patient_last:
         patient_full = f"{fax_patient_first} {fax_patient_last}"
+
+    # A turn that asks whether an already-sent fax arrived is answered by the
+    # 75/25 roll NOW. It used to fall into the identity stages below, which
+    # replied "Can I get the patient's first and last name and date of birth
+    # for this request?" to a question that needs no identity - so the
+    # question was never answered by this workflow and was free to leak to
+    # the LLM, which invented fax details ("a general office fax number") and
+    # claimed it could not confirm receipt. Identity present in the message is
+    # still captured (opportunistically, for later stages), it is just no
+    # longer a precondition for answering the receipt question.
+    if (
+        fax_received is None
+        and fax_stage in (None, "collect_patient", "collect_dob", "collect_request")
+        and is_fax_receipt_question(message_lower)
+    ):
+        if not fax_patient_first or not fax_patient_last:
+            pulled_first, pulled_last, pulled_dob = _pull_identity_from_app()
+            if pulled_first and pulled_last:
+                fax_patient_first, fax_patient_last = pulled_first, pulled_last
+            if pulled_dob and not fax_patient_dob:
+                fax_patient_dob = pulled_dob
+        if not fax_patient_first or not fax_patient_last:
+            name_first, name_last = _extract_patient_name(message)
+            if name_first and name_last:
+                fax_patient_first, fax_patient_last = name_first, name_last
+        if not fax_patient_dob and detect_dob_in_message(message):
+            fax_patient_dob = extract_dob_from_message(message)
+        _try_capture_request_details(
+            message, message_lower, require_identity=False
+        )
+        return _advance_from_request(message, message_lower)
 
     if fax_stage is None or fax_stage == "collect_patient":
         if not fax_patient_first or not fax_patient_last:
@@ -690,6 +970,21 @@ def handle_fax_flow(message, message_lower):
     if fax_stage == "closed":
         if _is_goodbye(message_lower):
             return "Thank you for calling. Have a great day!"
+        # A representative who asks for the office fax number must get it at
+        # ANY point in the call, including after the flow has already closed.
+        # On the NOT-RECEIVED path this is the whole point - Steve told them
+        # to resend, so the number to resend to may be asked for on a later
+        # turn. Previously the closed stage ignored the request and just
+        # asked "Is there anything else...", leaving the caller with no way
+        # to resend. Deliberately says nothing about a message: this
+        # workflow never creates a provider message (see the module
+        # docstring), so a fax Steve just said never arrived can never be
+        # described as something the provider was notified to review.
+        if _asks_for_fax_number(message_lower):
+            return (
+                f"Our office fax number is {_office_fax_number()}. "
+                "Is there anything else I can help you with today?"
+            )
         if fax_received:
             return (
                 "Is there anything else I can help you with today? "
