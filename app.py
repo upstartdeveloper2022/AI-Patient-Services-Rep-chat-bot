@@ -1,12 +1,12 @@
 import os
 import sys
 
-# Root-cause fix: when this file is launched directly (`python appbeforeclaude9272026.py`),
+# Root-cause fix: when this file is launched directly (`python app.py`),
 # Python loads it as the module `__main__`, NOT as a module named
 # `app`. Sprint13.py and Sprint14.py both do `import app` internally
 # (to read this file's live conversation_history/patient_first_name/
 # etc.) - without this registration, that `import app` doesn't find
-# this already-running module, so Python loads appbeforeclaude9272026.py from disk AGAIN
+# this already-running module, so Python loads app.py from disk AGAIN
 # as a brand-new, second, disconnected module object with its own
 # fresh globals (conversation_history=[], patient_first_name=None...)
 # that no HTTP request ever touches. That phantom copy is what
@@ -2996,6 +2996,35 @@ def detect_new_patient_household_relation(message_lower):
 _DAY_NAME_PATTERN = re.compile(
     r"\b(monday|tuesday|wednesday|thursday|friday)\b", re.IGNORECASE
 )
+# Bug fix (RT13): _DAY_NAME_PATTERN above matches only literal weekday
+# NAMES, so a caller answering the offer with a RELATIVE day
+# ("...for 9AM and my wife for 930AM for Tomorrow") produced no day
+# match at all. The couple six-month follow-up machine then had no day to
+# select and replied "Please choose one of the offered days and starting
+# times." - Steve could not name the day the caller had just asked for.
+# Resolve a relative reference to the weekday it actually refers to so it
+# can be matched against the offered pairs. Deliberately a fallback only:
+# an explicit weekday name in the message still wins (handled by the
+# caller), so "this Thursday" is unchanged. Returns (weekday_name, the
+# caller's own words) so an unmatchable reference can still be echoed
+# back with its real weekday named - the offered days are 4 random
+# weekdays, so "tomorrow" is frequently NOT one of them, and the honest
+# answer then names the day rather than repeating the request to choose.
+def _resolve_relative_day_name(message_lower):
+    """Map 'today' / 'tonight' / 'tomorrow' / 'the day after tomorrow' to
+    (weekday name, the phrase the caller used). Returns None when the
+    message contains no relative day reference."""
+    if "day after tomorrow" in message_lower:
+        offset, label = 2, "the day after tomorrow"
+    elif "tomorrow" in message_lower:
+        offset, label = 1, "tomorrow"
+    elif "today" in message_lower or "tonight" in message_lower:
+        offset, label = 0, "today"
+    else:
+        return None
+    day_name = (datetime.now() + timedelta(days=offset)).strftime("%A")
+    return day_name, label
+
 # Bug fix: the previous single pattern (\d{1,2}(?::\d{2})?\s*(?:am|pm))
 # only matched a time WITH a colon (e.g. "2:30 PM") or a bare hour
 # (e.g. "3 PM") - a compact time with no colon, like "230PM" (a common
@@ -4008,12 +4037,23 @@ def handle_couple_six_month_followup_flow(message):
             couple_followup_spouse_first_name = spouse_first
             couple_followup_spouse_last_name = spouse_last
             couple_followup_spouse_stage = "dob"
-            possessive = _household_pronoun_possessive(
-                couple_followup_spouse_relation
-            )
-            return f"Thank you. Could I get {possessive} date of birth?"
-        relation = couple_followup_spouse_relation or "spouse"
-        return f"What is your {relation}'s first and last name?"
+            # Bug fix: a caller who volunteers the spouse's name AND date
+            # of birth in one breath ("Her name is Linda McMahon and her
+            # date of birth is 1/6/1955") was answered with "Thank you.
+            # Could I get her date of birth?" - the stage advanced to "dob"
+            # but the turn returned unconditionally, so the DOB sitting in
+            # the same message was never read, the spouse was never stored,
+            # and every later reply re-asked for it forever. Only re-ask
+            # when no DOB was given; otherwise fall through to the "dob"
+            # branch below, which already stores the record and confirms.
+            if not detect_dob_in_message(message):
+                possessive = _household_pronoun_possessive(
+                    couple_followup_spouse_relation
+                )
+                return f"Thank you. Could I get {possessive} date of birth?"
+        else:
+            relation = couple_followup_spouse_relation or "spouse"
+            return f"What is your {relation}'s first and last name?"
 
     if couple_followup_spouse_stage == "dob":
         possessive = _household_pronoun_possessive(
@@ -4038,9 +4078,15 @@ def handle_couple_six_month_followup_flow(message):
     message_lower = message.lower()
     day_match = _DAY_NAME_PATTERN.search(message)
     message_times = _find_all_times_in_text(message)
+    relative_day = _resolve_relative_day_name(message_lower)
     chosen_pair = None
-    if day_match and message_times:
+    if day_match:
         selected_day = day_match.group(1).capitalize()
+    elif relative_day:
+        selected_day = relative_day[0]
+    else:
+        selected_day = None
+    if selected_day and message_times:
         for day, first_time, second_time in couple_followup_available_pairs:
             if day == selected_day and any(
                 norm in (first_time, second_time)
@@ -4049,6 +4095,26 @@ def handle_couple_six_month_followup_flow(message):
                 chosen_pair = (day, first_time, second_time)
                 break
     if chosen_pair is None:
+        # The caller asked for a day by reference and that day is one the
+        # office did not offer (or is a weekend closure). Name the actual
+        # weekday back and re-offer what IS open, rather than repeating a
+        # contentless "choose one of the offered days" - Steve demonstrably
+        # knows what day the caller meant. Never books an unoffered slot,
+        # and only replaces the re-ask when the DAY is the reason nothing
+        # matched (a missing time still gets the original message).
+        if relative_day and not day_match and not any(
+            day == relative_day[0]
+            for day, _first, _second in couple_followup_available_pairs
+        ):
+            offered_days = ", ".join(
+                day for day, _first, _second in couple_followup_available_pairs
+            )
+            return (
+                f"I am sorry, I do not have anything available "
+                f"{relative_day[1]}, which is {relative_day[0]}. I can "
+                f"schedule you on {offered_days}. Which day works best "
+                f"for you?"
+            )
         return "Please choose one of the offered days and starting times."
 
     day, first_time, second_time = chosen_pair
@@ -6120,6 +6186,28 @@ def handle_new_patient_flow(message, message_lower):
     return None
 
 
+# Tokens that can NEVER be the captured patient's name, but that the
+# relationship-anchored patient_patterns below happily match because
+# "my <relation> ..." is immediately followed by the caller's own
+# self-reference in a joint request ("...schedule a 6 month follow up
+# for my spouse and myself", "...my wife and me", "...my husband and
+# I"). Those captures ("and" / "myself", "and" / "me") were written to
+# patient_first_name/patient_last_name, which then (a) suppressed the
+# caller-is-patient sync below ("if caller_first_name and not
+# patient_first_name") so those globals stayed bogus for the whole call,
+# and (b) made every "is the caller the patient" comparison fail. Symptom
+# in the couple six-month follow-up flow: the caller booked himself, a
+# phantom "and myself" leg was announced as scheduled, and the real
+# spouse's identity was never collected. Rejecting these captures lets
+# the patient_patterns continue to the next pattern/position, so a
+# genuine name later in the same message ("...my son Tom Smith") is
+# still found. None of these is a real first name, so no legitimate
+# capture is lost.
+_PATIENT_NAME_NON_NAME_TOKENS = frozenset({
+    "and", "i", "im", "me", "myself", "mine", "we", "us", "our", "ours",
+})
+
+
 def extract_names_from_message(message):
     result = {
         "caller_first": None, "caller_last": None,
@@ -6218,6 +6306,8 @@ def extract_names_from_message(message):
     for pattern in patient_patterns:
         match = re.search(pattern, message, re.IGNORECASE)
         if match:
+            if match.group(1).lower() in _PATIENT_NAME_NON_NAME_TOKENS:
+                continue
             result["patient_first"] = match.group(1)
             if match.lastindex >= 2 and match.group(2):
                 result["patient_last"] = match.group(2)
@@ -8025,7 +8115,7 @@ def chat():
         w in message_lower for w in ("fax", "faxed", "facsimile")
     )
     # RT16-11 fix: single fax-precedence rule, replacing the prior
-    # reactive three-branch gate (_sprint16_gate) plus its own
+    # reactive three-branch gate (_Sprint16_gate) plus its own
     # phrase-dependent _fax_receipt_question check. That gate only ever
     # granted Sprint16 ownership for an ALREADY-ESTABLISHED
     # medical-professional caller (is_medical_professional_caller
@@ -8046,8 +8136,8 @@ def chat():
     # every previously-passing routing (RT16-01 through RT16-10) is
     # unaffected - this only ADDS coverage, it narrows nothing.
     _fax_owns_turn = (
-        Sprint16.detect_fax_inquiry_intent(message_lower)
-        or (is_medical_professional_caller and _fax_language_msg)
+            Sprint16.detect_fax_inquiry_intent(message_lower)
+            or (is_medical_professional_caller and _fax_language_msg)
     )
     if (
             not Sprint16.fax_flow_active
@@ -8058,6 +8148,16 @@ def chat():
             and not Sprint14.wellness_intent_detected
             and not med_pro_dme_order_pending
             and not med_pro_dme_callback_pending
+            # An in-progress DME fax exchange owns its own closing turn.
+            # The DME fax branch clears med_pro_dme_order_pending as soon
+            # as it answers, which left med_pro_dme_fax_pending - the flag
+            # whose branch below waits for the caller's fax number - with
+            # no protection: Sprint16 then captured that closing turn (any
+            # turn mentioning "fax" qualifies) and replied "And what
+            # information or documentation are you requesting?" instead of
+            # the fax confirmation. Excluding it here matches the other
+            # in-progress med-pro flags already listed.
+            and not med_pro_dme_fax_pending
             and not med_not_in_stock_callback_pending
             # A caller not yet established as a medical professional whose
             # message is itself a fresh med-pro introduction is left to the
@@ -8201,11 +8301,32 @@ def chat():
             med_pro_dme_fax_items = _extract_dme_fax_items(
                 user_message, message_lower
             )
-            dme_fax_offer_response = (
-                f"Yes. We have received the fax. I can fax "
-                f"{med_pro_dme_fax_items}. What is a good fax number "
-                f"for you?"
-            )
+            # RT16-12 root cause: this branch answered BOTH fax directions
+            # with the same outbound-send response. A supplier asking only
+            # whether the fax they already sent arrived ("...we faxed a
+            # request for the patient's latest sleep study, a diagnosis
+            # code, and the appointment note... Have you received that
+            # fax?") is asking about receipt/status, not asking us to send
+            # anything, so "I can fax {items}. What is a good fax number
+            # for you?" was word salad bolted onto a correct "yes we
+            # received it". A receipt question now gets the confirmation
+            # alone - naming the items the caller listed, so they can tell
+            # WHICH fax arrived - and closes; only a genuine send request
+            # earns the offer. Sprint16.is_fax_receipt_question is the same
+            # direction rule that lets a receipt question skip identity
+            # collection, so both fax flows agree on a turn's direction.
+            if Sprint16.is_fax_receipt_question(message_lower):
+                dme_fax_offer_response = (
+                    f"Yes. We have received the fax for "
+                    f"{med_pro_dme_fax_items}. Is there anything else I "
+                    f"can help you with today?"
+                )
+            else:
+                dme_fax_offer_response = (
+                    f"Yes. We have received the fax. I can fax "
+                    f"{med_pro_dme_fax_items}. What is a good fax number "
+                    f"for you?"
+                )
             conversation_history.append({"role": "user", "content": user_message})
             conversation_history.append(
                 {"role": "assistant", "content": dme_fax_offer_response}
@@ -8550,6 +8671,20 @@ def chat():
                 # intent was silently discarded in favor of a generic
                 # "how can I help you today?" handoff. Mirrors the
                 # existing PHF/wellness/refill/lab-order guards just above.
+                # HOUSEHOLD_CANCEL_TRIGGERS above is a literal list ("cancel
+                # those/both/the/our appointments") and does NOT cover the
+                # natural phrasing "I need to cancel appointments for my
+                # spouse and myself", so a joint couple cancellation stated
+                # in the same message as identification was discarded here
+                # and the caller got the contentless "Thank you for that.
+                # How can I help you today?" even though they had already
+                # said exactly what they wanted. Reuse the SAME detector
+                # handle_generic_couple_cancel() uses so this cannot drift
+                # from the machine it protects; that detector already
+                # excludes six-month, new-patient, wellness/hospital and
+                # 1823 phrasing, so those specialized machines keep their
+                # existing priority.
+                and not is_generic_couple_cancel_request(message_lower)
                 and not any(
             trigger in message_lower for trigger in (
                     RESCHEDULE_ACUTE_VISIT_TRIGGERS
