@@ -28,6 +28,7 @@ from groq import Groq
 import Sprint13
 import Sprint14
 import Sprint16
+import Sprint17
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -4478,21 +4479,79 @@ CONVERSATION_CLOSING_PHRASES = [
     "thats all you've been very helpful",
     "that's all you have been very helpful",
     "thats all you have been very helpful",
+    # Compliment sign-offs. "No you've been a big help" (and the rest of
+    # this family) matched nothing here, so the turn went to the AI, which
+    # read the leading "no" as the start of another request and answered
+    # "When Jeff calls we will be happy to assist further. Is there
+    # anything else I can help you with today?" - inventing a future call
+    # and re-opening a conversation the patient was ending. Kept separate
+    # from the plain "no" / "no thank you" entries so each one is listed
+    # in both the contracted and expanded spellings.
+    "no you've been a big help", "you've been a big help",
+    "you have been a big help",
+    "no you've been a great help", "you've been a great help",
+    "you have been a great help",
+    "no you've been such a help", "you've been such a help",
+    "no i appreciate you", "i appreciate you",
+    "no i appreciate it", "i appreciate it",
+    "no thank you so much", "thank you so much",
+    "no thanks so much", "thanks so much",
+    "no thanks a lot", "thanks a lot",
 ]
+
+# A closing that compliments Steve's help is answered with an
+# acknowledgement of THAT and a farewell, rather than with the plain
+# thank-you close - "You're welcome, {name}." - which reads as a
+# non-sequitur to "no you've been a big help".
+CONVERSATION_CLOSING_COMPLIMENT_MARKERS = [
+    "big help", "great help", "such a help", "helpful", "assistance",
+    "appreciate", "great job", "wonderful", "awesome",
+]
+
+# Closing phrases are compared in a canonical form so one sign-off is
+# recognized however the caller contracts it: apostrophes are dropped and
+# the contractions used in a close-out are expanded, so "you've been a
+# big help", "youve been a big help" and the transcript's misplaced-
+# apostrophe "youv'e been a big help" all reduce to the same text. The
+# phrase list is canonicalized once at import, so every existing entry
+# keeps matching exactly as before.
+_CLOSING_CONTRACTIONS = (
+    (r"\byouve\b", "you have"),
+    (r"\byoure\b", "you are"),
+    (r"\bthats\b", "that is"),
+    (r"\bits\b", "it is"),
+    (r"\bim\b", "i am"),
+)
+
+
+def _canonical_closing_phrase(text):
+    canonical = re.sub(r"[.,!?]", "", text)
+    canonical = canonical.replace("'", "").replace("\u2019", "")
+    canonical = re.sub(r"\s+", " ", canonical).strip()
+    for pattern, replacement in _CLOSING_CONTRACTIONS:
+        canonical = re.sub(pattern, replacement, canonical)
+    return canonical
+
+
+_CONVERSATION_CLOSING_PHRASES_CANONICAL = frozenset(
+    _canonical_closing_phrase(phrase) for phrase in CONVERSATION_CLOSING_PHRASES
+)
 
 
 def is_conversation_closing_reply(message_lower):
     """Returns True only if the ENTIRE message, after stripping
     trailing punctuation (periods, commas, exclamation points, question
-    marks) and collapsing whitespace, exactly matches a known closing
-    phrase - not a substring match. This is what makes "No. Thank you."
-    equivalent to "No thank you" (the period+space between them is the
-    only difference) without needing every punctuated variant spelled
-    out separately, while still refusing to match a longer reply that
-    merely starts with "no" but continues into a new request."""
-    normalized = re.sub(r"[.,!?]", "", message_lower).strip()
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized in CONVERSATION_CLOSING_PHRASES
+    marks) and apostrophes and expanding contractions, exactly matches a
+    known closing phrase - not a substring match. This is what makes
+    "No. Thank you." equivalent to "No thank you" (the period+space
+    between them is the only difference) without needing every punctuated
+    variant spelled out separately, while still refusing to match a
+    longer reply that merely starts with "no" but continues into a new
+    request."""
+    return (
+        _canonical_closing_phrase(message_lower)
+        in _CONVERSATION_CLOSING_PHRASES_CANONICAL
+    )
 
 
 def active_speaker_first_name():
@@ -7797,6 +7856,7 @@ def home():
     Sprint13.reset_state()
     Sprint14.reset_state()
     Sprint16.reset_state()
+    Sprint17.reset_state()
     conversation_history.clear()
     return render_template("index.html")
 
@@ -8139,6 +8199,22 @@ def chat():
             Sprint16.detect_fax_inquiry_intent(message_lower)
             or (is_medical_professional_caller and _fax_language_msg)
     )
+    # A verified patient asking to have their OWN imaging order sent to an
+    # outside facility ("...the order for the CT scan of my heart to be sent
+    # to Beachside Imaging") is Sprint17's imaging_fax workflow. It matches
+    # Sprint16's doc-request lists only because the facility name contains
+    # "imaging" and the sentence uses "sent", and handle_fax_flow then
+    # re-asks for the date of birth the patient already gave. Sprint17's
+    # patient-type dispatch runs BELOW this block, so ownership has to be
+    # declined here. Restricted to a completed pre-chart patient so every
+    # medical-professional fax inquiry keeps its existing owner.
+    _s17_imaging_fax_turn = (
+        pre_chart_complete
+        and caller_is_patient
+        and Sprint17.detect_imaging_fax(message_lower)
+    )
+    if _s17_imaging_fax_turn:
+        _fax_owns_turn = False
     if (
             not Sprint16.fax_flow_active
             and not Sprint16.fax_intent_detected
@@ -8180,6 +8256,29 @@ def chat():
         # including a medical professional whose identity collection already
         # completed. fax_verified_receipt (retired) used to force "received"
         # for those callers, bypassing the roll entirely - never reintroduce it.
+
+    # Sprint 17: capture patient-type miscellaneous request intent
+    # (practice manager, Total Care, samples, imaging request/clarity/fax)
+    # the moment it is stated, so it survives pre-chart collection.
+    # Mirrors the Sprint14 early-capture pattern; skipped when another
+    # specialized flow, a medical-professional caller, or same-day/acute
+    # urgency already owns the call.
+    if not Sprint17.requests_flow_active and not Sprint17.requests_pending_workflow:
+        _s17_intent = Sprint17.detect_any_request_intent(message_lower)
+        if (
+                _s17_intent in Sprint17.PATIENT_WORKFLOWS
+                and not is_medical_professional_caller
+                and not is_medical_professional_message(user_message, message_lower)
+                and not acute_same_day_established
+                and not new_patient_flow_active
+                and not Sprint13.phf_flow_active and not Sprint13.phf_intent_detected
+                and not Sprint14.wellness_flow_active
+                and not Sprint14.wellness_intent_detected
+                and not Sprint14.refill_intent_detected
+                and not Sprint14.lab_order_intent_detected
+                and not Sprint16.fax_flow_active and not Sprint16.fax_intent_detected
+        ):
+            Sprint17.requests_pending_workflow = _s17_intent
 
     # --- Profanity check ---
     profanity_words = [
@@ -8224,6 +8323,49 @@ def chat():
                 {"role": "assistant", "content": fax_response}
             )
             return jsonify({"response": fax_response})
+
+    # ── Sprint 17: miscellaneous request workflows (requests.py) ──
+    # Continues an ACTIVE flow, and starts the EXTERNAL-caller flows
+    # (prior auth rep, home health) here - ahead of the medical-professional
+    # intercept and pre-chart, since those callers are not patients and
+    # "home health"/"calling from" would otherwise route them into
+    # handle_med_pro_collection(). Patient-type flows are started after
+    # pre-chart further below.
+    _s17_other_flow_owns_turn = bool(
+        Sprint13.phf_flow_active or Sprint13.phf_intent_detected
+        or Sprint14.wellness_flow_active or Sprint14.wellness_intent_detected
+        or Sprint16.fax_flow_active or Sprint16.fax_intent_detected
+        or med_pro_dme_order_pending or med_pro_dme_callback_pending
+        or med_pro_dme_fax_pending or med_not_in_stock_callback_pending
+        or med_pro_speak_stage is not None
+    )
+    if not Sprint17.requests_flow_active and not _s17_other_flow_owns_turn:
+        _s17_ext = Sprint17.detect_any_request_intent(message_lower)
+        if (
+                _s17_ext in Sprint17.EXTERNAL_WORKFLOWS
+                and not (pre_chart_complete and caller_is_patient)
+        ):
+            Sprint17.requests_active_workflow = _s17_ext
+            Sprint17.requests_flow_active = True
+    if Sprint17.requests_flow_active:
+        _s17_response = Sprint17.handle_requests_flow(user_message, message_lower)
+        if _s17_response is not None:
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": _s17_response})
+            if check_response_time_stated(_s17_response):
+                response_time_stated = True
+            return jsonify({"response": _s17_response})
+        # Flow handed off to the standard FUTURE appointment scheduling
+        # (imaging request, provider not aware, patient accepted an
+        # appointment). Restate the request so the normal scheduling
+        # pipeline sees the reason and injects availability.
+        _s17_reason = Sprint17.pop_appointment_handoff_reason()
+        if _s17_reason:
+            user_message = (
+                f"I would like to schedule an appointment for an imaging "
+                f"order for {_s17_reason}"
+            )
+            message_lower = user_message.lower()
 
     # Bug fix: skip this intercept when the SAME message has already
     # signaled post-hospital-follow-up intent (Sprint13.phf_intent_detected,
@@ -8662,6 +8804,7 @@ def chat():
                 and not Sprint14.wellness_intent_detected
                 and not Sprint14.refill_intent_detected
                 and not Sprint14.lab_order_intent_detected
+                and not Sprint17.requests_pending_workflow
                 and not couple_followup_flow_active
                 # Bug fix: this shortcut fires the moment pre-chart
                 # collection completes, without checking whether the
@@ -9022,6 +9165,37 @@ def chat():
                 {"role": "assistant", "content": wellness_response}
             )
             return jsonify({"response": wellness_response})
+
+    # ── Sprint 17: patient-type request workflows (after pre-chart) ──
+    if (
+            pre_chart_complete
+            and Sprint17.requests_pending_workflow
+            and not Sprint17.requests_flow_active
+            and not is_medical_professional_caller
+            and not new_patient_flow_active
+            and not Sprint13.phf_flow_active
+            and not Sprint14.wellness_flow_active
+            and not Sprint16.fax_flow_active
+            and not is_truly_urgent(message_lower)
+            and not (
+                third_party_detected and not caller_is_patient
+                and current_hipaa_status != "ON_HIPAA"
+            )
+    ):
+        Sprint17.requests_active_workflow = Sprint17.requests_pending_workflow
+        Sprint17.requests_flow_active = True
+        _s17_response = Sprint17.handle_requests_flow(user_message, message_lower)
+        if _s17_response is not None:
+            Sprint17.requests_pending_workflow = None
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": _s17_response})
+            return jsonify({"response": _s17_response})
+    if pre_chart_complete and Sprint17.requests_pending_workflow and not Sprint17.requests_flow_active:
+        # Intent was not activated on the first post-pre-chart turn
+        # (another flow or a guard owns the call) - drop it so it cannot
+        # fire at an unrelated moment later in the call.
+        Sprint17.requests_pending_workflow = None
+    Sprint17.requests_pending_workflow = None if Sprint17.requests_flow_active else Sprint17.requests_pending_workflow
 
     # ─────────────────────────────────────────
     # Generic (non-PHF) appointment inquiry
@@ -10100,7 +10274,24 @@ def chat():
         if last_assistant_offered_closing and is_conversation_closing_reply(message_lower):
             closing_name = active_speaker_first_name()
             patient_expressed_thanks = "thank" in message_lower
-            if patient_expressed_thanks:
+            patient_expressed_compliment = any(
+                marker in message_lower
+                for marker in CONVERSATION_CLOSING_COMPLIMENT_MARKERS
+            )
+            if patient_expressed_compliment:
+                # A compliment sign-off ("no you've been a big help") is
+                # acknowledged and the call is CLOSED. It used to reach the
+                # AI, which answered "That sounds great. When Jeff calls we
+                # will be happy to assist further. Is there anything else I
+                # can help you with today?" - inventing a future call for a
+                # patient who is already on the line, and re-opening a
+                # conversation that was being ended.
+                closing_response = (
+                    "I'm glad to have been of assistance. Thank you for "
+                    "calling the Sykes Creek Primary Care Office. You have "
+                    "a great day!"
+                )
+            elif patient_expressed_thanks:
                 closing_response = (
                     f"You're welcome, {closing_name}. Thank you for "
                     f"calling Sykes Creek Primary Care. Have a great day!"
