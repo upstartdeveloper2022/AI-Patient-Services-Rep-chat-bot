@@ -1,0 +1,1628 @@
+"""
+requests.py — Miscellaneous Patient Services Request Workflows
+
+Covers 12 UAT-checklist request types that don't belong in the PHF
+(Sprint13) or Wellness/MAW/CHA (Sprint14) workflows:
+
+  1.  Practice Manager complaint/compliment (Tiffany Crosby)
+  2.  Transfer to Total Care for a car/automobile accident
+  3.  Prior authorization request from an insurance company rep
+  4.  Life insurance rep following up on a disability claim
+  5.  In-house home health: cannot accept patient (referred elsewhere)
+  6.  Home health: will the PCP follow the patient for home health?
+  7.  Home health nurse requesting written treatment instructions
+  8.  Medication samples inquiry
+  9.  Imaging order / imaging request
+  10. Lab order request
+  11. Clarity on an existing imaging order (what body part it concerns)
+  12. Faxing an imaging order to an outside facility
+  13. Critical lab result reported by a lab representative
+
+ARCHITECTURE (mirrors Sprint13.py / Sprint14.py exactly):
+  - Self-contained. Does not import Sprint13 or Sprint14 and never reads
+    or writes their state.
+  - app.py owns routing/dispatch and must call reset_state() on each new
+    call (see home()/reset pattern in app.py).
+  - Reads app.py's already-collected patient identity the same way
+    Sprint13/Sprint14 already do (import app locally inside the handler
+    that needs it, read-only).
+  - Every branch either returns a response string (which app.py should
+    return to the caller directly, bypassing the LLM, exactly like the
+    Sprint13/Sprint14 dispatch blocks already do) or returns None to
+    signal "not handled this turn" / "hand off to app.py's own flow"
+    (used only by the imaging/lab "offer appointment" branches, which
+    intentionally hand off to app.py's existing FUTURE appointment
+    scheduling rather than duplicating availability generation a third
+    time in a third file).
+
+SPRINT 17 INTEGRATION STATUS (integrated into app.py via Sprint17 alias)
+  Enabled (10): practice_manager, total_care, samples, imaging_request,
+    imaging_clarity, imaging_fax (patient-type; activated after
+    pre-chart) and prior_auth, hh_decline, hh_follow, hh_instructions
+    (external callers; activated before the medical-professional
+    intercept and before pre-chart).
+  Deliberately NOT enabled (see ENABLED_WORKFLOWS): critical_lab (already
+    handled in app.py/Sprint16 med-pro flow), lab_order_request (already
+    handled by app.py lab-work / Sprint14 lab-order flows), life_insurance
+    (staged; set aside to stay within the 10-workflow Sprint 17 limit).
+  Detection helpers use word-boundary matching so short triggers such as
+  "mri" or "ave" cannot match inside unrelated words.
+"""
+
+import os
+import random
+import re
+from datetime import datetime
+
+# ─────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────
+
+PRACTICE_MANAGER_NAME = "Tiffany Crosby"
+PRACTICE_MANAGER_FIRST_NAME = "Tiffany"
+TOTAL_CARE_NAME = "Total Care"
+
+PHONE_PATTERN = re.compile(r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b')
+
+# ── 1. Practice Manager ──
+PRACTICE_MANAGER_TRIGGERS = [
+    "practice manager", "speak to tiffany", "talk to tiffany",
+    "speak with tiffany", "talk with tiffany", "tiffany crosby",
+    "ms. crosby", "ms crosby", "mrs. crosby", "mrs crosby",
+    "speak to the manager", "talk to the manager",
+    "speak with the manager", "talk with the manager",
+    "speak to management", "file a complaint", "file a compliment",
+    "make a complaint", "lodge a complaint", "give a compliment",
+    "complaint about the office", "complaint about my visit",
+    "compliment about my visit", "compliment for",
+]
+
+# ── 2. Total Care / automobile accident ──
+CAR_ACCIDENT_TRIGGERS = [
+    "car wreck", "car accident", "automobile wreck",
+    "automobile accident", "car collision", "automobile collision",
+    "car crash", "automobile crash", "auto accident", "auto wreck",
+    "auto collision", "auto crash", "motor vehicle accident",
+    "motor vehicle collision", "mva",
+]
+
+# ── 3. Prior authorization (insurance rep) ──
+PRIOR_AUTH_TRIGGERS = [
+    "prior authorization", "prior auth", "requires a prior authorization",
+    "need a prior auth", "prior authorization is required",
+    "pa is required for", "authorization is required for this medication",
+    "authorization required to cover", "need authorization to cover",
+]
+
+# ── 4. Life insurance disability claim follow-up ──
+LIFE_INSURANCE_DISABILITY_TRIGGERS = [
+    "life insurance", "disability claim", "following up on a disability",
+    "calling about a disability claim", "disability claim follow up",
+    "disability claim follow-up", "checking on a disability claim",
+    "status of a disability claim", "disability claim status",
+]
+
+# ── 5/6/7. Home health (all require the base context word) ──
+HOME_HEALTH_CONTEXT_WORDS = ["home health"]
+
+HOME_HEALTH_DECLINE_TRIGGERS = [
+    "can't accept the patient", "cannot accept the patient",
+    "unable to accept the patient", "referred to another home health",
+    "referred out to another home health",
+    "referred to a different home health",
+    "patient was referred to another agency",
+    "not able to accept this patient", "won't be able to accept",
+    "will not be able to accept",
+    "can't accept this patient", "cannot accept this patient",
+    "unable to accept this patient", "can't accept your patient",
+    "cannot accept your patient", "unable to accept your patient",
+]
+
+HOME_HEALTH_FOLLOW_TRIGGERS = [
+    "will the provider follow", "will the doctor follow",
+    "follow the patient for home health", "follow for home health",
+    "continue to follow this patient", "will follow the patient",
+    "provider willing to follow", "pcp follow the patient",
+    "physician follow the patient",
+]
+
+HOME_HEALTH_INSTRUCTIONS_TRIGGERS = [
+    "written instructions", "need instructions to treat",
+    "instructions to treat the patient", "treatment instructions",
+    "need orders to treat", "instructions on how to treat",
+    "orders to treat the patient", "care instructions for the patient",
+]
+
+# ── 8. Medication samples inquiry ──
+MEDICATION_SAMPLES_TRIGGERS = [
+    "medication samples", "medicine samples", "drug samples",
+    "sample medication", "sample of my medication",
+    "samples of this medication", "have any samples",
+    "any samples available", "provide samples",
+]
+
+# Priority escalation of the samples message Steve ALREADY created ("can
+# you make that message high priority?"). Only ever consulted on the
+# completed samples stage - it never opens a message-intake turn, so it
+# cannot restart the workflow or ask for the callback number again. Needs
+# BOTH an urgency word and a reference to the existing message, so
+# ordinary closing remarks ("no that's all, thank you") are not treated
+# as an escalation.
+_PRIORITY_ESCALATION_TRIGGERS = [
+    "high priority", "higher priority", "top priority", "priority",
+    "urgent", "urgency", "expedite", "expedited", "rush", "asap",
+    "as soon as possible",
+]
+_PRIORITY_ESCALATION_TARGETS = [
+    "message", "note", "memo", "request", "ticket", "it", "this", "that",
+]
+
+# ── 9. Imaging order / imaging request ──
+# NOTE: none of these currently collide with any app.py trigger list -
+# x-ray/imaging vocabulary is unclaimed elsewhere in the codebase.
+IMAGING_ORDER_TRIGGERS = [
+    "xray", "x-ray", "x ray", "mri", "ct scan", "cat scan", "pet scan",
+    "calcium score", "ultrasound", "imaging order", "imaging request",
+    "order for an mri", "order for a ct", "order for an x-ray",
+    "order for an ultrasound",
+]
+
+# ── 10. Lab order request ──
+# *** SEE "LAB TRIGGER OVERLAP" NOTE AT TOP OF FILE ***
+LAB_ORDER_NAME_TRIGGERS = [
+    "complete blood count", "cbc",
+    "white blood cell differential", "wbc differential",
+    "reticulocyte count", "peripheral blood smear",
+    "basic metabolic panel", "bmp", "renal function panel",
+    "hepatic function panel", "liver function panel",
+    "lipid panel", "apolipoprotein b", "apob",
+    "high-sensitivity c-reactive protein", "hs-crp", "hscrp",
+    "troponin", "bnp", "hemoglobin a1c", "hba1c",
+    "thyroid panel", "vitamin d", "vitamin b12",
+    "iron panel", "blood culture", "urine culture",
+    "antinuclear antibody", "ana panel", "sti panel", "std panel",
+    "urinalysis", "fecal occult blood test", "fobt",
+    "lab order", "order my labs", "order for my labs",
+]
+
+# ── 11. Clarity on an imaging order ──
+IMAGING_CLARITY_TRIGGERS = [
+    "clarity on my imaging order", "clarity on my imaging",
+    "what is my imaging order for", "what does my imaging order say",
+    "clarify my imaging order", "what part of my body is the imaging",
+    "not sure what my imaging order is for",
+    "what is this imaging order for", "explain my imaging order",
+    "what was my imaging order for", "what body part is the imaging for",
+    "what was ordered for imaging", "what imaging was ordered",
+    "what imaging did the doctor order", "what imaging did dr",
+    "what imaging did my doctor order", "what kind of imaging was ordered",
+    "what type of imaging was ordered", "what test was ordered",
+    "what's the imaging order for", "what's my imaging order for",
+    "what's my imaging order",
+    "can't remember what the imaging order was for",
+    "don't remember what the imaging order was for",
+    "don't know what the imaging order is for",
+    "don't recall what my imaging order is for",
+]
+
+# Natural phrasings for the same question that name no "imaging order"
+# wording at all ("Dr. Patel ordered some imaging for me, but I can't
+# remember exactly what it was for or what part of my body they're
+# supposed to image"). Requires an imaging word AND a "I don't know what
+# the order says" cue so a request for a new order ("I need an imaging
+# order for my knee") and an imaging-results question ("what did my
+# MRI show") keep their own owners.
+_IMAGING_CONTEXT_WORDS = [
+    "imaging", "xray", "x-ray", "x ray", "mri", "ct scan", "cat scan",
+    "pet scan", "ultrasound", "radiology", "calcium score", "scan",
+]
+_IMAGING_UNCERTAINTY_CUES = [
+    "i can't remember", "i cannot remember", "i don't remember",
+    "i do not remember", "i can't recall", "i cannot recall",
+    "i don't recall", "i do not recall", "not sure what", "unsure what",
+    "don't know what", "do not know what", "don't remember what",
+    "do not remember what", "don't know which", "don't know what part",
+    "what part of my body", "which part of my body", "what body part",
+    "supposed to image", "supposed to scan", "what it was for",
+    "what the order says", "what the order is for", "what was it for",
+    "check my order", "look at my order", "look into my order",
+]
+
+# ── 12. Fax imaging order to outside facility ──
+IMAGING_FAX_TRIGGERS = [
+    "fax my imaging order", "fax the imaging order",
+    "fax my x-ray order", "fax my mri order",
+    "send my imaging order to", "fax imaging order to",
+    "fax my imaging order to", "fax the imaging order to",
+    "fax the x-ray order", "fax the mri order", "fax my ct order",
+    "fax the ct order", "fax my ultrasound order",
+]
+
+# Sending an imaging order to an outside facility WITHOUT saying "fax"
+# ("...the order for the CT scan of my heart to be sent to Beachside
+# Imaging"). Only the destination verbs - a bare "send" with no
+# destination is an imaging ORDER request, not a send-to-facility one.
+_IMAGING_ORDER_SEND_CUES = [
+    "sent to", "send to", "send it to", "send them to", "sent it to",
+    "send over to", "sent over to", "forward to", "forwarded to",
+    "route to", "routed to", "mail to", "mailed to", "email to",
+    "email it to", "deliver to", "delivered to",
+]
+
+# ── 13. Critical lab result (lab representative call) ──
+CRITICAL_LAB_TRIGGERS = [
+    "critical lab", "critical value", "critical result",
+    "critical lab result", "critical lab value", "panic value",
+    "panic lab", "panic result", "a critical", "abnormal critical",
+    "critical finding",
+]
+
+# Address heuristic (mirrors app.py's ADDRESS_INDICATORS shape - kept
+# local per the self-contained-module rule rather than importing app.py's).
+_ADDRESS_INDICATORS = [
+    "blvd", "boulevard", "street", "avenue", "ave", "road", "rd",
+    "lane", "ln", "court", "ct", "circle", "terrace", "suite", "ste",
+    "floor", "building", "apt", "unit", "po box",
+]
+
+EXTERNAL_WORKFLOWS = frozenset({
+    "prior_auth", "hh_decline", "hh_follow", "hh_instructions",
+})
+PATIENT_WORKFLOWS = frozenset({
+    "practice_manager", "total_care", "samples",
+    "imaging_request", "imaging_clarity", "imaging_fax",
+    "patient_prior_auth",
+})
+ENABLED_WORKFLOWS = EXTERNAL_WORKFLOWS | PATIENT_WORKFLOWS  # exactly 11
+
+_IMAGING_TYPE_CHOICES = [
+    "X-ray", "MRI", "CT scan", "Ultrasound", "PET scan",
+]
+_IMAGING_BODY_PART_CHOICES = [
+    "left knee", "right knee", "lumbar spine", "cervical spine",
+    "right shoulder", "left shoulder", "chest", "abdomen", "pelvis",
+    "right hip", "left hip", "right wrist", "left ankle", "brain",
+]
+
+# ─────────────────────────────────────────────
+# State variables
+# ─────────────────────────────────────────────
+
+requests_flow_active = False
+requests_active_workflow = None  # one of the tags returned by detect_any_request_intent()
+requests_pending_workflow = None  # patient-type intent captured before pre-chart completes
+requests_appointment_handoff_reason = None  # set when a flow hands off to app.py scheduling
+tc_stage = None  # Total Care: None -> "ask_transfer" -> "complete"
+
+# 1. Practice Manager
+pm_stage = None  # None -> "ask_reason" -> "await_callback" | "complete"
+pm_reason = None
+pm_availability_determined = False
+pm_available = None
+pm_callback_number = None
+
+# 2. Total Care (car accident) — stateless response, phone cached per call
+total_care_phone_number = None
+
+# 3. Prior authorization
+pa_stage = None  # "ask_fax" -> "ask_confirmation" -> "complete"
+pa_fax_number = None
+pa_portal_accepted = False
+pa_confirmation_number = None
+# 3b. Patient-reported prior authorization requirement ("Tricare requires a
+# prior authorization through their portal for my tirzepatide"). The
+# medication and the payer are both stated by the patient, so the message
+# to the MA can name them; no fax/confirmation machine exists because the
+# patient is not the party transmitting anything.
+pa_patient_stage = None  # "ask_contact" -> "complete"
+pa_patient_insurance = None
+pa_patient_medication = None
+pa_patient_ma = None
+pa_patient_contact_number = None
+
+# 4. Life insurance disability claim
+li_stage = None  # "ask_contact" -> "ask_fax" -> "ask_confirmation" -> "complete"
+li_contact_number = None
+li_fax_number = None
+li_confirmation_number = None
+
+# 5. Home health - decline (referred elsewhere)
+hh_decline_stage = None  # "ask_contact" -> "complete"
+hh_decline_contact_number = None
+
+# 6. Home health - will PCP follow
+hh_follow_stage = None  # "ask_contact" -> "complete"
+hh_follow_contact_number = None
+
+# 7. Home health nurse - written instructions
+hh_instructions_stage = None  # "check_ma" -> "ask_contact" (if unavailable) -> "complete"
+hh_instructions_ma_available = None
+hh_instructions_contact_number = None
+
+# 8. Medication samples
+samples_stage = None  # "ask_contact" -> "complete" (escalation handled on complete)
+samples_contact_number = None
+
+# 9. Imaging request
+# "ask_reason" -> "ask_provider_aware" -> "offer_appt" -> "complete"
+# "verify_phone" is the reason-already-stated path: the caller named the
+# physician and the reason in the first turn, so the request is notated and
+# the callback number verified instead of asking for either.
+imaging_stage = None
+imaging_reason = None
+imaging_provider_aware = None
+imaging_provider_name = None
+imaging_contact_number = None
+
+# 10. Lab order request (independent of imaging, same shape)
+lab_order_req_stage = None
+lab_order_req_reason = None
+lab_order_req_provider_aware = None
+
+# 11. Imaging order clarity (cached per call so a repeat question gets
+# the same answer instead of a new random result)
+imaging_clarity_result = None  # (imaging_type, body_part)
+
+# 12. Fax imaging order to outside facility
+imaging_fax_stage = None  # "ask_facility" -> "ask_fax_or_address" -> "complete"
+imaging_fax_facility_name = None
+imaging_fax_number = None
+
+# 13. Critical lab result (lab rep call) - stateless one-shot; MA is
+# always available per spec, so there is no failure branch/stage ladder.
+critical_lab_reported = False
+
+
+def reset_state():
+    global requests_flow_active, requests_active_workflow
+    global pm_stage, pm_reason, pm_availability_determined, pm_available, pm_callback_number
+    global total_care_phone_number
+    global pa_stage, pa_fax_number, pa_portal_accepted, pa_confirmation_number
+    global pa_patient_stage, pa_patient_insurance, pa_patient_medication
+    global pa_patient_ma, pa_patient_contact_number
+    global li_stage, li_contact_number, li_fax_number, li_confirmation_number
+    global hh_decline_stage, hh_decline_contact_number
+    global hh_follow_stage, hh_follow_contact_number
+    global hh_instructions_stage, hh_instructions_ma_available, hh_instructions_contact_number
+    global samples_stage, samples_contact_number
+    global imaging_stage, imaging_reason, imaging_provider_aware
+    global imaging_provider_name, imaging_contact_number
+    global lab_order_req_stage, lab_order_req_reason, lab_order_req_provider_aware
+    global imaging_clarity_result
+    global imaging_fax_stage, imaging_fax_facility_name, imaging_fax_number
+    global critical_lab_reported
+    global requests_pending_workflow, requests_appointment_handoff_reason, tc_stage
+
+    requests_flow_active = False
+    requests_pending_workflow = None
+    requests_appointment_handoff_reason = None
+    tc_stage = None
+    requests_active_workflow = None
+    pm_stage = None
+    pm_reason = None
+    pm_availability_determined = False
+    pm_available = None
+    pm_callback_number = None
+    total_care_phone_number = None
+    pa_stage = None
+    pa_fax_number = None
+    pa_portal_accepted = False
+    pa_confirmation_number = None
+    pa_patient_stage = None
+    pa_patient_insurance = None
+    pa_patient_medication = None
+    pa_patient_ma = None
+    pa_patient_contact_number = None
+    li_stage = None
+    li_contact_number = None
+    li_fax_number = None
+    li_confirmation_number = None
+    hh_decline_stage = None
+    hh_decline_contact_number = None
+    hh_follow_stage = None
+    hh_follow_contact_number = None
+    hh_instructions_stage = None
+    hh_instructions_ma_available = None
+    hh_instructions_contact_number = None
+    samples_stage = None
+    samples_contact_number = None
+    imaging_stage = None
+    imaging_reason = None
+    imaging_provider_aware = None
+    imaging_provider_name = None
+    imaging_contact_number = None
+    lab_order_req_stage = None
+    lab_order_req_reason = None
+    lab_order_req_provider_aware = None
+    imaging_clarity_result = None
+    imaging_fax_stage = None
+    imaging_fax_facility_name = None
+    imaging_fax_number = None
+    critical_lab_reported = False
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def _extract_phone(message):
+    match = PHONE_PATTERN.search(message)
+    return match.group(0) if match else None
+
+
+def _looks_like_fax_number(message):
+    return bool(_extract_phone(message))
+
+
+_ADDRESS_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(i) for i in _ADDRESS_INDICATORS) + r")\.?(?!\w)"
+)
+
+
+def _looks_like_address(message_lower):
+    # Word-boundary match plus a street number: the old substring test
+    # matched "ave" inside "have" and any digit, so "I have 5 minutes"
+    # counted as an address.
+    return bool(_ADDRESS_RE.search(message_lower)) and bool(
+        re.search(r"\b\d{1,6}\s+[a-z0-9]", message_lower)
+    )
+
+
+def _resolve_availability(env_key):
+    """Staff availability for transfer flows. Env override for UAT
+    (true/false); otherwise never 'available' outside office hours
+    (Steve must not claim to reach staff while the office is closed),
+    and a 50/50 roll during office hours."""
+    forced = os.environ.get(env_key)
+    if forced is not None and forced.lower() in ("true", "false", "1", "0", "yes", "no"):
+        return forced.lower() in ("true", "1", "yes")
+    try:
+        import app as _app
+        if not _app.is_within_office_hours():
+            return False
+    except Exception:
+        pass
+    return random.choice([True, False])
+
+
+def pop_appointment_handoff_reason():
+    """Returns (and clears) the reason a flow handed off to app.py's
+    FUTURE appointment scheduling, or None."""
+    global requests_appointment_handoff_reason
+    reason = requests_appointment_handoff_reason
+    requests_appointment_handoff_reason = None
+    return reason
+
+
+def _generate_phone_number():
+    return f"321-{random.randint(100, 999)}-{random.randint(1000, 9999)}"
+
+
+def _contains_any(message_lower, triggers):
+    # Word-boundary match (plural "s" allowed). Plain substring checks
+    # matched short triggers inside unrelated words.
+    return any(
+        re.search(r"(?<!\w)" + re.escape(t) + r"s?(?!\w)", message_lower)
+        for t in triggers
+    )
+
+
+# ─────────────────────────────────────────────
+# Intent detection
+# ─────────────────────────────────────────────
+
+def detect_practice_manager_request(message_lower):
+    return _contains_any(message_lower, PRACTICE_MANAGER_TRIGGERS)
+
+
+def detect_car_accident(message_lower):
+    return _contains_any(message_lower, CAR_ACCIDENT_TRIGGERS)
+
+
+_EXTERNAL_CALLER_CUE = re.compile(
+    r"\b(?:calling|call(?:ing)?\s+you)\s+(?:from|with|on behalf of)\b"
+    r"|\b(?:i'?m|i am|we'?re|we are)\s+(?:with|from)\b"
+    r"|\bthis is\s+[\w .'-]{1,40}?\s+(?:from|with|at)\b"
+    r"|\bon behalf of\b"
+)
+
+
+def detect_prior_auth_request(message_lower):
+    """Prior authorization call from a payer/pharmacy representative.
+    Requires a representative-style self-introduction so a PATIENT who
+    merely mentions a prior authorization is not treated as a rep."""
+    return _contains_any(message_lower, PRIOR_AUTH_TRIGGERS) and bool(
+        _EXTERNAL_CALLER_CUE.search(message_lower)
+    )
+
+
+# A PATIENT reporting what their own insurer requires ("I checked with
+# Tricare and they are requiring a prior authorization through their
+# portal in order for them to cover the tirzepatide that was prescribed
+# to me") is not a payer representative, so _EXTERNAL_CALLER_CUE above is
+# deliberately False and this turn matched NO workflow at all - it fell to
+# the LLM, which improvised an apology plus a callback ask instead of
+# noting the requirement. These cues are all COVERAGE CONSEQUENCES ("they
+# will not cover it unless...") rather than a bare mention of the words,
+# so a patient merely asking whether something needs authorization ("do
+# I need a prior authorization for this?") - a benefits question Steve
+# cannot answer - is still not captured.
+_PATIENT_PRIOR_AUTH_CUES = [
+    "in order for them to cover", "in order for it to cover",
+    "in order to cover", "so they will cover", "so they can cover",
+    "for them to cover", "for it to cover", "so that they cover",
+    "require a prior authorization", "requires a prior authorization",
+    "require a prior auth", "requires a prior auth",
+    "requiring a prior authorization", "requiring a prior auth",
+    "requiring prior authorization", "requires prior authorization",
+    "need a prior authorization to cover", "needs a prior authorization to cover",
+    "need prior authorization to cover", "needs prior authorization to cover",
+    "won't cover", "will not cover", "not covered without",
+    "not covered unless", "won't pay for", "will not pay for",
+    "won't approve", "will not approve", "not approved without",
+]
+
+
+def detect_patient_prior_auth_request(message_lower):
+    """Prior authorization requirement reported BY the patient about their
+    own coverage. Deliberately excludes the representative cue so every
+    payer/pharmacy caller keeps the external prior_auth workflow."""
+    return (
+        _contains_any(message_lower, PRIOR_AUTH_TRIGGERS)
+        and _contains_any(message_lower, _PATIENT_PRIOR_AUTH_CUES)
+        and not _EXTERNAL_CALLER_CUE.search(message_lower)
+    )
+
+
+def detect_life_insurance_disability(message_lower):
+    return _contains_any(message_lower, LIFE_INSURANCE_DISABILITY_TRIGGERS)
+
+
+def detect_home_health_decline(message_lower):
+    return (
+        _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
+        and _contains_any(message_lower, HOME_HEALTH_DECLINE_TRIGGERS)
+    )
+
+
+def detect_home_health_follow(message_lower):
+    return (
+        _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
+        and _contains_any(message_lower, HOME_HEALTH_FOLLOW_TRIGGERS)
+    )
+
+
+def detect_home_health_instructions(message_lower):
+    return (
+        _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
+        and _contains_any(message_lower, HOME_HEALTH_INSTRUCTIONS_TRIGGERS)
+    )
+
+
+def detect_medication_samples(message_lower):
+    return _contains_any(message_lower, MEDICATION_SAMPLES_TRIGGERS)
+
+
+def detect_priority_escalation(message_lower):
+    """Patient asking to raise the priority of a message that has already
+    been created (medication samples, etc.) rather than to start a new
+    one. Requires an urgency word plus a reference to that message."""
+    return (
+        _contains_any(message_lower, _PRIORITY_ESCALATION_TRIGGERS)
+        and _contains_any(message_lower, _PRIORITY_ESCALATION_TARGETS)
+    )
+
+
+_IMAGING_EXPLICIT = [
+    "imaging order", "imaging request", "order for an mri",
+    "order for a ct", "order for an x-ray", "order for an ultrasound",
+]
+_IMAGING_REQUEST_CUE = re.compile(
+    r"\b(order|orders|ordered|request|need|needs|want|get|schedule)\b"
+)
+_IMAGING_EXCLUDE = re.compile(r"\b(appointment|results?|report|findings)\b")
+
+
+def detect_imaging_request(message_lower):
+    """An imaging ORDER/REQUEST. Talking about an imaging appointment or
+    imaging results ("schedule an appointment to go over my MRI
+    results") is not an order request and is left to normal handling."""
+    if _contains_any(message_lower, _IMAGING_EXPLICIT):
+        return True
+    if not _contains_any(message_lower, IMAGING_ORDER_TRIGGERS):
+        return False
+    if _IMAGING_EXCLUDE.search(message_lower):
+        return False
+    return bool(_IMAGING_REQUEST_CUE.search(message_lower))
+
+
+def detect_lab_order_request(message_lower):
+    return _contains_any(message_lower, LAB_ORDER_NAME_TRIGGERS)
+
+
+def detect_imaging_clarity(message_lower):
+    if _contains_any(message_lower, IMAGING_CLARITY_TRIGGERS):
+        return True
+    # A question about an imaging order the patient cannot recall, phrased
+    # without any "imaging order" wording. Both halves are required: the
+    # imaging word keeps non-imaging questions out, the uncertainty cue
+    # keeps a request for a NEW order (imaging_request) and an
+    # imaging-results question out. Results/report/findings phrasing is
+    # excluded for the same reason _IMAGING_EXCLUDE guards the request
+    # trigger - "what did my MRI show" is not an order-clarity question.
+    return (
+        _contains_any(message_lower, _IMAGING_CONTEXT_WORDS)
+        and _contains_any(message_lower, _IMAGING_UNCERTAINTY_CUES)
+        and not _IMAGING_EXCLUDE.search(message_lower)
+    )
+
+
+def detect_imaging_fax(message_lower):
+    if _contains_any(message_lower, IMAGING_FAX_TRIGGERS):
+        return True
+    # imaging modality + fax wording ("get my MRI order faxed to X").
+    # Requires an imaging word so lab-order faxing stays with app.py.
+    if (
+        _contains_any(message_lower, IMAGING_ORDER_TRIGGERS)
+        and bool(re.search(r"\b(fax|faxed|faxing)\b", message_lower))
+        and not _IMAGING_EXCLUDE.search(message_lower)
+    ):
+        return True
+    # The same request phrased without the word "fax" ("I need the order
+    # for the CT scan of my heart to be sent to Beachside Imaging"). An
+    # imaging word plus a send-to-destination cue is required, so a request
+    # for a NEW order ("I need an MRI of my left knee") and an
+    # imaging-results question keep their existing owners.
+    return (
+        _contains_any(message_lower, IMAGING_ORDER_TRIGGERS)
+        and _contains_any(message_lower, _IMAGING_ORDER_SEND_CUES)
+        and not _IMAGING_EXCLUDE.search(message_lower)
+    )
+
+
+# An imaging order request whose reason the caller stated in the SAME turn
+# ("I need Dr. Chen to order an MRI of my left knee. When they did an x
+# ray of the knee, they found nothing."). Asking "what is the reason?"
+# there is the UAT failure: the patient already gave it. Kept narrow - a
+# bare order ("I need an MRI order for my knee") names no indication, so it
+# still gets the reason question.
+_IMAGING_REASON_STATED = re.compile(
+    r"\b(?:"
+    r"found\s+nothing"
+    r"|nothing\s+(?:showed|was\s+found|came\s+up|on\s+it)"
+    r"|(?:is|was|are|were|seem(?:s|ed)?|look(?:s|ed)?)\s+"
+    r"(?:normal|negative|clear|unremarkable|fine|good)"
+    r"|(?:n[o']t|never)\s+(?:show|find|reveal|see)\w*"
+    r"|already\s+(?:had|done|gotten|got|went|been)"
+    r"|been\s+(?:hurting|aching|in\s+pain)"
+    r"|hurt|hurts|hurting|ache|aches|aching|pain|painful|stiff|stiffness"
+    r"|swelling|swollen|numb|numbness|tingling|injury|injured|fracture"
+    r"|sprain|sprained|tear|torn|rash|bruise|bruised"
+    r")\b"
+)
+
+# The study the caller says the provider will review. An existing study is
+# named apart from the one being requested ("MRI of my knee ... they did an
+# x ray"), so x-ray/CT/ultrasound are matched BEFORE any fallback.
+_IMAGING_PRIOR_STUDY = (
+    (re.compile(r"\bx[\s-]?rays?\b"), "x-ray"),
+    (re.compile(r"\b(?:ct|cat)[\s-]?scans?\b|\bcts?\b"), "CT scan"),
+    (re.compile(r"\bultrasounds?\b"), "ultrasound"),
+)
+
+# Case-sensitive on purpose: "my doctor said ..." must not yield "Dr. Said",
+# and a caller who names the physician capitalizes the surname.
+_PHYSICIAN_IN_MESSAGE = re.compile(
+    r"\b(?:Dr|Doctor)\.?\s+((?:[A-Z][a-zA-Z'’-]+)(?:\s+[A-Z][a-zA-Z'’-]+)*)"
+)
+
+
+def imaging_reason_already_stated(message_lower):
+    """True when the caller's own turn already carried the clinical reason
+    for the imaging order (a prior study with negative findings, or the
+    symptoms/injury driving it)."""
+    return bool(_IMAGING_REASON_STATED.search(message_lower))
+
+
+def _prior_study_named(message_lower):
+    """The existing study the provider is to review, or None."""
+    for pattern, label in _IMAGING_PRIOR_STUDY:
+        if pattern.search(message_lower):
+            return label
+    return None
+
+
+_FACILITY_SUFFIXES = (
+    "imaging", "radiology", "center", "centre", "centre", "clinic",
+    "medical", "diagnostics", "diagnostic", "associates", "group",
+    "hospital", "lab", "labs", "laboratory", "health", "partners",
+)
+
+
+def _facility_named_in_message(message):
+    """The outside facility the caller already named as the destination,
+    or None. Reads the text AFTER the send cue ("...sent to Beachside
+    Imaging"), so a body part mentioned earlier in the sentence ("...of
+    my heart to be sent to Beachside Imaging") is never mistaken for the
+    facility."""
+    stripped = message.strip().rstrip("?.!,")
+    lowered = stripped.lower()
+    best = None
+    for cue in _IMAGING_ORDER_SEND_CUES:
+        idx = lowered.rfind(cue)
+        if idx == -1:
+            continue
+        tail = stripped[idx + len(cue):].strip()
+        tail = re.sub(r"^(?:it|them|the order|the form)?\s*to\s+", "", tail,
+                      flags=re.IGNORECASE).strip()
+        tail = re.sub(r"^(?:the|a|an)\s+", "", tail, flags=re.IGNORECASE).strip()
+        if not tail or PHONE_PATTERN.search(tail):
+            continue
+        best = tail
+    if not best:
+        return None
+    # Keep it to a facility-like name: at most four words, and it must
+    # not be a body part or a clinical phrase.
+    words = best.split()
+    if len(words) > 4:
+        return None
+    if any(len(w) > 24 for w in words):
+        return None
+    if re.search(r"\b(?:of|for|my|heart|knee|chest|head|brain|back|"
+                 r"abdomen|spine|shoulder|hip|ankle|wrist|lung|lungs)\b",
+                 best, re.IGNORECASE):
+        return None
+    if _contains_any(best.lower(), _FACILITY_SUFFIXES):
+        return best
+    # No facility keyword, but a short capitalized proper name at the end
+    # of the sentence is still a name ("...sent to Beachside").
+    return best if best[:1].isupper() or len(words) <= 2 else None
+
+
+def _resolve_imaging_physician(message):
+    """The physician the caller named, in the caller's own form ("Dr.
+    Chen"). Falls back to the patient's PCP on the chart, then to neutral
+    wording - never invents a name."""
+    match = _PHYSICIAN_IN_MESSAGE.search(message)
+    if match:
+        return "Dr. " + match.group(1).split()[-1]
+    try:
+        import app as _app
+        pcp = _app.get_patient_pcp_from_history()
+    except Exception:
+        pcp = None
+    if pcp:
+        return "Dr. " + pcp.split()[-1]
+    return "your provider"
+
+
+def detect_critical_lab_report(message_lower):
+    return _contains_any(message_lower, CRITICAL_LAB_TRIGGERS)
+
+
+def detect_any_request_intent(message_lower):
+    """Returns a workflow tag for app.py's early-capture pattern
+    (mirrors Sprint13.phf_intent_detected / Sprint14.wellness_intent_detected),
+    or None. Checked in a fixed priority order so a message that could
+    plausibly match more than one (rare, given the trigger specificity)
+    resolves deterministically. Critical lab is checked FIRST, ahead of
+    every other workflow in this file (and, per the integration note at
+    the top of this file, must also be checked ahead of app.py's
+    medical-professional intercept) - a delayed or misrouted critical
+    lab report is a patient-safety issue, not just a misrouted call.
+    Imaging clarity and imaging fax are checked before the general
+    imaging-request trigger since both are more specific subsets of
+    "imaging" phrasing."""
+    ordered = (
+        ("critical_lab", detect_critical_lab_report),
+        ("practice_manager", detect_practice_manager_request),
+        ("total_care", detect_car_accident),
+        ("patient_prior_auth", detect_patient_prior_auth_request),
+        ("prior_auth", detect_prior_auth_request),
+        ("life_insurance", detect_life_insurance_disability),
+        ("hh_decline", detect_home_health_decline),
+        ("hh_follow", detect_home_health_follow),
+        ("hh_instructions", detect_home_health_instructions),
+        ("samples", detect_medication_samples),
+        ("imaging_clarity", detect_imaging_clarity),
+        ("imaging_fax", detect_imaging_fax),
+        ("imaging_request", detect_imaging_request),
+        ("lab_order_request", detect_lab_order_request),
+    )
+    for tag, detector in ordered:
+        if tag in ENABLED_WORKFLOWS and detector(message_lower):
+            return tag
+    return None
+
+
+# ─────────────────────────────────────────────
+# 1. Practice Manager complaint/compliment
+# ─────────────────────────────────────────────
+
+def _handle_practice_manager(message, message_lower):
+    global pm_stage, pm_reason, pm_availability_determined, pm_available
+    global pm_callback_number, requests_flow_active
+
+    if pm_stage is None and (
+            "complaint" in message_lower or "compliment" in message_lower
+    ):
+        # The caller already stated the reason - do not ask again.
+        pm_reason = message.strip()
+        pm_availability_determined = True
+        pm_available = _resolve_availability("STEVE_FORCE_PM_AVAILABLE")
+        if pm_available:
+            pm_stage = "complete"
+            requests_flow_active = False
+            return (
+                f"I'd be happy to connect you with our Practice Manager, "
+                f"{PRACTICE_MANAGER_NAME}. Let me transfer you now. "
+                f"Please hold."
+            )
+        pm_stage = "await_callback"
+        return (
+            f"I'd be happy to help with that. I'm sorry, "
+            f"{PRACTICE_MANAGER_FIRST_NAME} is not available right now. "
+            f"I'll take a message and have her follow up with you. May "
+            f"I get a good contact number for you?"
+        )
+
+    if pm_stage is None:
+        pm_stage = "ask_reason"
+        return (
+            f"I'd be happy to connect you with our Practice Manager, "
+            f"{PRACTICE_MANAGER_NAME}. May I ask the reason for your call?"
+        )
+
+    if pm_stage == "ask_reason":
+        pm_reason = message.strip()
+        if not pm_availability_determined:
+            pm_available = _resolve_availability("STEVE_FORCE_PM_AVAILABLE")
+            pm_availability_determined = True
+        if pm_available:
+            pm_stage = "complete"
+            requests_flow_active = False
+            return (
+                f"Thank you. Let me transfer you to {PRACTICE_MANAGER_FIRST_NAME} "
+                f"now. Please hold."
+            )
+        pm_stage = "await_callback"
+        return (
+            f"I'm sorry, {PRACTICE_MANAGER_FIRST_NAME} is not available "
+            f"right now. I'll take a message and have her follow up with "
+            f"you. May I get a good contact number for you?"
+        )
+
+    if pm_stage == "await_callback":
+        phone = _extract_phone(message)
+        if phone:
+            pm_callback_number = phone
+            pm_stage = "complete"
+            requests_flow_active = False
+            return (
+                f"Thank you. I've noted your callback number as {phone} "
+                f"and left a message for {PRACTICE_MANAGER_FIRST_NAME}. "
+                f"Is there anything else I can help you with today?"
+            )
+        return "May I get a good contact number for you?"
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 2. Total Care transfer (car/automobile accident)
+# ─────────────────────────────────────────────
+
+def _handle_total_care(message, message_lower):
+    global total_care_phone_number, requests_flow_active, tc_stage
+    if not total_care_phone_number:
+        total_care_phone_number = _generate_phone_number()
+    if tc_stage is None:
+        tc_stage = "ask_transfer"
+        return (
+            f"I'm sorry to hear about your accident. Unfortunately, your "
+            f"provider does not treat injuries from automobile accidents. "
+            f"I can transfer you to {TOTAL_CARE_NAME}, who specializes in "
+            f"this kind of care - their number is {total_care_phone_number}. "
+            f"Would you like me to transfer you now?"
+        )
+    # The flow used to end right after asking the question, so the
+    # patient's yes/no went to the LLM. Answer it deterministically.
+    declines = _contains_any(message_lower, ["no", "nope", "not right now", "no thank you", "no thanks"])
+    accepts = _contains_any(message_lower, ["yes", "yeah", "yep", "sure", "ok", "okay", "please", "go ahead"])
+    if declines and not accepts:
+        tc_stage = "complete"
+        requests_flow_active = False
+        return (
+            f"No problem. If you change your mind, {TOTAL_CARE_NAME} can be "
+            f"reached at {total_care_phone_number}. Is there anything else "
+            f"I can help you with today?"
+        )
+    if accepts:
+        tc_stage = "complete"
+        requests_flow_active = False
+        return (
+            f"I'm transferring you to {TOTAL_CARE_NAME} now. Should the call "
+            f"disconnect, their number is {total_care_phone_number}. Thank "
+            f"you for calling Sykes Creek Primary Care. Have a great day!"
+        )
+    return "Would you like me to transfer you to Total Care now?"
+
+
+# ─────────────────────────────────────────────
+# 3. Prior authorization (insurance rep)
+# ─────────────────────────────────────────────
+
+def _handle_prior_auth(message, message_lower):
+    global pa_stage, pa_fax_number, pa_portal_accepted
+    global pa_confirmation_number, requests_flow_active
+
+    if pa_stage is None:
+        pa_stage = "ask_fax"
+        return (
+            "Thank you for letting us know. Can I get a good fax number "
+            "so we can send over what's needed for the prior "
+            "authorization? If it's easier to handle through your "
+            "portal, that works too."
+        )
+
+    if pa_stage == "ask_fax":
+        if "portal" in message_lower:
+            pa_portal_accepted = True
+            pa_stage = "ask_confirmation"
+            return (
+                "That works. Could I get a confirmation number for this "
+                "request?"
+            )
+        fax = _extract_phone(message)
+        if fax:
+            pa_fax_number = fax
+            pa_stage = "ask_confirmation"
+            return "Thank you. Could I get a confirmation number for this request?"
+        return (
+            "Can I get a good fax number, or let me know if this can be "
+            "handled through your portal instead?"
+        )
+
+    if pa_stage == "ask_confirmation":
+        pa_confirmation_number = message.strip()
+        pa_stage = "complete"
+        requests_flow_active = False
+        return (
+            "Thank you, I've put in a message with that information for "
+            "the provider to complete the prior authorization. Have a "
+            "great day."
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 3b. Patient-reported prior authorization requirement
+# ─────────────────────────────────────────────
+# Distinct from #3 above: that workflow models a payer representative who
+# has paperwork to transmit (fax number -> confirmation number). This one
+# models a patient relaying what the insurer told them, which is a message
+# to the MA - "Tricare requires a prior auth through their portal for my
+# tirzepatide" - exactly the notate-and-call-back shape every other
+# patient-type workflow uses.
+
+_PA_MEDICATION_PATTERNS = (
+    r"(?:cover|covering|covered|pay for|paying for)\s+(?:the|my)\s+"
+    r"([A-Za-z][\w'\-]{2,30})",
+    r"(?:prior\s+auth(?:orization)?|pa)\s+(?:for|on)\s+(?:the|my)\s+"
+    r"([A-Za-z][\w'\-]{2,30})",
+    r"(?:medication|medicine|drug|script|prescription)\s+(?:called\s+|named\s+)?"
+    r"([A-Za-z][\w'\-]{2,30})",
+    r"(?:to\s+cover|for)\s+(?:my\s+)?([A-Za-z][\w'\-]{2,30})(?!\s+(?:authorization|auth))",
+)
+_PA_MEDICATION_BLOCKLIST = {
+    "authorization", "auth", "prescription", "prescribed", "medication",
+    "medicine", "coverage", "portal", "it", "that", "this", "them",
+    "they", "one", "anything", "something", "prior",
+}
+_PA_INSURER_PATTERN = re.compile(
+    r"(?:checked|called|spoke|talked|confirmed|verified|heard)\s+"
+    r"(?:with|to|on)\s+((?:[A-Z][\w&'\.\-]*)(?:\s+[A-Z][\w&'\.\-]*){0,2})"
+)
+
+
+def _patient_prior_auth_medication(message):
+    for pattern in _PA_MEDICATION_PATTERNS:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            name = match.group(1).lower()
+            if name not in _PA_MEDICATION_BLOCKLIST:
+                return name
+    return None
+
+
+def _patient_prior_auth_insurance(message):
+    match = _PA_INSURER_PATTERN.search(message)
+    if not match:
+        return None
+    name = match.group(1).strip()
+    # Trim a trailing clause that followed the payer's name.
+    name = re.split(r"\b(?:and|but|they|who|to|for|about)\b", name)[0].strip()
+    return name or None
+
+
+def _patient_prior_auth_ma():
+    """The MA name + provider the message goes to, from the PCP the patient
+    already named. Returns (ma_label, None) or ("the medical assistant for
+    your provider", None) when no PCP is on the call."""
+    try:
+        import app as _app
+        ma_name, provider = _app.get_ma_for_patient()
+    except Exception:
+        ma_name, provider = None, None
+    if ma_name and provider:
+        return f"{ma_name}, the medical assistant for {provider}"
+    return "the medical assistant for your provider"
+
+
+def _handle_patient_prior_auth(message, message_lower):
+    global pa_patient_stage, pa_patient_insurance, pa_patient_medication
+    global pa_patient_ma, pa_patient_contact_number, requests_flow_active
+
+    if pa_patient_stage is None:
+        pa_patient_stage = "ask_contact"
+        pa_patient_insurance = _patient_prior_auth_insurance(message)
+        pa_patient_medication = _patient_prior_auth_medication(message)
+        pa_patient_ma = _patient_prior_auth_ma()
+        # With no payer named, "noting that requires..." would read as a
+        # broken sentence - the subject is missing. Use the neutral
+        # "that your insurance requires" instead.
+        payer = (
+            f"{pa_patient_insurance} " if pa_patient_insurance
+            else "your insurance "
+        )
+        via = " through their portal" if "portal" in message_lower else ""
+        drug = (
+            f" for your {pa_patient_medication}"
+            if pa_patient_medication else " for your medication"
+        )
+        return (
+            f"Thank you for letting us know. I'll send a message to "
+            f"{pa_patient_ma}, noting that {payer}requires a prior "
+            f"authorization{via}{drug}. May I get a good callback number "
+            f"for you?"
+        )
+
+    if pa_patient_stage == "ask_contact":
+        pa_patient_contact_number = (
+            _extract_phone(message) or message.strip()
+        )
+        pa_patient_stage = "complete"
+        requests_flow_active = False
+        detail = ""
+        if pa_patient_insurance or pa_patient_medication:
+            detail = (
+                f" noting that "
+                f"{pa_patient_insurance or 'your insurance'} requires a "
+                f"prior authorization"
+                f"{' for your ' + pa_patient_medication if pa_patient_medication else ''}"
+            )
+        return (
+            f"Thank you, I've put in a message with that information"
+            f"{detail}. Have a great day."
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 4. Life insurance disability claim follow-up
+# ─────────────────────────────────────────────
+
+def _handle_life_insurance(message, message_lower):
+    global li_stage, li_contact_number, li_fax_number
+    global li_confirmation_number, requests_flow_active
+
+    if li_stage is None:
+        li_stage = "ask_contact"
+        return (
+            "One moment while I check the chart. (pause) I do see the "
+            "disability claim documentation on file. Could I get a good "
+            "contact number for your office?"
+        )
+
+    if li_stage == "ask_contact":
+        phone = _extract_phone(message)
+        li_contact_number = phone or message.strip()
+        li_stage = "ask_fax"
+        return "Thank you. Could I also get a good fax number?"
+
+    if li_stage == "ask_fax":
+        fax = _extract_phone(message)
+        li_fax_number = fax or message.strip()
+        li_stage = "ask_confirmation"
+        return "And could I get a confirmation number for this request?"
+
+    if li_stage == "ask_confirmation":
+        li_confirmation_number = message.strip()
+        li_stage = "complete"
+        requests_flow_active = False
+        return (
+            "Thank you, I've put in a message with that information for "
+            "the provider. Have a great day."
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 5. Home health - cannot accept patient (referred elsewhere)
+# ─────────────────────────────────────────────
+
+def _handle_hh_decline(message, message_lower):
+    global hh_decline_stage, hh_decline_contact_number, requests_flow_active
+
+    if hh_decline_stage is None:
+        hh_decline_stage = "ask_contact"
+        return (
+            "Thank you for letting us know. May I get a good contact "
+            "number in case the provider or medical assistant needs to "
+            "follow up?"
+        )
+
+    if hh_decline_stage == "ask_contact":
+        phone = _extract_phone(message)
+        hh_decline_contact_number = phone or message.strip()
+        hh_decline_stage = "complete"
+        requests_flow_active = False
+        return (
+            "Thank you, I've sent a message with that information. Have "
+            "a great day."
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 6. Home health - will PCP follow the patient?
+# ─────────────────────────────────────────────
+
+def _handle_hh_follow(message, message_lower):
+    global hh_follow_stage, hh_follow_contact_number, requests_flow_active
+
+    if hh_follow_stage is None:
+        hh_follow_stage = "ask_contact"
+        return (
+            "I'll need to check with the provider on that. May I get a "
+            "good contact number so we can follow up with you?"
+        )
+
+    if hh_follow_stage == "ask_contact":
+        phone = _extract_phone(message)
+        hh_follow_contact_number = phone or message.strip()
+        hh_follow_stage = "complete"
+        requests_flow_active = False
+        return (
+            "Thank you, I've put in a message for the provider. Have a "
+            "great day."
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 7. Home health nurse - written treatment instructions
+# ─────────────────────────────────────────────
+
+def _handle_hh_instructions(message, message_lower):
+    global hh_instructions_stage, hh_instructions_ma_available
+    global hh_instructions_contact_number, requests_flow_active
+
+    if hh_instructions_stage is None:
+        hh_instructions_ma_available = _resolve_availability("STEVE_FORCE_HH_MA_AVAILABLE")
+        if hh_instructions_ma_available:
+            hh_instructions_stage = "complete"
+            requests_flow_active = False
+            return (
+                "Let me get the medical assistant on the line for you "
+                "now. Please hold while I transfer you."
+            )
+        hh_instructions_stage = "ask_contact"
+        return (
+            "I'm sorry, the medical assistant is not available right "
+            "now. May I get a good contact number for you?"
+        )
+
+    if hh_instructions_stage == "ask_contact":
+        phone = _extract_phone(message)
+        hh_instructions_contact_number = phone or message.strip()
+        hh_instructions_stage = "complete"
+        requests_flow_active = False
+        return (
+            "Thank you. I've put in a high priority message - please "
+            "allow up to 24 business hours for this to be processed. "
+            "Have a great day."
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 8. Medication samples inquiry
+# ─────────────────────────────────────────────
+
+def _handle_medication_samples(message, message_lower):
+    global samples_stage, samples_contact_number, requests_flow_active
+
+    if samples_stage is None:
+        samples_stage = "ask_contact"
+        return (
+            "I'm not able to confirm sample availability myself, but I "
+            "can pass that along to the provider. May I get your best "
+            "contact number?"
+        )
+
+    if samples_stage == "ask_contact":
+        phone = _extract_phone(message)
+        samples_contact_number = phone or message.strip()
+        samples_stage = "complete"
+        # requests_flow_active deliberately STAYS True here. The message
+        # now exists, and the patient's next turn is very often a change
+        # to that same message ("can you make that message high
+        # priority?"). Clearing the flag ended the flow at the callback
+        # number, so the escalation turn fell through to the LLM, which
+        # restarted intake - claiming it had to create a new urgent
+        # message and re-asking for the callback number the patient had
+        # just given. Keeping the flow dispatchable lets the completed
+        # stage below answer that turn deterministically. Any turn that is
+        # NOT an escalation returns None, which releases the flow (see
+        # handle_requests_flow) so nothing else is held back.
+        return (
+            "Thank you, I've put in a message with that information. "
+            "Have a great day."
+        )
+
+    if samples_stage == "complete":
+        if not detect_priority_escalation(message_lower):
+            return None
+        captured = samples_contact_number or ""
+        # Echo the number already on file so the patient can see it was
+        # retained (no second intake); fall back to neutral wording if the
+        # caller gave a non-number answer.
+        reference = (
+            captured if PHONE_PATTERN.search(captured)
+            else "the contact number you gave me"
+        )
+        return (
+            f"Of course. I've updated the message I already sent to the "
+            f"provider to high priority - there's no need to start a new "
+            f"one. The callback number I have on file is {reference}. "
+            f"Please allow up to 24 business hours for the provider to "
+            f"process it. Is there anything else I can help you with today?"
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 9. Imaging request  /  10. Lab order request
+# ─────────────────────────────────────────────
+# Identical shape per the spec, kept as independent state so the two
+# workflows never cross-contaminate, but sharing one implementation.
+
+def _handle_reason_awareness_flow(message, message_lower, kind):
+    """kind: 'imaging' or 'lab'. Returns a response string, or None to
+    hand off to app.py's existing FUTURE appointment scheduling (only
+    on the 'offer appointment, patient accepts' branch)."""
+    global imaging_stage, imaging_reason, imaging_provider_aware
+    global imaging_provider_name, imaging_contact_number
+    global lab_order_req_stage, lab_order_req_reason, lab_order_req_provider_aware
+    global requests_flow_active, requests_appointment_handoff_reason
+
+    label = "imaging" if kind == "imaging" else "lab"
+
+    if kind == "imaging":
+        stage, reason, aware = imaging_stage, imaging_reason, imaging_provider_aware
+    else:
+        stage, reason, aware = (
+            lab_order_req_stage, lab_order_req_reason, lab_order_req_provider_aware
+        )
+
+    if stage is None and kind == "imaging" and imaging_reason_already_stated(
+        message_lower
+    ):
+        # The caller stated the reason in the same turn as the order
+        # ("...order an MRI of my left knee. When they did an x ray of the
+        # knee, they found nothing."), and named the provider who will
+        # review it. Re-asking the reason made the patient repeat
+        # themselves, so the request is notated and the callback number
+        # verified instead.
+        imaging_reason = message.strip()
+        imaging_provider_name = _resolve_imaging_physician(message)
+        study = _prior_study_named(message_lower)
+        review = (
+            f"will review the {study} and get back in touch with you"
+            if study
+            else "will review this and get back in touch with you"
+        )
+        imaging_stage = "verify_phone"
+        return (
+            f"{imaging_provider_name} {review}, however I will notate our "
+            f"conversation. Can you verify your phone number so that when "
+            f"{imaging_provider_name} calls, they are able to reach you?"
+        )
+
+    if stage is None:
+        if kind == "imaging":
+            imaging_stage = "ask_reason"
+        else:
+            lab_order_req_stage = "ask_reason"
+        return f"Sure, what is the reason for the {label} request?"
+
+    if stage == "verify_phone":
+        # The patient confirms the number already on file or gives a new
+        # one; either way the notated request is closed here so the answer
+        # never reaches the LLM.
+        phone = _extract_phone(message)
+        if phone:
+            imaging_contact_number = phone
+        provider = imaging_provider_name or "your provider"
+        reach = f" at {imaging_contact_number}" if imaging_contact_number else ""
+        imaging_stage = "complete"
+        requests_flow_active = False
+        return (
+            f"Thank you. I have notated your request and our conversation, "
+            f"and {provider} will be able to reach you{reach} to review it. "
+            f"Please allow up to 24 business hours for that to be processed. "
+            f"Is there anything else I can help you with today?"
+        )
+
+    if stage == "ask_reason":
+        if kind == "imaging":
+            imaging_reason = message.strip()
+            imaging_stage = "ask_provider_aware"
+        else:
+            lab_order_req_reason = message.strip()
+            lab_order_req_stage = "ask_provider_aware"
+        return f"Thank you. Is your provider already aware of this {label} request?"
+
+    if stage == "ask_provider_aware":
+        # Negation is checked first: "not aware" contains "aware" and
+        # bare "no" matched inside "know"/"not" under substring tests.
+        is_yes = _contains_any(message_lower, ["yes", "yeah", "yep"])
+        is_not_aware = _contains_any(message_lower, [
+            "not aware", "isn't aware", "is not aware", "unaware",
+            "don't think", "do not think", "doesn't know", "does not know",
+            "not sure",
+        ]) or (_contains_any(message_lower, ["no", "nope"]) and not is_yes)
+        if is_not_aware:
+            if kind == "imaging":
+                imaging_provider_aware = False
+                imaging_stage = "offer_appt"
+            else:
+                lab_order_req_provider_aware = False
+                lab_order_req_stage = "offer_appt"
+            return (
+                f"Since your provider isn't aware yet, I can offer to "
+                f"schedule an appointment so this can be discussed. "
+                f"Would you like me to set that up?"
+            )
+        # Default to aware=True on an ambiguous/affirmative reply.
+        if kind == "imaging":
+            imaging_provider_aware = True
+            imaging_stage = "complete"
+        else:
+            lab_order_req_provider_aware = True
+            lab_order_req_stage = "complete"
+        requests_flow_active = False
+        return (
+            f"Thank you, I've put in a message with that information "
+            f"for the provider. Is there anything else I can help you "
+            f"with today?"
+        )
+
+    if stage == "offer_appt":
+        wants_appt = _contains_any(
+            message_lower, ["yes", "yeah", "sure", "okay", "ok", "please", "sounds good"]
+        )
+        declines_appt = _contains_any(
+            message_lower, ["no", "nope", "not right now", "no thank you"]
+        )
+        if declines_appt and not wants_appt:
+            if kind == "imaging":
+                imaging_stage = "complete"
+            else:
+                lab_order_req_stage = "complete"
+            requests_flow_active = False
+            return (
+                "No problem, I've put in a message with that "
+                "information for the provider. Is there anything else "
+                "I can help you with today?"
+            )
+        if wants_appt:
+            if kind == "imaging":
+                imaging_stage = "complete"
+            else:
+                lab_order_req_stage = "complete"
+            requests_flow_active = False
+            requests_appointment_handoff_reason = (
+                imaging_reason if kind == "imaging" else lab_order_req_reason
+            ) or "this request"
+            # Hand off to app.py's existing FUTURE appointment
+            # scheduling rather than duplicating availability
+            # generation here - the patient's stated reason
+            # (imaging_reason/lab_order_req_reason) is available for
+            # app.py to use as the already-known appointment reason.
+            return None
+        return "Would you like me to schedule an appointment for this?"
+
+    return None
+
+
+def _handle_imaging_request(message, message_lower):
+    return _handle_reason_awareness_flow(message, message_lower, "imaging")
+
+
+def _handle_lab_order_request(message, message_lower):
+    return _handle_reason_awareness_flow(message, message_lower, "lab")
+
+
+# ─────────────────────────────────────────────
+# 11. Clarity on an existing imaging order
+# ─────────────────────────────────────────────
+
+def _handle_imaging_clarity(message, message_lower):
+    global imaging_clarity_result, requests_flow_active
+
+    if not imaging_clarity_result:
+        imaging_clarity_result = (
+            random.choice(_IMAGING_TYPE_CHOICES),
+            random.choice(_IMAGING_BODY_PART_CHOICES),
+        )
+    imaging_type, body_part = imaging_clarity_result
+    requests_flow_active = False
+    return (
+        f"One moment while I pull that up. (pause) I see your imaging "
+        f"order is for a {imaging_type} of the {body_part}. Is there "
+        f"anything else I can help you with today?"
+    )
+
+
+# ─────────────────────────────────────────────
+# 12. Fax an imaging order to an outside facility
+# ─────────────────────────────────────────────
+
+def _handle_imaging_fax(message, message_lower):
+    global imaging_fax_stage, imaging_fax_facility_name
+    global imaging_fax_number, requests_flow_active
+
+    if imaging_fax_stage is None:
+        # The caller may already have named the facility in this very turn
+        # ("...sent to Beachside Imaging"). Asking for the name again was
+        # the UAT failure, so capture it and go straight to the fax
+        # number/address question.
+        facility = _facility_named_in_message(message)
+        if facility:
+            imaging_fax_facility_name = facility
+            imaging_fax_stage = "ask_fax_or_address"
+            return (
+                "I can get that faxed over for you. Do you have the "
+                "facility's fax number? If not, do you have the address "
+                "of the facility so I can look up the fax number?"
+            )
+        imaging_fax_stage = "ask_facility"
+        return "Sure, what is the name of the facility this should be faxed to?"
+
+    if imaging_fax_stage == "ask_facility":
+        imaging_fax_facility_name = message.strip()
+        imaging_fax_stage = "ask_fax_or_address"
+        return (
+            f"Thank you. Can I get a good fax number for "
+            f"{imaging_fax_facility_name}? If you don't know the fax "
+            f"number, you can give me the address instead and I can "
+            f"look it up."
+        )
+
+    if imaging_fax_stage == "ask_fax_or_address":
+        fax = _extract_phone(message)
+        if fax:
+            imaging_fax_number = fax
+            imaging_fax_stage = "complete"
+            requests_flow_active = False
+            return (
+                f"Perfect, I'll fax the imaging order to "
+                f"{imaging_fax_facility_name} at {fax}. Is there "
+                f"anything else I can help you with today?"
+            )
+        if _looks_like_address(message_lower):
+            imaging_fax_stage = "complete"
+            requests_flow_active = False
+            return (
+                f"Thank you, I've located the fax number for that "
+                f"address and will fax the imaging order to "
+                f"{imaging_fax_facility_name}. Is there anything else I "
+                f"can help you with today?"
+            )
+        return (
+            "Can you provide a fax number, or the address so I can "
+            "look up the fax number?"
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# 13. Critical lab result (lab representative call)
+# ─────────────────────────────────────────────
+# Per spec: the medical assistant is available 100% of the time for
+# this - there is no "MA unavailable" branch to build. One-shot,
+# immediate connection.
+
+def _handle_critical_lab(message, message_lower):
+    global critical_lab_reported, requests_flow_active
+    critical_lab_reported = True
+    requests_flow_active = False
+    return (
+        "Thank you for letting us know right away. I'm connecting you "
+        "with our medical assistant now - please hold."
+    )
+
+
+# ─────────────────────────────────────────────
+# Main dispatcher
+# ─────────────────────────────────────────────
+
+_WORKFLOW_HANDLERS = {
+    "critical_lab": _handle_critical_lab,
+    "practice_manager": _handle_practice_manager,
+    "total_care": _handle_total_care,
+    "patient_prior_auth": _handle_patient_prior_auth,
+    "prior_auth": _handle_prior_auth,
+    "life_insurance": _handle_life_insurance,
+    "hh_decline": _handle_hh_decline,
+    "hh_follow": _handle_hh_follow,
+    "hh_instructions": _handle_hh_instructions,
+    "samples": _handle_medication_samples,
+    "imaging_request": _handle_imaging_request,
+    "lab_order_request": _handle_lab_order_request,
+    "imaging_clarity": _handle_imaging_clarity,
+    "imaging_fax": _handle_imaging_fax,
+}
+
+
+def handle_requests_flow(message, message_lower):
+    """Main entry point for app.py. Call only when requests_flow_active
+    is True (set by app.py after detect_any_request_intent() fires) or
+    when a fresh intent is detected on this turn. Returns a response
+    string, or None if the current stage intentionally hands off to
+    app.py's own logic (imaging/lab 'offer appointment' acceptance)."""
+    global requests_flow_active, requests_active_workflow
+
+    if not requests_active_workflow:
+        return None
+    handler = _WORKFLOW_HANDLERS.get(requests_active_workflow)
+    if handler is None:
+        requests_flow_active = False
+        requests_active_workflow = None
+        return None
+    response = handler(message, message_lower)
+    if response is None:
+        # Handler intentionally handed off (e.g. imaging/lab
+        # appointment acceptance) - clear our own state so app.py's
+        # own flow owns the rest of the conversation cleanly.
+        requests_flow_active = False
+        requests_active_workflow = None
+    return response
+
+
+# ─────────────────────────────────────────────
+# Context builder for LLM injection (consistency with Sprint13/Sprint14;
+# unused today since every branch above returns a response directly)
+# ─────────────────────────────────────────────
+
+def build_context():
+    if not requests_flow_active or not requests_active_workflow:
+        return ""
+    context = "MISC_REQUEST_WORKFLOW INJECTED BY SYSTEM:\n"
+    context += f"Active workflow: {requests_active_workflow}\n"
+    context += (
+        "This workflow is handled deterministically by Python. Do NOT "
+        "improvise - follow the Python-generated response for this "
+        "turn.\n"
+    )
+    return context
