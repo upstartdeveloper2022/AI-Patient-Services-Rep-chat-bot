@@ -4464,6 +4464,12 @@ CONVERSATION_CLOSING_PHRASES = [
     "no i don't need anything else", "no i do not need anything else",
     "have a good day", "have a great day",
     "no you have been very helpful", "you have been very helpful",
+    # Bare refusals of the offer ("Not really" / "No, not really") are
+    # whole-message closes too, and were missing from both the phrase list
+    # and the peel-one-negative rule because "not really" carries its own
+    # negative. Listed explicitly; exact-match keeps "Not really, I need
+    # a referral" from being swallowed.
+    "not really", "no not really", "nope not really",
     "no you've been very helpful", "you've been very helpful",
     "no you have been so helpful", "you have been so helpful",
     "no you were very helpful", "you were very helpful",
@@ -4473,6 +4479,25 @@ CONVERSATION_CLOSING_PHRASES = [
     "thank you for all your help", "no thank you for all your help",
     "thanks for your help", "no thanks for your help",
     "thanks for all your help", "no thanks for all your help",
+    # "No, that's all I needed thank you for your help." - the transcript's
+    # sign-off. The "that's all" family and the "thank you for your help"
+    # family were both listed, but never this compound, and the whole
+    # message must match one entry exactly, so the close fell through to
+    # the LLM and returned the connection-failure fallback instead of a
+    # farewell.
+    "that's all i needed", "thats all i needed",
+    "that is all i needed", "no that's all i needed",
+    "no thats all i needed", "no that is all i needed",
+    "that's all i needed thank you for your help",
+    "thats all i needed thank you for your help",
+    "that is all i needed thank you for your help",
+    "no that's all i needed thank you for your help",
+    "no thats all i needed thank you for your help",
+    "no that is all i needed thank you for your help",
+    "that's all i needed thanks for your help",
+    "thats all i needed thanks for your help",
+    "no that's all i needed thanks for your help",
+    "no thats all i needed thanks for your help",
     "no that's all you've been very helpful",
     "no that is all you have been very helpful",
     "that's all you've been very helpful",
@@ -4537,6 +4562,35 @@ _CONVERSATION_CLOSING_PHRASES_CANONICAL = frozenset(
     _canonical_closing_phrase(phrase) for phrase in CONVERSATION_CLOSING_PHRASES
 )
 
+# A closing sign-off is a negative particle, optionally followed by a
+# gratitude tail, and callers combine the two freely: "No that's all
+# thank you", "Nope, nothing else", "Nothing else thanks". The phrase
+# list above enumerates each of those pieces, but the whole message has
+# to match one entry EXACTLY, so every combination outside the list fell
+# through to the LLM and came back as the connection-failure fallback
+# instead of a farewell.
+#
+# Rather than keep enumerating compounds, peel one leading negative and
+# one trailing gratitude clause and re-test what remains against the
+# same exact-match list. This stays a whole-message test: the leftover
+# must still be a complete known close, so "No, actually I need a
+# referral" cannot match (its remainder is not in the list).
+_CLOSING_NEGATIVE_PREFIXES = (
+    "no", "nope", "not really", "no not really",
+)
+_CLOSING_GRATITUDE_SUFFIXES = (
+    "thank you so much", "thanks so much",
+    "thank you very much", "thanks very much",
+    "thank you for all your help", "thanks for all your help",
+    "thank you for your help", "thanks for your help",
+    "thank you a lot", "thanks a lot",
+    "thank you", "thanks",
+)
+
+
+def _matches_known_closing(canonical):
+    return canonical in _CONVERSATION_CLOSING_PHRASES_CANONICAL
+
 
 def is_conversation_closing_reply(message_lower):
     """Returns True only if the ENTIRE message, after stripping
@@ -4547,11 +4601,37 @@ def is_conversation_closing_reply(message_lower):
     between them is the only difference) without needing every punctuated
     variant spelled out separately, while still refusing to match a
     longer reply that merely starts with "no" but continues into a new
-    request."""
-    return (
-        _canonical_closing_phrase(message_lower)
-        in _CONVERSATION_CLOSING_PHRASES_CANONICAL
-    )
+    request.
+
+    A single leading negative particle ("No", "Nope") and a single
+    trailing gratitude clause ("thank you", "thanks so much") are peeled
+    and the remainder re-tested, so "No that's all thank you" and "Nope,
+    nothing else" are recognized as closes even though neither compound
+    is spelled out in CONVERSATION_CLOSING_PHRASES. The remainder must
+    still match a known close exactly, so a continuation that begins with
+    a negative ("No, actually I need a referral") is still rejected."""
+    canonical = _canonical_closing_phrase(message_lower)
+    if _matches_known_closing(canonical):
+        return True
+
+    for prefix in _CLOSING_NEGATIVE_PREFIXES:
+        if not canonical.startswith(prefix + " "):
+            continue
+        remainder = canonical[len(prefix) + 1:]
+        if _matches_known_closing(remainder):
+            return True
+        for suffix in _CLOSING_GRATITUDE_SUFFIXES:
+            if not remainder.endswith(" " + suffix):
+                continue
+            if _matches_known_closing(remainder[: -(len(suffix) + 1)]):
+                return True
+
+    for suffix in _CLOSING_GRATITUDE_SUFFIXES:
+        if canonical.endswith(" " + suffix):
+            if _matches_known_closing(canonical[: -(len(suffix) + 1)]):
+                return True
+
+    return False
 
 
 def active_speaker_first_name():
@@ -4667,9 +4747,18 @@ def _extract_med_pro_patient_name(message):
     # "dob"/"date of birth" token. Mirrors Sprint16's DOB-guarded
     # "_PATIENT_FOR_NAME_PATTERN" - the dob adjacency makes this a
     # precise signal, so "for the referral"/"for Dr Foster" cannot match.
+    # The gap before the DOB token is optional, not empty: reps routinely
+    # insert the possessive and a comma ("...about Bob Howard, HIS date
+    # of birth is 9/9/1945"). Requiring zero words between the name and
+    # the DOB token missed that whole phrasing, so aggressive_name_
+    # extraction's earlier "patient of Dr." match ("a patient of Dr.
+    # Brooks") won instead and Steve re-asked for a name the rep had
+    # already given. Bounded to a comma plus an optional possessive so
+    # this stays as precise as before.
     dense = re.search(
         r"(?:for|about)\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)"
-        r"\s+(?:dob|date\s+of\s+birth)\b",
+        r"(?:\s*,)?(?:\s+(?:his|her|their))?\s*"
+        r"(?:dob|date\s+of\s+birth)\b",
         message, re.IGNORECASE,
     )
     if dense and _is_med_pro_patient_name(dense.group(1), dense.group(2)):
@@ -8355,6 +8444,50 @@ def chat():
             if check_response_time_stated(_s17_response):
                 response_time_stated = True
             return jsonify({"response": _s17_response})
+        # handle_requests_flow returned None, so it has released
+        # requests_flow_active. A completed workflow can deliberately hold
+        # that flag True to stay dispatchable for a same-subject
+        # escalation (samples - "make that message high priority"), and
+        # while it was held BOTH recapture sites above/below were skipped,
+        # because each is gated on "not requests_flow_active". The new
+        # request therefore reached the completed handler, got None, and
+        # fell through to the LLM instead of being routed. Retry the
+        # capture once now that the flag is actually free.
+        if not Sprint17.requests_flow_active:
+            _s17_retry = Sprint17.detect_any_request_intent(message_lower)
+            if (
+                    _s17_retry in Sprint17.PATIENT_WORKFLOWS
+                    and not is_medical_professional_caller
+                    and not is_medical_professional_message(user_message, message_lower)
+                    and not acute_same_day_established
+                    and not new_patient_flow_active
+                    and not Sprint13.phf_flow_active and not Sprint13.phf_intent_detected
+                    and not Sprint14.wellness_flow_active
+                    and not Sprint14.wellness_intent_detected
+                    and not Sprint14.refill_intent_detected
+                    and not Sprint14.lab_order_intent_detected
+                    and not Sprint16.fax_flow_active and not Sprint16.fax_intent_detected
+            ):
+                Sprint17.requests_active_workflow = _s17_retry
+                Sprint17.requests_flow_active = True
+                _s17_retry_response = Sprint17.handle_requests_flow(user_message, message_lower)
+                if _s17_retry_response is not None:
+                    conversation_history.append({"role": "user", "content": user_message})
+                    conversation_history.append({"role": "assistant", "content": _s17_retry_response})
+                    if check_response_time_stated(_s17_retry_response):
+                        response_time_stated = True
+                    return jsonify({"response": _s17_retry_response})
+            if _s17_retry in Sprint17.EXTERNAL_WORKFLOWS and not (
+                    pre_chart_complete and caller_is_patient):
+                Sprint17.requests_active_workflow = _s17_retry
+                Sprint17.requests_flow_active = True
+                _s17_retry_response = Sprint17.handle_requests_flow(user_message, message_lower)
+                if _s17_retry_response is not None:
+                    conversation_history.append({"role": "user", "content": user_message})
+                    conversation_history.append({"role": "assistant", "content": _s17_retry_response})
+                    if check_response_time_stated(_s17_retry_response):
+                        response_time_stated = True
+                    return jsonify({"response": _s17_retry_response})
         # Flow handed off to the standard FUTURE appointment scheduling
         # (imaging request, provider not aware, patient accepted an
         # appointment). Restate the request so the normal scheduling
@@ -10253,11 +10386,33 @@ def chat():
     # merely starts with "no" but continues into a new request (e.g.
     # "No, actually I have another question") correctly falls through
     # unchanged instead of prematurely ending the call.
+    #
+    # Sprint17 external-caller closing fix: this block used to require
+    # `not is_medical_professional_caller`, which excluded EVERY medical-
+    # professional caller. That exclusion predates the Sprint17
+    # external-caller workflows (prior auth from an insurer, home-health
+    # decline/follow-up, DME/pharmacy callbacks), all of which are med-pro
+    # callers that end with Steve's own "anything else" question. Their
+    # closing turn ("No. Thank you for your help.") matched no deterministic
+    # branch and fell through to the LLM - observed answering
+    # GROQ_SAFE_FALLBACK ("I'm having trouble connecting to our system")
+    # instead of a farewell. The caller TYPE is the wrong discriminator: what
+    # this block must not steal is a med-pro SUB-FLOW that owns its own
+    # closing turn (a DME/fax/pharmacy callback turn with its own scripted
+    # close), which is now excluded by flag instead. Sprint17's flows clear
+    # requests_flow_active before this block, so their completed turns are
+    # untouched.
 
     if (
             pre_chart_complete and not Sprint13.phf_flow_active
-            and not is_medical_professional_caller
             and not new_patient_flow_active
+            and not med_pro_dme_order_pending
+            and not med_pro_dme_callback_pending
+            and not med_pro_dme_fax_pending
+            and not med_not_in_stock_callback_pending
+            and med_pro_speak_stage is None
+            and not outside_provider_insurance_responded
+            and not Sprint17.requests_flow_active
     ):
         last_assistant_offered_closing = False
         for turn in reversed(conversation_history):
