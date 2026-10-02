@@ -4,7 +4,7 @@ requests.py — Miscellaneous Patient Services Request Workflows
 Covers 12 UAT-checklist request types that don't belong in the PHF
 (Sprint13) or Wellness/MAW/CHA (Sprint14) workflows:
 
-  1.  Practice Manager complaint/compliment (Tiffany Crosby)
+  1.  Practice Manager complaint/compliment (Monica Caldwell)
   2.  Transfer to Total Care for a car/automobile accident
   3.  Prior authorization request from an insurance company rep
   4.  Life insurance rep following up on a disability claim
@@ -58,17 +58,17 @@ from datetime import datetime
 # Constants
 # ─────────────────────────────────────────────
 
-PRACTICE_MANAGER_NAME = "Tiffany Crosby"
-PRACTICE_MANAGER_FIRST_NAME = "Tiffany"
+PRACTICE_MANAGER_NAME = "Monica Caldwell"
+PRACTICE_MANAGER_FIRST_NAME = "Monica"
 TOTAL_CARE_NAME = "Total Care"
 
 PHONE_PATTERN = re.compile(r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b')
 
 # ── 1. Practice Manager ──
 PRACTICE_MANAGER_TRIGGERS = [
-    "practice manager", "speak to tiffany", "talk to tiffany",
-    "speak with tiffany", "talk with tiffany", "tiffany crosby",
-    "ms. crosby", "ms crosby", "mrs. crosby", "mrs crosby",
+    "practice manager", "speak to Monica", "talk to Monica",
+    "speak with Monica", "talk with Monica", "Monica Caldwell",
+    "ms. Caldwell", "ms Caldwell", "mrs. Caldwell", "mrs Caldwell",
     "speak to the manager", "talk to the manager",
     "speak with the manager", "talk with the manager",
     "speak to management", "file a complaint", "file a compliment",
@@ -118,13 +118,55 @@ HOME_HEALTH_DECLINE_TRIGGERS = [
     "cannot accept your patient", "unable to accept your patient",
 ]
 
+# The same decline is often phrased without the word "accept" ("we are
+# unable to take Mr. Howard on as a patient"), so the substring list above
+# misses it and the turn fell through to the LLM, which improvised a
+# finished-message + 72-hour reply. This pattern covers the "on as a
+# patient" family; the base "home health" context word is still required
+# by detect_home_health_decline().
+_HH_DECLINE_ONBOARDING_PATTERN = re.compile(
+    r"\b(?:not\s+able\s+to|unable\s+to|cannot|can't|won'?t\s+be\s+able\s+to|"
+    r"will\s+not\s+be\s+able\s+to)\s+"
+    r"(?:take|taking|accept|accepting|see|seeing|manage|managing|keep)\b"
+    r"(?:\s+on\s+as\s+(?:a|an|our|your|the)\s+|\s+as\s+(?:a|an|our|your|the)\s+)?"
+    r"(?:\s+[\w'\.]+){0,6}?"
+    r"\s*(?:new\s+|this\s+|the\s+)*patients?\b"
+)
+
+# "the patient has already been referred to loving hands home health, ..."
+_HH_REFERRAL_AGENCY_PATTERN = re.compile(
+    r"referred\s+(?:them|him|her|the\s+patient|this\s+patient|"
+    r"the\s+person)?\s*(?:out\s+|over\s+|else\s+)?to\s+"
+    r"(?P<agency>[^,.;?!]+)",
+    re.IGNORECASE,
+)
+
 HOME_HEALTH_FOLLOW_TRIGGERS = [
     "will the provider follow", "will the doctor follow",
     "follow the patient for home health", "follow for home health",
     "continue to follow this patient", "will follow the patient",
     "provider willing to follow", "pcp follow the patient",
     "physician follow the patient",
+    "follow this patient", "will follow this patient",
+    "follow him for home health", "follow her for home health",
 ]
+
+# The same follow-up request is often phrased with a demonstrative or
+# pronoun object, which the substring list above misses: "will Dr.
+# Rodriguez follow THIS patient for home health" contains neither "follow
+# for home health" nor "follow the patient for home health", so
+# detect_home_health_follow() returned False and the turn fell through to
+# the LLM, which improvised its own callback-and-close wording. This
+# pattern covers the "follow <object> for home health" family; the base
+# "home health" context word is still required by
+# detect_home_health_follow().
+_HH_FOLLOW_FOR_PATTERN = re.compile(
+    r"\b(?:follow|following|continue\s+to\s+follow|keep\s+following|"
+    r"see|seeing)\s+"
+    r"(?:him|her|them|this\s+patient|that\s+patient|the\s+patient|"
+    r"(?:mr|mrs|ms|miss|dr)\.?\s+[\w'\.]+)?\s*"
+    r"for\s+home\s+health\b"
+)
 
 HOME_HEALTH_INSTRUCTIONS_TRIGGERS = [
     "written instructions", "need instructions to treat",
@@ -132,6 +174,22 @@ HOME_HEALTH_INSTRUCTIONS_TRIGGERS = [
     "need orders to treat", "instructions on how to treat",
     "orders to treat the patient", "care instructions for the patient",
 ]
+
+# The same written-instructions request is often qualified by the KIND of
+# care between "written" and "instructions" ("written WOUND-CARE
+# instructions", "written medication instructions"), so none of the fixed
+# substrings above match and detect_home_health_instructions() returned
+# False. The whole turn then fell to the LLM, which improvised its own
+# request/priority/deadline wording and, once Groq rate-limited, answered
+# the caller's deadline with the connection-failure fallback. This pattern
+# allows up to two qualifier words between the modifier and
+# "instructions"/"orders"; the base "home health" context word is still
+# required by detect_home_health_instructions().
+_HH_INSTRUCTIONS_PATTERN = re.compile(
+    r"\b(?:written|verbal|updated|revised|formal|home\s+health)\s+"
+    r"(?:\w+[\s\-]\s*){0,2}"
+    r"(?:instructions?|orders?)\b"
+)
 
 # ── 8. Medication samples inquiry ──
 MEDICATION_SAMPLES_TRIGGERS = [
@@ -335,9 +393,12 @@ hh_follow_stage = None  # "ask_contact" -> "complete"
 hh_follow_contact_number = None
 
 # 7. Home health nurse - written instructions
-hh_instructions_stage = None  # "check_ma" -> "ask_contact" (if unavailable) -> "complete"
+# "check_ma" -> "ask_contact" (if unavailable) -> "ask_deadline" -> "ask_contact" -> "complete"
+hh_instructions_stage = None
 hh_instructions_ma_available = None
 hh_instructions_contact_number = None
+hh_instructions_deadline = None
+hh_instructions_high_priority = False
 
 # 8. Medication samples
 samples_stage = None  # "ask_contact" -> "complete" (escalation handled on complete)
@@ -384,6 +445,7 @@ def reset_state():
     global hh_decline_stage, hh_decline_contact_number
     global hh_follow_stage, hh_follow_contact_number
     global hh_instructions_stage, hh_instructions_ma_available, hh_instructions_contact_number
+    global hh_instructions_deadline, hh_instructions_high_priority
     global samples_stage, samples_contact_number
     global imaging_stage, imaging_reason, imaging_provider_aware
     global imaging_provider_name, imaging_contact_number
@@ -424,6 +486,8 @@ def reset_state():
     hh_instructions_stage = None
     hh_instructions_ma_available = None
     hh_instructions_contact_number = None
+    hh_instructions_deadline = None
+    hh_instructions_high_priority = False
     samples_stage = None
     samples_contact_number = None
     imaging_stage = None
@@ -579,23 +643,31 @@ def detect_life_insurance_disability(message_lower):
 
 
 def detect_home_health_decline(message_lower):
-    return (
-        _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
-        and _contains_any(message_lower, HOME_HEALTH_DECLINE_TRIGGERS)
+    if not _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS):
+        return False
+    return bool(
+        _contains_any(message_lower, HOME_HEALTH_DECLINE_TRIGGERS)
+        or _HH_DECLINE_ONBOARDING_PATTERN.search(message_lower)
     )
 
 
 def detect_home_health_follow(message_lower):
-    return (
+    return bool(
         _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
-        and _contains_any(message_lower, HOME_HEALTH_FOLLOW_TRIGGERS)
+        and (
+            _contains_any(message_lower, HOME_HEALTH_FOLLOW_TRIGGERS)
+            or _HH_FOLLOW_FOR_PATTERN.search(message_lower)
+        )
     )
 
 
 def detect_home_health_instructions(message_lower):
-    return (
+    return bool(
         _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
-        and _contains_any(message_lower, HOME_HEALTH_INSTRUCTIONS_TRIGGERS)
+        and (
+            _contains_any(message_lower, HOME_HEALTH_INSTRUCTIONS_TRIGGERS)
+            or _HH_INSTRUCTIONS_PATTERN.search(message_lower)
+        )
     )
 
 
@@ -839,13 +911,52 @@ def detect_any_request_intent(message_lower):
 # 1. Practice Manager complaint/compliment
 # ─────────────────────────────────────────────
 
+# Words that carry no information about WHAT a complaint or compliment is
+# about - politeness, the request verb, and the topic noun itself. Used
+# only to decide whether the caller volunteered the substance of their
+# message (see _pm_caller_stated_reason); they are stripped from the
+# caller's text, never echoed back.
+_PM_BOILERPLATE_PATTERN = re.compile(
+    r"\b(?:i|i'?d|i'?m|me|my|we|our|us|would|like|to|want|wish|need|"
+    r"please|could|can|may|might|will|shall|file|make|making|lodge|give|"
+    r"leave|send|talk|speak|with|about|a|an|the|and|for|of|there|is|it|"
+    r"that|this|get|in|have|has|had|do|does|did|you|your|are|am|was|were|"
+    r"be|been|so|if|or|at|up|out|now|also|just|really|still|when|"
+    r"someone|somebody|complain|complaint|complaints|compliment|"
+    r"compliments|practice|manager|monica|caldwell|ms|mrs|mr|office|"
+    r"front|desk|staff|call|calling|connect|put|let|any|one|"
+    r"something|anything|going|hope|feel|think|know|see)\b"
+)
+_PM_NON_WORD_PATTERN = re.compile(r"[^a-z0-9]+")
+
+
+def _pm_caller_stated_reason(message_lower):
+    """True when a complaint/compliment message carries actual substance,
+    not just the topic.
+
+    The shortcut below used to fire on the mere PRESENCE of the word
+    "complaint"/"compliment", so "I would like to file a complaint with
+    the manager" was treated as a fully-stated reason: Steve asked
+    straight for a callback number and never learned what the message was
+    about. Monica then receives a message that says only "the patient
+    called about a complaint", which is exactly the note she needs the
+    details to act on.
+
+    Strip the politeness/boilerplate scaffolding ("I would like to file
+    a complaint with the manager") and look for real content words
+    ("about the rude front desk staff"). Content words present means the
+    caller said what it is about, so the shortcut is safe."""
+    stripped = _PM_BOILERPLATE_PATTERN.sub(" ", message_lower)
+    return bool([word for word in _PM_NON_WORD_PATTERN.split(stripped) if word])
+
+
 def _handle_practice_manager(message, message_lower):
     global pm_stage, pm_reason, pm_availability_determined, pm_available
     global pm_callback_number, requests_flow_active
 
     if pm_stage is None and (
             "complaint" in message_lower or "compliment" in message_lower
-    ):
+    ) and _pm_caller_stated_reason(message_lower):
         # The caller already stated the reason - do not ask again.
         pm_reason = message.strip()
         pm_availability_determined = True
@@ -868,6 +979,23 @@ def _handle_practice_manager(message, message_lower):
 
     if pm_stage is None:
         pm_stage = "ask_reason"
+        # The caller named the topic ("file a complaint with the manager")
+        # without saying what it is about. Ask for the substance BEFORE
+        # the callback number, so the note Monica receives actually
+        # describes the issue - otherwise she gets a message she cannot
+        # act on.
+        if (
+                "complaint" in message_lower
+                or "compliment" in message_lower
+        ):
+            return (
+                f"I'd be happy to help with that. {PRACTICE_MANAGER_FIRST_NAME} "
+                f"is going to want to know what the nature of the "
+                f"{'complaint' if 'complaint' in message_lower else 'compliment'} "
+                f"is. Could you give me details about the "
+                f"{'complaint' if 'complaint' in message_lower else 'compliment'} "
+                f"please?"
+            )
         return (
             f"I'd be happy to connect you with our Practice Manager, "
             f"{PRACTICE_MANAGER_NAME}. May I ask the reason for your call?"
@@ -989,8 +1117,8 @@ def _handle_prior_auth(message, message_lower):
         requests_flow_active = False
         return (
             "Thank you, I've put in a message with that information for "
-            "the provider to complete the prior authorization. Have a "
-            "great day."
+            "the provider to complete the prior authorization. Is there "
+            "anything else I can help you with today?"
         )
 
     return None
@@ -1094,17 +1222,17 @@ def _handle_patient_prior_auth(message, message_lower):
         )
         pa_patient_stage = "complete"
         requests_flow_active = False
-        detail = ""
-        if pa_patient_insurance or pa_patient_medication:
-            detail = (
-                f" noting that "
-                f"{pa_patient_insurance or 'your insurance'} requires a "
-                f"prior authorization"
-                f"{' for your ' + pa_patient_medication if pa_patient_medication else ''}"
-            )
+        # Do NOT re-read the payer/drug back here. The message was already
+        # stated in full on the previous turn, so repeating it added
+        # nothing; what the patient still needs is the processing window
+        # and an open-ended close (same shape as app.py's
+        # handle_medication_order_destination), not a hard "have a great
+        # day" sign-off that ended the call before Steve asked whether
+        # anything else was needed.
         return (
-            f"Thank you, I've put in a message with that information"
-            f"{detail}. Have a great day."
+            "Thank you. I have put in a message. Please allow up to 72 "
+            "business hours for processing. Is there anything else that I "
+            "can help you with?"
         )
 
     return None
@@ -1144,7 +1272,8 @@ def _handle_life_insurance(message, message_lower):
         requests_flow_active = False
         return (
             "Thank you, I've put in a message with that information for "
-            "the provider. Have a great day."
+            "the provider. Is there anything else I can help you with "
+            "today?"
         )
 
     return None
@@ -1154,15 +1283,111 @@ def _handle_life_insurance(message, message_lower):
 # 5. Home health - cannot accept patient (referred elsewhere)
 # ─────────────────────────────────────────────
 
+def _hh_decline_patient_label():
+    """The patient's full name for the decline reply, from the identity the
+    med-pro caller already gave. Falls back to neutral wording rather than
+    inventing or mis-naming a patient."""
+    try:
+        import app as _app
+        first = getattr(_app, "med_pro_patient_first", None)
+        last = getattr(_app, "med_pro_patient_last", None)
+        if not first:
+            first = getattr(_app, "patient_first_name", None)
+        if not last:
+            last = getattr(_app, "patient_last_name", None)
+    except Exception:
+        first = last = None
+    full = f"{first} {last}".strip() if first else None
+    return full or "the patient"
+
+
+def _hh_decline_pronoun(message):
+    """The caller's own pronoun for the patient. Checks this turn's wording
+    (including the "Mr."/"Mrs."/"Ms." honorific) first, then the last few
+    caller turns, and never guesses when nothing is known."""
+    def _from_text(text):
+        if not text:
+            return None
+        low = text.lower()
+        if re.search(r"\b(?:mrs\.?|ms\.)\b", low):
+            return "she"
+        if re.search(r"\bmr\.?\b", low):
+            return "he"
+        if re.search(r"\b(?:he|his|him|himself)\b", low):
+            return "he"
+        if re.search(r"\b(?:she|her|hers|herself)\b", low):
+            return "she"
+        return None
+
+    found = _from_text(message)
+    if found:
+        return found
+    try:
+        import app as _app
+        prior_user_turns = [
+            turn.get("content", "")
+            for turn in getattr(_app, "conversation_history", [])
+            if turn.get("role") == "user"
+        ]
+    except Exception:
+        prior_user_turns = []
+    for prior in reversed(prior_user_turns[-5:]):
+        found = _from_text(prior)
+        if found:
+            return found
+    return "they"
+
+
+def _hh_decline_agency(message):
+    """The home-health agency the patient was already referred to, in the
+    caller's own words. Returns neutral wording when the caller only said
+    "another home health" with no agency name."""
+    match = _HH_REFERRAL_AGENCY_PATTERN.search(message)
+    if not match:
+        return None
+    agency = match.group("agency").strip()
+    agency = re.split(
+        r"\b(?:and|but|so|because|which|who|that|they|we|since|as)\b",
+        agency,
+    )[0].strip()
+    agency = re.sub(r"\s+", " ", agency)
+    if not agency:
+        return None
+    lowered = agency.lower()
+    if re.match(
+        r"^(?:an?|the|other|some)?\s*(?:different|other|another)?\s*"
+        r"(?:home\s+health|home\s+health\s+agency|home\s+health\s+provider"
+        r"|agency|provider|company)\b",
+        lowered,
+    ) or not re.search(r"[a-z]", lowered):
+        return "another home health agency"
+    # Title-case only fully-lowercase words so an agency the caller already
+    # capitalized partially ("St. Mary's") is preserved.
+    words = []
+    for word in agency.split(" "):
+        core = re.sub(r"[^A-Za-z]", "", word)
+        if core and any(ch.isupper() for ch in word[1:]):
+            words.append(word)
+        elif core:
+            words.append(word[0].upper() + word[1:].lower())
+        else:
+            words.append(word)
+    return " ".join(words)
+
+
 def _handle_hh_decline(message, message_lower):
     global hh_decline_stage, hh_decline_contact_number, requests_flow_active
 
     if hh_decline_stage is None:
         hh_decline_stage = "ask_contact"
+        patient = _hh_decline_patient_label()
+        pronoun = _hh_decline_pronoun(message)
+        agency = _hh_decline_agency(message) or "another home health agency"
         return (
-            "Thank you for letting us know. May I get a good contact "
-            "number in case the provider or medical assistant needs to "
-            "follow up?"
+            f"I am putting in a message that you are declining referral "
+            f"for {patient} because {pronoun} has already been referred "
+            f"to {agency}. What is a good number to reach you just in "
+            f"case the office has questions regarding this?"
         )
 
     if hh_decline_stage == "ask_contact":
@@ -1170,9 +1395,12 @@ def _handle_hh_decline(message, message_lower):
         hh_decline_contact_number = phone or message.strip()
         hh_decline_stage = "complete"
         requests_flow_active = False
+        # Open-ended close, NOT a "have a great day" sign-off: the workflow
+        # is done but the caller may have another reason for calling, and
+        # hard-closing here ended the call before Steve asked.
         return (
-            "Thank you, I've sent a message with that information. Have "
-            "a great day."
+            "Thank you, I've sent a message with that information. Is "
+            "there anything else I can help you with today?"
         )
 
     return None
@@ -1198,8 +1426,8 @@ def _handle_hh_follow(message, message_lower):
         hh_follow_stage = "complete"
         requests_flow_active = False
         return (
-            "Thank you, I've put in a message for the provider. Have a "
-            "great day."
+            "Thank you, I've put in a message for the provider. Is there "
+            "anything else I can help you with today?"
         )
 
     return None
@@ -1212,6 +1440,7 @@ def _handle_hh_follow(message, message_lower):
 def _handle_hh_instructions(message, message_lower):
     global hh_instructions_stage, hh_instructions_ma_available
     global hh_instructions_contact_number, requests_flow_active
+    global hh_instructions_deadline, hh_instructions_high_priority
 
     if hh_instructions_stage is None:
         hh_instructions_ma_available = _resolve_availability("STEVE_FORCE_HH_MA_AVAILABLE")
@@ -1223,23 +1452,64 @@ def _handle_hh_instructions(message, message_lower):
                 "now. Please hold while I transfer you."
             )
         hh_instructions_stage = "ask_contact"
+        # The request is a provider-facing clinical message, which this
+        # workflow has always notated at high priority; an explicit
+        # escalation turn below confirms it rather than changing it.
+        hh_instructions_high_priority = True
         return (
             "I'm sorry, the medical assistant is not available right "
             "now. May I get a good contact number for you?"
         )
 
     if hh_instructions_stage == "ask_contact":
+        # The caller asked for this message to be made HIGH PRIORITY rather
+        # than giving the number we asked for. That is an escalation of the
+        # message that already exists, so the flow must retain the request
+        # and its urgency and ask for the deadline instead of filing the
+        # sentence as the contact number and closing. Previously this turn
+        # matched nothing, the flow lost ownership, and the caller's
+        # deadline answer reached the LLM.
+        if detect_priority_escalation(message_lower):
+            hh_instructions_high_priority = True
+            hh_instructions_stage = "ask_deadline"
+            return (
+                "I can mark the message as high priority for the provider. "
+                "When will the wound-care instructions be needed?"
+            )
         phone = _extract_phone(message)
         hh_instructions_contact_number = phone or message.strip()
         hh_instructions_stage = "complete"
         requests_flow_active = False
+        return _hh_instructions_close()
+
+    if hh_instructions_stage == "ask_deadline":
+        # The caller answered "by tomorrow morning". Capture it verbatim as
+        # the urgency deadline and go back for the callback number, keeping
+        # request + priority + deadline + number on one message.
+        hh_instructions_deadline = message.strip().rstrip(".?!, ")
+        hh_instructions_stage = "ask_contact"
         return (
-            "Thank you. I've put in a high priority message - please "
-            "allow up to 24 business hours for this to be processed. "
-            "Have a great day."
+            f"Thank you, I've noted the deadline. What is the best contact "
+            f"number for the office to reach you?"
         )
 
     return None
+
+
+def _hh_instructions_close():
+    """Confirmation for the completed written-instructions request, keeping
+    only the details this call actually captured."""
+    parts = ["Thank you. I've put in a message"]
+    if hh_instructions_high_priority:
+        parts.append(" and marked it high priority")
+    reply = "".join(parts) + " for the provider."
+    if hh_instructions_deadline:
+        reply += f" I've noted the deadline you gave: {hh_instructions_deadline}."
+    reply += (
+        " Please allow up to 24 business hours for this to be processed. Is "
+        "there anything else I can help you with today?"
+    )
+    return reply
 
 
 # ─────────────────────────────────────────────
@@ -1273,8 +1543,8 @@ def _handle_medication_samples(message, message_lower):
         # NOT an escalation returns None, which releases the flow (see
         # handle_requests_flow) so nothing else is held back.
         return (
-            "Thank you, I've put in a message with that information. "
-            "Have a great day."
+            "Thank you, I've put in a message with that information. Is "
+            "there anything else I can help you with today?"
         )
 
     if samples_stage == "complete":
