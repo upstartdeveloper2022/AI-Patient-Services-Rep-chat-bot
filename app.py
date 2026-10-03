@@ -8304,6 +8304,19 @@ def chat():
     )
     if _s17_imaging_fax_turn:
         _fax_owns_turn = False
+    # Sprint 17 UAT: a future-tense heads-up that another office WILL fax a
+    # request for an order, and a transfer-to-medical-records request, are
+    # Sprint17 workflows (fax_notice / transfer_records), not Sprint16
+    # receipt inquiries. Both detectors exclude receipt-question wording.
+    if (
+            Sprint17.detect_incoming_fax_notice(message_lower)
+            or Sprint17.detect_records_transfer(message_lower)
+            or (
+                Sprint17.requests_flow_active
+                and Sprint17.requests_active_workflow == "fax_notice"
+            )
+    ):
+        _fax_owns_turn = False
     if (
             not Sprint16.fax_flow_active
             and not Sprint16.fax_intent_detected
@@ -8357,7 +8370,7 @@ def chat():
         if (
                 _s17_intent in Sprint17.PATIENT_WORKFLOWS
                 and not is_medical_professional_caller
-                and not is_medical_professional_message(user_message, message_lower)
+                and (_s17_intent == "wrong_office" or not is_medical_professional_message(user_message, message_lower))
                 and not acute_same_day_established
                 and not new_patient_flow_active
                 and not Sprint13.phf_flow_active and not Sprint13.phf_intent_detected
@@ -8495,8 +8508,9 @@ def chat():
         _s17_reason = Sprint17.pop_appointment_handoff_reason()
         if _s17_reason:
             user_message = (
-                f"I would like to schedule an appointment for an imaging "
-                f"order for {_s17_reason}"
+                f"I would like to schedule an appointment for "
+                f"{Sprint17.requests_appointment_handoff_label} "
+                f"for {_s17_reason}"
             )
             message_lower = user_message.lower()
 
@@ -8516,7 +8530,13 @@ def chat():
             and not Sprint14.wellness_flow_active
             and not Sprint16.fax_flow_active
             and not Sprint16.fax_intent_detected):
-        if is_medical_professional_message(user_message, message_lower):
+        if (
+                is_medical_professional_message(user_message, message_lower)
+                # Sprint 17 UAT: "I called the wrong doctor's office" contains
+                # the med-pro keyword "doctor's office" but is a wrong_office
+                # request from a caller, not a medical professional.
+                and not Sprint17.detect_wrong_office(message_lower)
+        ):
             is_medical_professional_caller = True
             pre_chart_complete = True
             if med_pro_call_topic is None:
@@ -8715,7 +8735,13 @@ def chat():
                 return jsonify(
                     {"response": med_substitution_callback_response}
                 )
-        elif detect_med_not_in_stock_substitution(message_lower):
+        elif (
+                detect_med_not_in_stock_substitution(message_lower)
+                or (
+                    Sprint17.detect_script_verification(message_lower)
+                    and not detect_speak_with_provider(message_lower)
+                )
+        ):
             med_not_in_stock_callback_pending = True
             med_substitution_response = (
                 "I'm going to put in a high priority phone message. "
