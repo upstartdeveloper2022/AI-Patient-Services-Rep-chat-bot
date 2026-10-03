@@ -648,7 +648,8 @@ LAB_WORK_TRIGGERS = [
     "thyroid test", "a1c", "glucose test", "cholesterol test",
     "complete blood count", "comprehensive metabolic",
     "basic metabolic", "order a test", "run some labs",
-    "run labs", "get some blood work", "get my blood drawn"
+    "run labs", "get some blood work", "get my blood drawn",
+    "fecal occult blood"
 ]
 
 # Nurse-visit triggers: services that are always performed in the office
@@ -3575,6 +3576,14 @@ def generate_last_visit_date(schedule_num):
 
 
 def is_six_month_followup_request(message_lower):
+    # Exclude messages that are requesting lab orders for follow-up appointments
+    # rather than scheduling the follow-up appointment itself
+    if any(
+        trigger in message_lower for trigger in LAB_WORK_TRIGGERS
+    ) or any(
+        phrase in message_lower for phrase in MEDICATION_ORDER_REQUEST_PHRASES
+    ):
+        return False
     return any(
         phrase in message_lower for phrase in [
             "6 month follow up", "6-month follow up",
@@ -3590,6 +3599,14 @@ def is_three_month_followup_request(message_lower):
     deliberately separate from is_six_month_followup_request() so the two
     flows never cross-trigger: a "3 month" phrase cannot match any of the
     six-month phrases above and vice versa."""
+    # Exclude messages that are requesting lab orders for follow-up appointments
+    # rather than scheduling the follow-up appointment itself
+    if any(
+        trigger in message_lower for trigger in LAB_WORK_TRIGGERS
+    ) or any(
+        phrase in message_lower for phrase in MEDICATION_ORDER_REQUEST_PHRASES
+    ):
+        return False
     return any(
         phrase in message_lower for phrase in [
             "3 month follow up", "3-month follow up",
@@ -3778,6 +3795,20 @@ def is_medication_order_request(message_lower):
     return True
 
 
+def is_direct_lab_order_request(message_lower):
+    """True for direct lab order requests like 'put in an order for a CBC'.
+    These should be handled deterministically with immediate confirmation,
+    not the interactive lab-work flow. Excludes controlled substances and
+    appointment scheduling requests."""
+    if not any(p in message_lower for p in MEDICATION_ORDER_REQUEST_PHRASES):
+        return False
+    if not any(trigger in message_lower for trigger in LAB_WORK_TRIGGERS):
+        return False
+    if detect_controlled_substance(message_lower):
+        return False
+    return True
+
+
 def handle_medication_order_request():
     """Deterministically notate a non-controlled medication order request
     and ask where the order should be sent."""
@@ -3786,6 +3817,17 @@ def handle_medication_order_request():
     return (
         "I will notate your request. Where would you like this order "
         "sent to?"
+    )
+
+
+def handle_direct_lab_order_request():
+    """Deterministically handle direct lab order requests with immediate
+    confirmation and 72 business hours processing time."""
+    # Get the patient's PCP from the collected state
+    pcp_name = get_patient_pcp_from_history() or "your primary care provider"
+    return (
+        f"I will put in a message to {pcp_name}'s team. "
+        "Please allow up to 72 business hours for processing. Is there anything else I can help you with?"
     )
 
 
@@ -13309,6 +13351,12 @@ def chat():
                 {"role": "assistant", "content": _med_order_reply}
             )
             return jsonify({"response": _med_order_reply})
+        if is_direct_lab_order_request(message_lower):
+            _lab_order_reply = handle_direct_lab_order_request()
+            conversation_history.append(
+                {"role": "assistant", "content": _lab_order_reply}
+            )
+            return jsonify({"response": _lab_order_reply})
 
     # ── Outside-provider insurance acceptance (LLM-fallback guard) ──
     # "I was referred to endocrinologist Dr. David Gilmore. Does he
