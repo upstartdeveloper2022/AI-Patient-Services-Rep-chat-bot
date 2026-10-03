@@ -849,11 +849,11 @@ def detect_imaging_fax(message_lower):
 # still gets the reason question.
 _IMAGING_REASON_STATED = re.compile(
     r"\b(?:"
-    r"found\s+nothing"
-    r"|nothing\s+(?:showed|was\s+found|came\s+up|on\s+it)"
-    r"|(?:is|was|are|were|seem(?:s|ed)?|look(?:s|ed)?)\s+"
+    r"found\s+nothing|showed\s+nothing|shows\s+nothing|showing\s+nothing"
+    r"|nothing\s+(?:showed|shows|showing|was\s+found|came\s+up|on\s+it)"
+    r"|(?:is|was|are|were|isn't|wasn't|aren't|weren't|seem(?:s|ed)?|look(?:s|ed)?)\s+"
     r"(?:normal|negative|clear|unremarkable|fine|good)"
-    r"|(?:n[o']t|never)\s+(?:show|find|reveal|see)\w*"
+    r"|(?:not|never|didn't|doesn't|isn't|wasn't|weren't)\s+(?:show|find|reveal|see)\w*"
     r"|already\s+(?:had|done|gotten|got|went|been)"
     r"|been\s+(?:hurting|aching|in\s+pain)"
     r"|hurt|hurts|hurting|ache|aches|aching|pain|painful|stiff|stiffness"
