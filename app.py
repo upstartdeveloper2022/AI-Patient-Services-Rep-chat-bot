@@ -853,7 +853,7 @@ MEDICAL_PROFESSIONAL_KEYWORDS = [
     "medical center", "health center", "home health",
     "nursing home", "assisted living", "rehabilitation",
     "specialist", "orthopedic", "cardiology", "neurology",
-    "dermatology", "urology", "oncology", "radiology",
+    "dermatology", "urology", "oncology",
     "gastroenterology", "endocrinology", "pulmonology",
     "rheumatology", "nephrology", "hematology",
     "ophthalmology", "otolaryngology", "psychiatry",
@@ -8345,6 +8345,20 @@ def chat():
         and Sprint17.detect_imaging_fax(message_lower)
     )
     if _s17_imaging_fax_turn:
+        _fax_owns_turn = False
+    # Similarly, a verified patient reporting a prior authorization
+    # requirement ("Anthem requires a prior authorization be sent...") is
+    # Sprint17's patient_prior_auth workflow. It matches Sprint16's
+    # doc-request lists because "prior authorization" is in _DOC_REQUEST_WORDS
+    # and "sent" is in _DOC_REQUEST_FRAMING, so handle_fax_flow would
+    # re-ask for the date of birth the patient already gave. Decline
+    # ownership here so Sprint17 can handle it.
+    _s17_prior_auth_turn = (
+        pre_chart_complete
+        and caller_is_patient
+        and Sprint17.detect_patient_prior_auth_request(message_lower)
+    )
+    if _s17_prior_auth_turn:
         _fax_owns_turn = False
     # Sprint 17 UAT: a future-tense heads-up that another office WILL fax a
     # request for an order, and a transfer-to-medical-records request, are
