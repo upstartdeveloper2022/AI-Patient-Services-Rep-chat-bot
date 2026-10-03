@@ -220,9 +220,10 @@ _PRIORITY_ESCALATION_TARGETS = [
 # x-ray/imaging vocabulary is unclaimed elsewhere in the codebase.
 IMAGING_ORDER_TRIGGERS = [
     "xray", "x-ray", "x ray", "mri", "ct scan", "cat scan", "pet scan",
-    "calcium score", "ultrasound", "imaging order", "imaging request",
+    "calcium score", "ultrasound", "mammogram", "mammography",
+    "imaging order", "imaging request",
     "order for an mri", "order for a ct", "order for an x-ray",
-    "order for an ultrasound",
+    "order for an ultrasound", "order for a mammogram",
 ]
 
 # ── 10. Lab order request ──
@@ -289,11 +290,11 @@ _IMAGING_UNCERTAINTY_CUES = [
 # ── 12. Fax imaging order to outside facility ──
 IMAGING_FAX_TRIGGERS = [
     "fax my imaging order", "fax the imaging order",
-    "fax my x-ray order", "fax my mri order",
+    "fax my x-ray order", "fax my mri order", "fax my mammogram order",
     "send my imaging order to", "fax imaging order to",
     "fax my imaging order to", "fax the imaging order to",
-    "fax the x-ray order", "fax the mri order", "fax my ct order",
-    "fax the ct order", "fax my ultrasound order",
+    "fax the x-ray order", "fax the mri order", "fax the mammogram order",
+    "fax my ct order", "fax the ct order", "fax my ultrasound order",
 ]
 
 # Sending an imaging order to an outside facility WITHOUT saying "fax"
@@ -305,6 +306,11 @@ _IMAGING_ORDER_SEND_CUES = [
     "send over to", "sent over to", "forward to", "forwarded to",
     "route to", "routed to", "mail to", "mailed to", "email to",
     "email it to", "deliver to", "delivered to",
+]
+# Facility extraction also needs to look for fax-related destination cues
+# ("...faxed to Crossroads Diagnostics").
+_IMAGING_FAX_SEND_CUES = [
+    "fax to", "faxed to", "fax it to", "fax them to",
 ]
 
 # ── 13. Critical lab result (lab representative call) ──
@@ -747,6 +753,7 @@ def detect_priority_escalation(message_lower):
 _IMAGING_EXPLICIT = [
     "imaging order", "imaging request", "order for an mri",
     "order for a ct", "order for an x-ray", "order for an ultrasound",
+    "order for a mammogram",
 ]
 _IMAGING_REQUEST_CUE = re.compile(
     r"\b(order|orders|ordered|request|need|needs|want|get|schedule)\b"
@@ -909,7 +916,9 @@ def _facility_named_in_message(message):
     stripped = message.strip().rstrip("?.!,")
     lowered = stripped.lower()
     best = None
-    for cue in _IMAGING_ORDER_SEND_CUES:
+    # Check both send cues and fax cues
+    all_cues = _IMAGING_ORDER_SEND_CUES + _IMAGING_FAX_SEND_CUES
+    for cue in all_cues:
         idx = lowered.rfind(cue)
         if idx == -1:
             continue
