@@ -110,7 +110,8 @@ HOME_HEALTH_DECLINE_TRIGGERS = [
     "unable to accept the patient", "referred to another home health",
     "referred out to another home health",
     "referred to a different home health",
-    "patient was referred to another agency",
+    "patient was referred to another agency", "already been referred to another agency",
+    "the patient was already referred to another agency",
     "not able to accept this patient", "won't be able to accept",
     "will not be able to accept",
     "can't accept this patient", "cannot accept this patient",
@@ -131,6 +132,51 @@ _HH_DECLINE_ONBOARDING_PATTERN = re.compile(
     r"(?:\s+on\s+as\s+(?:a|an|our|your|the)\s+|\s+as\s+(?:a|an|our|your|the)\s+)?"
     r"(?:\s+[\w'\.]+){0,6}?"
     r"\s*(?:new\s+|this\s+|the\s+)*patients?\b"
+)
+
+# The same decline is just as often phrased about a PRONOUN rather than
+# the word "patient" - "we are not able to take him on because he has
+# already been referred to Loving Hands Home Health", "the patient has
+# already been referred to Loving Hands Home Health, so we cannot take
+# him on", "unfortunately we are not able to take him as he has already
+# been referred elsewhere for home health". The onboarding pattern above
+# cannot match any of those (it requires a literal "patient(s)" downstream
+# of the verb) and the fixed trigger list cannot either (it requires
+# "accept the patient" or "referred to another home health", never
+# "referred to <named agency> Home Health" or "referred elsewhere"), so
+# detect_home_health_decline() returned False. The turn then fell through
+# to the LLM, which improvised a message it claimed was already
+# documented plus a 72-business-hour follow-up, and never asked for a
+# callback number at all.
+#
+# _HH_DECLINE_REFUSED_PATTERN is the refusal half (the caller rejecting
+# the patient) and _HH_ALREADY_REFERRED_PATTERN is the evidence half (a
+# referral already exists somewhere else). BOTH are required by
+# detect_home_health_decline(): either alone is far too broad - "we
+# cannot see the results" or "she was referred to us" must keep their
+# existing owners - but together they are the exact definition of this
+# workflow. The base "home health" context word is still required.
+_HH_DECLINE_REFUSED_PATTERN = re.compile(
+    r"\b(?:cannot|can't|can\s+not|could\s+not|couldn't|won't|will\s+not|"
+    r"would\s+not|wouldn't|do\s+not|don't|does\s+not|never|"
+    r"(?:un)?able\s+to|"
+    r"not(?:\s+going\s+to\s+be\s+able\s+to|\s+be\s+able\s+to|\s+able\s+to)?)"
+    # Up to three filler words between the refusal and the verb, so
+    # "won't be able to take" and "not going to be able to accept" are
+    # read the same as the bare "cannot take".
+    r"(?:\s+\w+){0,3}?\s+"
+    r"(?:accept|admit|admitt|handle|keep|see|serve|take|treat)"
+    r"(?:s|ing)?\b",
+    re.IGNORECASE,
+)
+
+_HH_ALREADY_REFERRED_PATTERN = re.compile(
+    r"\balready\s+(?:been\s+)?referred\b"
+    r"|\b(?:has|have|had)\s+been\s+referred\b"
+    r"|\b(?:was|were)\s+(?:already\s+)?referred\b"
+    r"|\breferred\s+(?:out\s+|over\s+|already\s+|elsewhere"
+    r"|to\s+(?:an?\s+)?(?:other|another|different|existing|second)\s+)",
+    re.IGNORECASE,
 )
 
 # "the patient has already been referred to loving hands home health, ..."
@@ -458,15 +504,15 @@ ext_patient_first = None
 ext_patient_last = None
 ext_patient_dob = None
 requests_appointment_handoff_label = "an imaging order"
-dc_stage = None        # death certificate: "ask_decedent" -> "ask_contact"
+dc_stage = None  # death certificate: "ask_decedent" -> "ask_contact"
 dc_callback_number = None
-wo_stage = None        # wrong office: "ask_office"
-fn_stage = None        # fax notice: "ask_patient" -> "ask_contact"
+wo_stage = None  # wrong office: "ask_office"
+fn_stage = None  # fax notice: "ask_patient" -> "ask_contact"
 fn_provider = None
 fn_callback_number = None
-xfer_stage = None      # department transfer: "ask_transfer"
-xfer_numbers = {}      # department -> number, cached per call
-ins_stage = None       # insurance update: "ask_company" -> "ask_member"
+xfer_stage = None  # department transfer: "ask_transfer"
+xfer_numbers = {}  # department -> number, cached per call
+ins_stage = None  # insurance update: "ask_company" -> "ask_member"
 ins_company = None
 ins_member_number = None
 _ext_identity_owner = None  # workflow that currently owns ext_patient_*
@@ -684,6 +730,7 @@ _PATIENT_PRIOR_AUTH_CUES = [
     "won't cover", "will not cover", "not covered without",
     "not covered unless", "won't pay for", "will not pay for",
     "won't approve", "will not approve", "not approved without",
+    "told me they require", "told me they requires", "told me it requires",
 ]
 
 
@@ -692,9 +739,9 @@ def detect_patient_prior_auth_request(message_lower):
     own coverage. Deliberately excludes the representative cue so every
     payer/pharmacy caller keeps the external prior_auth workflow."""
     return (
-        _contains_any(message_lower, PRIOR_AUTH_TRIGGERS)
-        and _contains_any(message_lower, _PATIENT_PRIOR_AUTH_CUES)
-        and not _EXTERNAL_CALLER_CUE.search(message_lower)
+            _contains_any(message_lower, PRIOR_AUTH_TRIGGERS)
+            and _contains_any(message_lower, _PATIENT_PRIOR_AUTH_CUES)
+            and not _EXTERNAL_CALLER_CUE.search(message_lower)
     )
 
 
@@ -707,21 +754,62 @@ def detect_life_insurance_disability(message_lower):
     ) and bool(_EXTERNAL_CALLER_CUE.search(message_lower))
 
 
-def detect_home_health_decline(message_lower):
-    if not _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS):
+def _home_health_caller_in_context():
+    """True when the medical-professional caller already identified
+    themselves as home health in an EARLIER turn of this call. Detectors
+    here are stateless per message, so a decline worded without the phrase
+    "home health" ("...referred elsewhere, so we will not be admitting
+    them") lost the context the caller established in their introduction
+    and fell through to the LLM. Read-only, same pattern as the other
+    app.py reads in this file. Scoped to medical-professional callers whose
+    earlier turn was an external-caller self-introduction, so a patient who
+    merely mentioned home health cannot trigger it."""
+    try:
+        import app as _app
+        if not getattr(_app, "is_medical_professional_caller", False):
+            return False
+        return any(
+            turn.get("role") == "user"
+            and "home health" in turn.get("content", "").lower()
+            and _EXTERNAL_CALLER_CUE.search(turn.get("content", "").lower())
+            for turn in getattr(_app, "conversation_history", [])
+        )
+    except Exception:
         return False
-    return bool(
-        _contains_any(message_lower, HOME_HEALTH_DECLINE_TRIGGERS)
-        or _HH_DECLINE_ONBOARDING_PATTERN.search(message_lower)
-    )
+
+
+def detect_home_health_decline(message_lower):
+    if not (
+            _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
+            or _home_health_caller_in_context()
+    ):
+        return False
+    if (
+            _contains_any(message_lower, HOME_HEALTH_DECLINE_TRIGGERS)
+            or _HH_DECLINE_ONBOARDING_PATTERN.search(message_lower)
+    ):
+        return True
+    # Pronoun/referral-worded declines ("...not able to take him on because
+    # he has already been referred to <Agency> Home Health"). Both halves
+    # are required. No sibling-workflow veto is added here: hh_decline is
+    # already checked ahead of hh_follow/hh_instructions in
+    # detect_any_request_intent(), so a turn carrying a genuine decline
+    # keeps resolving to the decline exactly as it does for the fixed
+    # triggers above.
+    if (
+            _HH_DECLINE_REFUSED_PATTERN.search(message_lower)
+            and _HH_ALREADY_REFERRED_PATTERN.search(message_lower)
+    ):
+        return True
+    return False
 
 
 def detect_home_health_follow(message_lower):
     return bool(
         _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
         and (
-            _contains_any(message_lower, HOME_HEALTH_FOLLOW_TRIGGERS)
-            or _HH_FOLLOW_FOR_PATTERN.search(message_lower)
+                _contains_any(message_lower, HOME_HEALTH_FOLLOW_TRIGGERS)
+                or _HH_FOLLOW_FOR_PATTERN.search(message_lower)
         )
     )
 
@@ -730,8 +818,8 @@ def detect_home_health_instructions(message_lower):
     return bool(
         _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
         and (
-            _contains_any(message_lower, HOME_HEALTH_INSTRUCTIONS_TRIGGERS)
-            or _HH_INSTRUCTIONS_PATTERN.search(message_lower)
+                _contains_any(message_lower, HOME_HEALTH_INSTRUCTIONS_TRIGGERS)
+                or _HH_INSTRUCTIONS_PATTERN.search(message_lower)
         )
     )
 
@@ -745,8 +833,8 @@ def detect_priority_escalation(message_lower):
     been created (medication samples, etc.) rather than to start a new
     one. Requires an urgency word plus a reference to that message."""
     return (
-        _contains_any(message_lower, _PRIORITY_ESCALATION_TRIGGERS)
-        and _contains_any(message_lower, _PRIORITY_ESCALATION_TARGETS)
+            _contains_any(message_lower, _PRIORITY_ESCALATION_TRIGGERS)
+            and _contains_any(message_lower, _PRIORITY_ESCALATION_TARGETS)
     )
 
 
@@ -802,8 +890,8 @@ def detect_lab_order_request(message_lower):
     if _LAB_EXCLUDE.search(message_lower):
         return False
     has_lab = (
-        _contains_any(message_lower, LAB_ORDER_NAME_TRIGGERS)
-        or _contains_any(message_lower, _LAB_GENERIC_WORDS)
+            _contains_any(message_lower, LAB_ORDER_NAME_TRIGGERS)
+            or _contains_any(message_lower, _LAB_GENERIC_WORDS)
     )
     return has_lab and bool(_LAB_REQUEST_CUE.search(message_lower))
 
@@ -819,9 +907,9 @@ def detect_imaging_clarity(message_lower):
     # excluded for the same reason _IMAGING_EXCLUDE guards the request
     # trigger - "what did my MRI show" is not an order-clarity question.
     return (
-        _contains_any(message_lower, _IMAGING_CONTEXT_WORDS)
-        and _contains_any(message_lower, _IMAGING_UNCERTAINTY_CUES)
-        and not _IMAGING_EXCLUDE.search(message_lower)
+            _contains_any(message_lower, _IMAGING_CONTEXT_WORDS)
+            and _contains_any(message_lower, _IMAGING_UNCERTAINTY_CUES)
+            and not _IMAGING_EXCLUDE.search(message_lower)
     )
 
 
@@ -831,9 +919,9 @@ def detect_imaging_fax(message_lower):
     # imaging modality + fax wording ("get my MRI order faxed to X").
     # Requires an imaging word so lab-order faxing stays with app.py.
     if (
-        _contains_any(message_lower, IMAGING_ORDER_TRIGGERS)
-        and bool(re.search(r"\b(fax|faxed|faxing)\b", message_lower))
-        and not _IMAGING_EXCLUDE.search(message_lower)
+            _contains_any(message_lower, IMAGING_ORDER_TRIGGERS)
+            and bool(re.search(r"\b(fax|faxed|faxing|faxes)\b", message_lower))
+            and not _IMAGING_EXCLUDE.search(message_lower)
     ):
         return True
     # The same request phrased without the word "fax" ("I need the order
@@ -842,9 +930,9 @@ def detect_imaging_fax(message_lower):
     # for a NEW order ("I need an MRI of my left knee") and an
     # imaging-results question keep their existing owners.
     return (
-        _contains_any(message_lower, IMAGING_ORDER_TRIGGERS)
-        and _contains_any(message_lower, _IMAGING_ORDER_SEND_CUES)
-        and not _IMAGING_EXCLUDE.search(message_lower)
+            _contains_any(message_lower, IMAGING_ORDER_TRIGGERS)
+            and _contains_any(message_lower, _IMAGING_ORDER_SEND_CUES)
+            and not _IMAGING_EXCLUDE.search(message_lower)
     )
 
 
@@ -1302,6 +1390,7 @@ def _handle_patient_prior_auth(message, message_lower):
         pa_patient_insurance = _patient_prior_auth_insurance(message)
         pa_patient_medication = _patient_prior_auth_medication(message)
         pa_patient_ma = _patient_prior_auth_ma()
+
         # With no payer named, "noting that requires..." would read as a
         # broken sentence - the subject is missing. Use the neutral
         # "that your insurance requires" instead.
@@ -1323,7 +1412,7 @@ def _handle_patient_prior_auth(message, message_lower):
 
     if pa_patient_stage == "ask_contact":
         pa_patient_contact_number = (
-            _extract_phone(message) or message.strip()
+                _extract_phone(message) or message.strip()
         )
         pa_patient_stage = "complete"
         requests_flow_active = False
@@ -1424,6 +1513,7 @@ def _hh_decline_pronoun(message):
     """The caller's own pronoun for the patient. Checks this turn's wording
     (including the "Mr."/"Mrs."/"Ms." honorific) first, then the last few
     caller turns, and never guesses when nothing is known."""
+
     def _from_text(text):
         if not text:
             return None
@@ -1474,10 +1564,10 @@ def _hh_decline_agency(message):
         return None
     lowered = agency.lower()
     if re.match(
-        r"^(?:an?|the|other|some)?\s*(?:different|other|another)?\s*"
-        r"(?:home\s+health|home\s+health\s+agency|home\s+health\s+provider"
-        r"|agency|provider|company)\b",
-        lowered,
+            r"^(?:an?|the|other|some)?\s*(?:different|other|another)?\s*"
+            r"(?:home\s+health|home\s+health\s+agency|home\s+health\s+provider"
+            r"|agency|provider|company)\b",
+            lowered,
     ) or not re.search(r"[a-z]", lowered):
         return "another home health agency"
     # Title-case only fully-lowercase words so an agency the caller already
@@ -1502,11 +1592,11 @@ def _handle_hh_decline(message, message_lower):
         patient = _hh_decline_patient_label()
         pronoun = _hh_decline_pronoun(message)
         agency = _hh_decline_agency(message) or "another home health agency"
+        verb = "has" if pronoun in ("he", "she") else "have"
         return (
-            f"I am putting in a message that you are declining referral "
-            f"for {patient} because {pronoun} has already been referred "
-            f"to {agency}. What is a good number to reach you just in "
-            f"case the office has questions regarding this?"
+            f"I am putting in a message that the agency cannot accept {patient} "
+            f"because {pronoun} {verb} already been referred to {agency}. "
+            f"What is a good number to reach you just in case the office has questions regarding this?"
         )
 
     if hh_decline_stage == "ask_contact":
@@ -1712,29 +1802,28 @@ def _handle_reason_awareness_flow(message, message_lower, kind):
             lab_order_req_stage, lab_order_req_reason, lab_order_req_provider_aware
         )
 
-    if stage is None and kind == "imaging" and imaging_reason_already_stated(
-        message_lower
-    ):
-        # The caller stated the reason in the same turn as the order
+    if stage is None and kind == "imaging":
+        # Check if the caller stated the reason in the same turn as the order
         # ("...order an MRI of my left knee. When they did an x ray of the
         # knee, they found nothing."), and named the provider who will
         # review it. Re-asking the reason made the patient repeat
         # themselves, so the request is notated and the callback number
         # verified instead.
-        imaging_reason = message.strip()
-        imaging_provider_name = _resolve_imaging_physician(message)
-        study = _prior_study_named(message_lower)
-        review = (
-            f"will review the {study} and get back in touch with you"
-            if study
-            else "will review this and get back in touch with you"
-        )
-        imaging_stage = "verify_phone"
-        return (
-            f"{imaging_provider_name} {review}, however I will notate our "
-            f"conversation. Can you verify your phone number so that when "
-            f"{imaging_provider_name} calls, they are able to reach you?"
-        )
+        if imaging_reason_already_stated(message_lower) or _prior_study_named(message_lower):
+            imaging_reason = message.strip()
+            imaging_provider_name = _resolve_imaging_physician(message)
+            study = _prior_study_named(message_lower)
+            review = (
+                f"will review the {study} and get back in touch with you"
+                if study
+                else "will review this and get back in touch with you"
+            )
+            imaging_stage = "verify_phone"
+            return (
+                f"{imaging_provider_name} {review}, however I will notate our "
+                f"conversation. Can you verify your phone number so that when "
+                f"{imaging_provider_name} calls, they are able to reach you?"
+            )
 
     if stage is None:
         if kind == "imaging":
@@ -1837,8 +1926,8 @@ def _handle_reason_awareness_flow(message, message_lower, kind):
                 lab_order_req_stage = "complete"
             requests_flow_active = False
             requests_appointment_handoff_reason = (
-                imaging_reason if kind == "imaging" else lab_order_req_reason
-            ) or "this request"
+                                                      imaging_reason if kind == "imaging" else lab_order_req_reason
+                                                  ) or "this request"
             requests_appointment_handoff_label = (
                 "an imaging order" if kind == "imaging" else "a lab order"
             )
@@ -1962,7 +2051,6 @@ def _handle_critical_lab(message, message_lower):
     )
 
 
-
 # ─────────────────────────────────────────────
 # Sprint 17 UAT additions
 # ─────────────────────────────────────────────
@@ -1985,7 +2073,7 @@ _NAME_STOP = {
 }
 _NAME_DENSE_RE = re.compile(
     r"(" + _NAME_TOKEN + r")\s+(" + _NAME_TOKEN + r")\s*,?\s*"
-    r"(?i:(?:his\s+|her\s+|their\s+)?(?:dob|d\.o\.b\.?|date\s+of\s+birth|born))"
+                                                  r"(?i:(?:his\s+|her\s+|their\s+)?(?:dob|d\.o\.b\.?|date\s+of\s+birth|born))"
 )
 _NAME_KEYWORD_RE = re.compile(
     r"(?i:\b(?:patient|claimant|insured|decedent|deceased|name\s+is|"
@@ -1994,14 +2082,14 @@ _NAME_KEYWORD_RE = re.compile(
 )
 _NAME_BARE_RE = re.compile(
     r"^\s*(" + _NAME_TOKEN + r")\s+(" + _NAME_TOKEN + r")\b[\s,.:;!?\d/\-]*"
-    r"(?i:(?:dob|date\s+of\s+birth)?)[\s,.:;\d/\-a-z]*$"
+                                                      r"(?i:(?:dob|date\s+of\s+birth)?)[\s,.:;\d/\-a-z]*$"
 )
 
 
 def _name_ok(first, last):
     return (
-        first not in _NAME_STOP and last not in _NAME_STOP
-        and first.lower() != last.lower()
+            first not in _NAME_STOP and last not in _NAME_STOP
+            and first.lower() != last.lower()
     )
 
 
@@ -2076,7 +2164,6 @@ _ASK_OFFICE_FAX_RE = re.compile(
     r"fax\s+number\s+(?:is|for)|where\s+(?:do|should)\s+(?:i|we)\s+fax)\b"
 )
 
-
 # ── detectors ──
 
 _SUPERVISOR_RE = re.compile(
@@ -2138,9 +2225,9 @@ def detect_incoming_fax_notice(message_lower):
     the PCP. Future tense only, so a past-tense receipt question ("did you
     receive the fax we sent") stays with Sprint16."""
     return (
-        bool(_FAX_NOTICE_FUTURE_RE.search(message_lower))
-        and bool(re.search(r"\b(?:request|order)s?\b", message_lower))
-        and not _FAX_NOTICE_RECEIPT_RE.search(message_lower)
+            bool(_FAX_NOTICE_FUTURE_RE.search(message_lower))
+            and bool(re.search(r"\b(?:request|order)s?\b", message_lower))
+            and not _FAX_NOTICE_RECEIPT_RE.search(message_lower)
     )
 
 
@@ -2170,15 +2257,15 @@ def detect_lab_scheduling_transfer(message_lower):
     if _LAB_SCHED_RE.search(message_lower):
         # "schedule an appointment to discuss my labs" is not lab scheduling.
         return (
-            not re.search(r"\bappointment\b", message_lower)
-            or bool(re.search(r"\blabs?\s+appointment\b", message_lower))
+                not re.search(r"\bappointment\b", message_lower)
+                or bool(re.search(r"\blabs?\s+appointment\b", message_lower))
         )
     return False
 
 
 _RECORDS_XFER_RE = re.compile(
     r"\b" + _XFER_VERB + r"\b[^.?!]{0,30}\b(?:the\s+)?(?:medical\s+)?records\b|"
-    r"\b(?:medical\s+)?records\s+(?:department|dept|team|office)\b"
+                         r"\b(?:medical\s+)?records\s+(?:department|dept|team|office)\b"
 )
 
 
@@ -2223,9 +2310,9 @@ def detect_script_verification(message_lower):
     caller who asks to speak with the provider keeps the speak-with-provider
     flow, and fax wording keeps Sprint16."""
     return (
-        bool(_SCRIPT_VERIFY_RE.search(message_lower))
-        and bool(_SCRIPT_WORD_RE.search(message_lower))
-        and not re.search(r"\bfax\w*\b", message_lower)
+            bool(_SCRIPT_VERIFY_RE.search(message_lower))
+            and bool(_SCRIPT_WORD_RE.search(message_lower))
+            and not re.search(r"\bfax\w*\b", message_lower)
     )
 
 
@@ -2439,9 +2526,9 @@ def _looks_like_close(message_lower):
     if "?" in message_lower or len(words) > 10:
         return False
     if re.search(
-        r"\b(?:need|want|also|but|actually|another|question|how|what|when|"
-        r"where|why|can|could|would|please|wait|hold|one\s+more)\b",
-        message_lower,
+            r"\b(?:need|want|also|but|actually|another|question|how|what|when|"
+            r"where|why|can|could|would|please|wait|hold|one\s+more)\b",
+            message_lower,
     ):
         return False
     return bool(re.search(
@@ -2526,9 +2613,9 @@ def handle_requests_flow(message, message_lower):
         requests_flow_active = False
         requests_active_workflow = None
     elif (
-        not requests_flow_active
-        and requests_active_workflow in EXTERNAL_WORKFLOWS
-        and not any(_verified_patient_identity())
+            not requests_flow_active
+            and requests_active_workflow in EXTERNAL_WORKFLOWS
+            and not any(_verified_patient_identity())
     ):
         # An EXTERNAL caller's workflow just finished and Steve asked
         # "anything else?". Stay dispatchable for exactly one more turn so
