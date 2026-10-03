@@ -323,15 +323,27 @@ _ADDRESS_INDICATORS = [
     "floor", "building", "apt", "unit", "po box",
 ]
 
+# Sprint 17 UAT additions (callers who are NOT verified patients - they are
+# activated before the medical-professional intercept and before pre-chart):
+#   life_insurance (previously staged), supervisor, death_cert,
+#   wrong_office, fax_notice.
 EXTERNAL_WORKFLOWS = frozenset({
     "prior_auth", "hh_decline", "hh_follow", "hh_instructions",
+    "life_insurance", "supervisor", "death_cert", "wrong_office",
+    "fax_notice",
 })
+# Sprint 17 UAT additions (activated after pre-chart): transfer_lab,
+# transfer_records, insurance_update, lab_order_request (previously staged),
+# and fax_notice (a VERIFIED patient announcing that another office will
+# fax - the same tag is also external for unverified callers).
 PATIENT_WORKFLOWS = frozenset({
     "practice_manager", "total_care", "samples",
     "imaging_request", "imaging_clarity", "imaging_fax",
     "patient_prior_auth",
+    "transfer_lab", "transfer_records", "insurance_update",
+    "lab_order_request", "fax_notice", "wrong_office",
 })
-ENABLED_WORKFLOWS = EXTERNAL_WORKFLOWS | PATIENT_WORKFLOWS  # exactly 11
+ENABLED_WORKFLOWS = EXTERNAL_WORKFLOWS | PATIENT_WORKFLOWS
 
 _IMAGING_TYPE_CHOICES = [
     "X-ray", "MRI", "CT scan", "Ultrasound", "PET scan",
@@ -433,6 +445,26 @@ imaging_fax_number = None
 # always available per spec, so there is no failure branch/stage ladder.
 critical_lab_reported = False
 
+# ── Sprint 17 UAT additions ──
+# Identity captured from an EXTERNAL caller about the patient they are
+# calling on (life insurance rep, coroner/funeral home, another office).
+ext_patient_first = None
+ext_patient_last = None
+ext_patient_dob = None
+requests_appointment_handoff_label = "an imaging order"
+dc_stage = None        # death certificate: "ask_decedent" -> "ask_contact"
+dc_callback_number = None
+wo_stage = None        # wrong office: "ask_office"
+fn_stage = None        # fax notice: "ask_patient" -> "ask_contact"
+fn_provider = None
+fn_callback_number = None
+xfer_stage = None      # department transfer: "ask_transfer"
+xfer_numbers = {}      # department -> number, cached per call
+ins_stage = None       # insurance update: "ask_company" -> "ask_member"
+ins_company = None
+ins_member_number = None
+_ext_identity_owner = None  # workflow that currently owns ext_patient_*
+
 
 def reset_state():
     global requests_flow_active, requests_active_workflow
@@ -454,7 +486,29 @@ def reset_state():
     global imaging_fax_stage, imaging_fax_facility_name, imaging_fax_number
     global critical_lab_reported
     global requests_pending_workflow, requests_appointment_handoff_reason, tc_stage
+    global ext_patient_first, ext_patient_last, ext_patient_dob
+    global requests_appointment_handoff_label
+    global dc_stage, dc_callback_number, wo_stage
+    global fn_stage, fn_provider, fn_callback_number
+    global xfer_stage, xfer_numbers
+    global ins_stage, ins_company, ins_member_number, _ext_identity_owner
 
+    _ext_identity_owner = None
+    ext_patient_first = None
+    ext_patient_last = None
+    ext_patient_dob = None
+    requests_appointment_handoff_label = "an imaging order"
+    dc_stage = None
+    dc_callback_number = None
+    wo_stage = None
+    fn_stage = None
+    fn_provider = None
+    fn_callback_number = None
+    xfer_stage = None
+    xfer_numbers = {}
+    ins_stage = None
+    ins_company = None
+    ins_member_number = None
     requests_flow_active = False
     requests_pending_workflow = None
     requests_appointment_handoff_reason = None
@@ -639,7 +693,12 @@ def detect_patient_prior_auth_request(message_lower):
 
 
 def detect_life_insurance_disability(message_lower):
-    return _contains_any(message_lower, LIFE_INSURANCE_DISABILITY_TRIGGERS)
+    # A representative-style introduction is required so a PATIENT who
+    # merely mentions their life insurance or a disability claim is not
+    # treated as a company representative.
+    return _contains_any(
+        message_lower, LIFE_INSURANCE_DISABILITY_TRIGGERS
+    ) and bool(_EXTERNAL_CALLER_CUE.search(message_lower))
 
 
 def detect_home_health_decline(message_lower):
@@ -708,8 +767,38 @@ def detect_imaging_request(message_lower):
     return bool(_IMAGING_REQUEST_CUE.search(message_lower))
 
 
+_LAB_GENERIC_WORDS = [
+    "lab work", "labs", "blood work", "blood test", "lab test",
+    "lab order", "lab request", "blood draw",
+]
+_LAB_REQUEST_CUE = re.compile(
+    r"\b(?:need|needs|want|wants|order|ordered|request|requesting|"
+    r"put\s+in|get|can\s+i|could\s+i|can\s+you|could\s+you|like)\b"
+)
+# Everything that already has an owner elsewhere: lab RESULTS inquiries,
+# lab-order pickup/print/fax/send (app.py + Sprint14), "can't find my lab
+# order" (Sprint14), scheduling/transfer to the lab (transfer_lab below),
+# fasting questions, and critical-lab calls.
+_LAB_EXCLUDE = re.compile(
+    r"\b(?:results?|pick(?:ing)?\s*up|print\w*|fax\w*|send\w*|sent|"
+    r"find|locate|where|appointment|schedul\w+|fast\w*|critical|quest|"
+    r"labcorp|lab\s+corp|front\s+desk|going\s+to|have\s+my|has\s+my|"
+    r"have\s+the|transfer\w*|cancel\w*|bill\w*)\b"
+)
+
+
 def detect_lab_order_request(message_lower):
-    return _contains_any(message_lower, LAB_ORDER_NAME_TRIGGERS)
+    """A request for NEW lab work / a lab order. Only fires when no
+    pickup/fax/results/scheduling/fasting wording is present, so the
+    existing lab-order pickup, fax, EHR-guidance and lab-results flows in
+    app.py/Sprint14 keep ownership of their own phrasing."""
+    if _LAB_EXCLUDE.search(message_lower):
+        return False
+    has_lab = (
+        _contains_any(message_lower, LAB_ORDER_NAME_TRIGGERS)
+        or _contains_any(message_lower, _LAB_GENERIC_WORDS)
+    )
+    return has_lab and bool(_LAB_REQUEST_CUE.search(message_lower))
 
 
 def detect_imaging_clarity(message_lower):
@@ -887,10 +976,17 @@ def detect_any_request_intent(message_lower):
     "imaging" phrasing."""
     ordered = (
         ("critical_lab", detect_critical_lab_report),
+        ("supervisor", detect_supervisor_request),
+        ("death_cert", detect_death_certificate),
+        ("wrong_office", detect_wrong_office),
+        ("fax_notice", detect_incoming_fax_notice),
         ("practice_manager", detect_practice_manager_request),
         ("total_care", detect_car_accident),
         ("patient_prior_auth", detect_patient_prior_auth_request),
         ("prior_auth", detect_prior_auth_request),
+        ("insurance_update", detect_insurance_update),
+        ("transfer_lab", detect_lab_scheduling_transfer),
+        ("transfer_records", detect_records_transfer),
         ("life_insurance", detect_life_insurance_disability),
         ("hh_decline", detect_home_health_decline),
         ("hh_follow", detect_home_health_follow),
@@ -1246,7 +1342,21 @@ def _handle_life_insurance(message, message_lower):
     global li_stage, li_contact_number, li_fax_number
     global li_confirmation_number, requests_flow_active
 
-    if li_stage is None:
+    if li_stage in (None, "ask_patient"):
+        # Sprint 17 UAT: the representative is not a verified patient and
+        # no identity has been collected yet, so the patient's name and
+        # date of birth come first (the chart cannot be checked without
+        # them). Existing downstream stages are unchanged.
+        _ext_capture_identity(message, bare_reply=(li_stage == "ask_patient"))
+        if not (ext_patient_first and ext_patient_last):
+            li_stage = "ask_patient"
+            return (
+                "I can help with that. Could I get the patient's first and "
+                "last name and date of birth?"
+            )
+        if not ext_patient_dob:
+            li_stage = "ask_patient"
+            return f"Thank you. Could I get {ext_patient_first}'s date of birth?"
         li_stage = "ask_contact"
         return (
             "One moment while I check the chart. (pause) I do see the "
@@ -1680,6 +1790,13 @@ def _handle_reason_awareness_flow(message, message_lower, kind):
             lab_order_req_provider_aware = True
             lab_order_req_stage = "complete"
         requests_flow_active = False
+        if kind == "lab":
+            return (
+                "Thank you, I've put in a message with that information "
+                "for the provider. Please allow up to 72 business hours "
+                "for this to be processed. Is there anything else I can "
+                "help you with today?"
+            )
         return (
             f"Thank you, I've put in a message with that information "
             f"for the provider. Is there anything else I can help you "
@@ -1713,6 +1830,9 @@ def _handle_reason_awareness_flow(message, message_lower, kind):
             requests_appointment_handoff_reason = (
                 imaging_reason if kind == "imaging" else lab_order_req_reason
             ) or "this request"
+            requests_appointment_handoff_label = (
+                "an imaging order" if kind == "imaging" else "a lab order"
+            )
             # Hand off to app.py's existing FUTURE appointment
             # scheduling rather than duplicating availability
             # generation here - the patient's stated reason
@@ -1833,6 +1953,510 @@ def _handle_critical_lab(message, message_lower):
     )
 
 
+
+# ─────────────────────────────────────────────
+# Sprint 17 UAT additions
+# ─────────────────────────────────────────────
+# Source: updated one-page UAT checklist. Every handler below is a
+# deterministic Python state machine in the same shape as the handlers
+# above; nothing here duplicates app.py/Sprint14/Sprint16 behavior.
+
+_DOB_RE = re.compile(
+    r"\b(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4})\b|"
+    r"\b(?:january|february|march|april|may|june|july|august|september|"
+    r"october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{4}\b",
+    re.IGNORECASE,
+)
+_NAME_TOKEN = r"[A-Z][a-zA-Z'\-]+"
+_NAME_STOP = {
+    "The", "This", "That", "His", "Her", "Our", "Your", "My", "Dr", "Mr",
+    "Mrs", "Ms", "Insurance", "Life", "Home", "Health", "Funeral", "Office",
+    "Clinic", "Hospital", "Pharmacy", "Police", "Department", "Medical",
+    "Center", "Group", "Services", "Company", "Sheriff", "Coroner",
+}
+_NAME_DENSE_RE = re.compile(
+    r"(" + _NAME_TOKEN + r")\s+(" + _NAME_TOKEN + r")\s*,?\s*"
+    r"(?i:(?:his\s+|her\s+|their\s+)?(?:dob|d\.o\.b\.?|date\s+of\s+birth|born))"
+)
+_NAME_KEYWORD_RE = re.compile(
+    r"(?i:\b(?:patient|claimant|insured|decedent|deceased|name\s+is|"
+    r"named|for|regarding|about))\s*,?\s+(" + _NAME_TOKEN + r")\s+("
+    + _NAME_TOKEN + r")"
+)
+_NAME_BARE_RE = re.compile(
+    r"^\s*(" + _NAME_TOKEN + r")\s+(" + _NAME_TOKEN + r")\b[\s,.:;!?\d/\-]*"
+    r"(?i:(?:dob|date\s+of\s+birth)?)[\s,.:;\d/\-a-z]*$"
+)
+
+
+def _name_ok(first, last):
+    return (
+        first not in _NAME_STOP and last not in _NAME_STOP
+        and first.lower() != last.lower()
+    )
+
+
+def _ext_capture_identity(message, bare_reply=False):
+    """Capture the patient/decedent name and DOB an EXTERNAL caller gives.
+    Anchored patterns only (a name next to a DOB, or after patient/
+    claimant/decedent/for/regarding); a bare two-word reply is accepted
+    only when Steve has just asked for the name (bare_reply=True)."""
+    global ext_patient_first, ext_patient_last, ext_patient_dob
+    if not (ext_patient_first and ext_patient_last):
+        for pattern in (_NAME_DENSE_RE, _NAME_KEYWORD_RE):
+            for match in pattern.finditer(message):
+                first, last = match.group(1), match.group(2)
+                if _name_ok(first, last):
+                    ext_patient_first, ext_patient_last = first, last
+                    break
+            if ext_patient_first:
+                break
+        if not ext_patient_first and bare_reply:
+            match = _NAME_BARE_RE.match(message.strip())
+            if match and _name_ok(match.group(1), match.group(2)):
+                ext_patient_first, ext_patient_last = match.group(1), match.group(2)
+    if not ext_patient_dob:
+        dob = _DOB_RE.search(message)
+        if dob:
+            ext_patient_dob = dob.group(0)
+
+
+def _verified_patient_identity():
+    """(first, last) of a patient already identified by app.py pre-chart,
+    or (None, None). Read-only, same pattern as Sprint13/14/16."""
+    try:
+        import app as _app
+        if _app.pre_chart_complete and _app.caller_is_patient:
+            return (
+                getattr(_app, "patient_first_name", None),
+                getattr(_app, "patient_last_name", None),
+            )
+    except Exception:
+        pass
+    return None, None
+
+
+def _our_provider_named(message_lower):
+    try:
+        import app as _app
+        return _app.detect_provider_in_message(message_lower)
+    except Exception:
+        return None
+
+
+def _office_is_open():
+    try:
+        import app as _app
+        return _app.is_within_office_hours()
+    except Exception:
+        return True
+
+
+def _office_fax_number():
+    """Same per-call office fax number Sprint16 quotes (one number per
+    call, STEVE_FORCE_FAX_NUMBER override honored there)."""
+    try:
+        import Sprint16
+        return Sprint16._office_fax_number()
+    except Exception:
+        return "321-555-0199"
+
+
+_ASK_OFFICE_FAX_RE = re.compile(
+    r"\b(?:what(?:'s| is)?\s+(?:your|the)\s+fax|your\s+fax\s+number|"
+    r"fax\s+number\s+(?:is|for)|where\s+(?:do|should)\s+(?:i|we)\s+fax)\b"
+)
+
+
+# ── detectors ──
+
+_SUPERVISOR_RE = re.compile(
+    r"\b(?:speak|talk|connect|transfer|put\s+me|get|reach|need|want|like|"
+    r"can\s+i|could\s+i|ask\s+for)\b[^.?!]{0,40}\bsupervisor\b"
+)
+
+
+def detect_supervisor_request(message_lower):
+    """A caller asking for the supervisor ("my supervisor needs a note" is
+    deliberately not a request: a cue verb must precede the word)."""
+    return bool(_SUPERVISOR_RE.search(message_lower)) and not re.search(
+        r"\bmy\s+supervisor\b", message_lower
+    )
+
+
+_DEATH_CERT_RE = re.compile(
+    r"\bdeath\s+certificates?\b|\bcertificates?\s+of\s+death\b|\bdeath\s+cert\b"
+)
+_DEATH_CALLER_RE = re.compile(
+    r"\b(?:coroner|medical\s+examiner|police|sheriff|officer|detective|"
+    r"funeral|mortuary|mortician|crematory|cremation|morgue|deputy|trooper)\b"
+)
+
+
+def detect_death_certificate(message_lower):
+    return bool(_DEATH_CERT_RE.search(message_lower)) and bool(
+        _DEATH_CALLER_RE.search(message_lower)
+        or _EXTERNAL_CALLER_CUE.search(message_lower)
+    )
+
+
+_WRONG_OFFICE_RE = re.compile(
+    r"\bwrong\s+(?:office|number|practice|clinic|place|medical\s+office|"
+    r"doctor'?s?\s+office|doctors?\s+office)\b|"
+    r"\b(?:called|dialed|reached|calling)\s+the\s+wrong\b|"
+    r"\bmeant\s+to\s+call\s+(?:another|a\s+different|someone)\b|"
+    r"\bdid(?:n'?t|\s+not)\s+mean\s+to\s+call\b"
+)
+
+
+def detect_wrong_office(message_lower):
+    return bool(_WRONG_OFFICE_RE.search(message_lower))
+
+
+_FAX_NOTICE_FUTURE_RE = re.compile(
+    r"\b(?:will|going\s+to|gonna|about\s+to|'ll)\s+(?:be\s+)?"
+    r"(?:faxing|fax|sending\s+(?:over\s+)?(?:you\s+)?a\s+fax)\b|"
+    r"\b(?:will|going\s+to|gonna|about\s+to)\s+be\s+sending\b[^.?!]{0,30}\bfax\b"
+)
+_FAX_NOTICE_RECEIPT_RE = re.compile(
+    r"\breceiv\w*\b|\bdid\s+you\b|\bhave\s+you\b|\barriv\w*\b|"
+    r"\bcame\s+through\b|\bresend\w*\b"
+)
+
+
+def detect_incoming_fax_notice(message_lower):
+    """Heads-up that another office WILL fax a request for an order from
+    the PCP. Future tense only, so a past-tense receipt question ("did you
+    receive the fax we sent") stays with Sprint16."""
+    return (
+        bool(_FAX_NOTICE_FUTURE_RE.search(message_lower))
+        and bool(re.search(r"\b(?:request|order)s?\b", message_lower))
+        and not _FAX_NOTICE_RECEIPT_RE.search(message_lower)
+    )
+
+
+_XFER_VERB = (
+    r"(?:transfer(?:red)?|connect(?:ed)?|put\s+me\s+through|route\s+me|"
+    r"speak\s+(?:to|with)|talk\s+(?:to|with)|reach|get\s+me\s+to|send\s+me\s+to)"
+)
+_LAB_XFER_RE = re.compile(
+    r"\blab(?:oratory)?\s+scheduling\b|\b" + _XFER_VERB
+    + r"\b[^.?!]{0,30}\b(?:the\s+)?lab(?:oratory)?\b"
+)
+_LAB_SCHED_RE = re.compile(
+    r"\b(?:schedule|book|make|set\s+up)\b[^.?!]{0,40}\b(?:labs?|lab\s+work|"
+    r"blood\s*work|blood\s+draw|lab\s+draw|lab\s+appointment)\b"
+)
+_LAB_XFER_EXCLUDE = re.compile(
+    r"\b(?:results?|go\s+over|review|discuss|order|orders|pick(?:ing)?\s*up|"
+    r"fax\w*|send|sent|critical|quest|labcorp|cancel\w*|fast\w*)\b"
+)
+
+
+def detect_lab_scheduling_transfer(message_lower):
+    if _LAB_XFER_EXCLUDE.search(message_lower):
+        return False
+    if _LAB_XFER_RE.search(message_lower):
+        return True
+    if _LAB_SCHED_RE.search(message_lower):
+        # "schedule an appointment to discuss my labs" is not lab scheduling.
+        return (
+            not re.search(r"\bappointment\b", message_lower)
+            or bool(re.search(r"\blabs?\s+appointment\b", message_lower))
+        )
+    return False
+
+
+_RECORDS_XFER_RE = re.compile(
+    r"\b" + _XFER_VERB + r"\b[^.?!]{0,30}\b(?:the\s+)?(?:medical\s+)?records\b|"
+    r"\b(?:medical\s+)?records\s+(?:department|dept|team|office)\b"
+)
+
+
+def detect_records_transfer(message_lower):
+    """Transfer to the medical records department. Fax wording is excluded
+    so Sprint16 keeps every records FAX inquiry."""
+    return bool(_RECORDS_XFER_RE.search(message_lower)) and not re.search(
+        r"\bfax\w*\b", message_lower
+    )
+
+
+_INS_GIVE_RE = re.compile(
+    r"\b(?:update|updating|add|adding|change|changing|changed|switch(?:ed|ing)?|"
+    r"give|provide|put|new)\b[^.?!]{0,40}\b(?:insurance|coverage)\b|"
+    r"\b(?:insurance|coverage)\b[^.?!]{0,40}\b(?:changed|is\s+new|"
+    r"information|info|card|update|updated)\b"
+)
+_INS_EXCLUDE_RE = re.compile(
+    r"\b(?:accept\w*|take\s+(?:my|our|this)|in[- ]network|out[- ]of[- ]network|"
+    r"prior\s+auth\w*|authorization|life\s+insurance|disability|claim|bill\w*|"
+    r"copay|deductible|referral|new\s+patient|not\s+a\s+patient|estimate|"
+    r"cover(?:ed|s)?\b)"
+)
+
+
+def detect_insurance_update(message_lower):
+    return bool(_INS_GIVE_RE.search(message_lower)) and not _INS_EXCLUDE_RE.search(
+        message_lower
+    )
+
+
+_SCRIPT_VERIFY_RE = re.compile(r"\bverif(?:y|ying|ication)\b|\bconfirm(?:ing)?\b")
+_SCRIPT_WORD_RE = re.compile(
+    r"\b(?:script|scripts|prescription|prescriptions|rx|e-?prescri\w+)\b"
+)
+
+
+def detect_script_verification(message_lower):
+    """A pharmacy verifying a script/prescription that was sent in. Used by
+    app.py's EXISTING pharmacy high-priority-message flow (same flow as the
+    not-in-stock substitution call) - no second flow is built here. A
+    caller who asks to speak with the provider keeps the speak-with-provider
+    flow, and fax wording keeps Sprint16."""
+    return (
+        bool(_SCRIPT_VERIFY_RE.search(message_lower))
+        and bool(_SCRIPT_WORD_RE.search(message_lower))
+        and not re.search(r"\bfax\w*\b", message_lower)
+    )
+
+
+# ── handlers ──
+
+def _handle_death_certificate(message, message_lower):
+    global dc_stage, dc_callback_number, requests_flow_active
+    if dc_stage in (None, "ask_decedent"):
+        _ext_capture_identity(message, bare_reply=(dc_stage == "ask_decedent"))
+        if not (ext_patient_first and ext_patient_last):
+            dc_stage = "ask_decedent"
+            return (
+                "I'm very sorry for the loss. I can put in a high priority "
+                "message for the provider about the death certificate. Could "
+                "I get the decedent's first and last name and date of birth?"
+            )
+        if not ext_patient_dob:
+            dc_stage = "ask_decedent"
+            return f"Thank you. Could I get {ext_patient_first}'s date of birth?"
+        dc_stage = "ask_contact"
+        return "Thank you. May I get a good callback number for you?"
+    if dc_stage == "ask_contact":
+        phone = _extract_phone(message)
+        if not phone:
+            return "May I get a good callback number for you?"
+        dc_callback_number = phone
+        dc_stage = "complete"
+        requests_flow_active = False
+        return (
+            "Thank you. I've put in a high priority message for the "
+            "provider regarding the death certificate and noted your "
+            "callback number. Please allow up to 24 business hours for "
+            "this to be processed. Is there anything else I can help you "
+            "with today?"
+        )
+    return None
+
+
+def _handle_wrong_office(message, message_lower):
+    global wo_stage, requests_flow_active
+    ours = _our_provider_named(message_lower)
+    if ours:
+        wo_stage = "complete"
+        requests_flow_active = False
+        return (
+            f"{ours} is one of our providers here at Sykes Creek Primary "
+            f"Care, so you have reached the right office. How can I help "
+            f"you today?"
+        )
+    if wo_stage is None:
+        wo_stage = "ask_office"
+        return (
+            "No problem at all. You have reached Sykes Creek Primary Care. "
+            "Which office or provider were you trying to reach?"
+        )
+    if wo_stage == "ask_office":
+        wo_stage = "complete"
+        requests_flow_active = False
+        return (
+            "Thank you. I'm not able to transfer you to another practice "
+            "or look up their number, but I recommend checking your "
+            "appointment card, patient portal, or insurance provider "
+            "directory for the correct number. Is there anything else I "
+            "can help you with today?"
+        )
+    return None
+
+
+def _handle_fax_notice(message, message_lower):
+    global fn_stage, fn_provider, fn_callback_number, requests_flow_active
+    first, last = _verified_patient_identity()
+    if first and last and not ext_patient_first:
+        globals()["ext_patient_first"], globals()["ext_patient_last"] = first, last
+    _ext_capture_identity(message, bare_reply=(fn_stage == "ask_patient"))
+    if fn_provider is None:
+        fn_provider = _our_provider_named(message_lower)
+    fax_line = ""
+    if _ASK_OFFICE_FAX_RE.search(message_lower):
+        fax_line = f"Our office fax number is {_office_fax_number()}. "
+    if fn_stage in (None, "ask_patient"):
+        if not (ext_patient_first and ext_patient_last):
+            fn_stage = "ask_patient"
+            return (
+                f"{fax_line}Thank you for letting us know. Could I get the "
+                f"patient's first and last name and date of birth for the "
+                f"request?"
+            )
+        if not ext_patient_dob and not (first and last):
+            fn_stage = "ask_patient"
+            return (
+                f"{fax_line}Thank you. Could I get {ext_patient_first}'s "
+                f"date of birth?"
+            )
+        fn_stage = "ask_contact"
+        return (
+            f"{fax_line}Thank you. May I get a good callback number in case "
+            f"the team has questions?"
+        )
+    if fn_stage == "ask_contact":
+        phone = _extract_phone(message)
+        if not phone:
+            return f"{fax_line}May I get a good callback number?".strip()
+        fn_callback_number = phone
+        fn_stage = "complete"
+        requests_flow_active = False
+        provider = fn_provider or "the provider"
+        return (
+            f"{fax_line}Thank you. I've put in a note for {provider}'s team "
+            f"that a request for an order for {ext_patient_first} "
+            f"{ext_patient_last} will be coming in by fax. Please allow up "
+            f"to 72 business hours for it to be processed once it is "
+            f"received. Is there anything else I can help you with today?"
+        )
+    return None
+
+
+_DEPARTMENTS = {
+    "transfer_lab": "Lab Scheduling",
+    "transfer_records": "Medical Records",
+}
+
+
+def _dept_number(dept):
+    if dept not in xfer_numbers:
+        xfer_numbers[dept] = _generate_phone_number()
+    return xfer_numbers[dept]
+
+
+def _handle_department_transfer(message, message_lower):
+    """Transfer to an internal department. Same offer/accept/decline shape
+    as Total Care, plus the existing office-hours rule: no warm transfer
+    while the office is closed (staff are not reachable)."""
+    global xfer_stage, requests_flow_active
+    dept = _DEPARTMENTS.get(requests_active_workflow, "that department")
+    number = _dept_number(dept)
+    if xfer_stage is None:
+        if not _office_is_open():
+            xfer_stage = "complete"
+            requests_flow_active = False
+            return (
+                f"I'm sorry, our {dept} team is only available during "
+                f"office hours, Monday through Friday, 9:00 AM to 5:00 PM, "
+                f"and our office is currently closed. You can reach them "
+                f"at {number} when we reopen. Is there anything else I can "
+                f"help you with today?"
+            )
+        xfer_stage = "ask_transfer"
+        return (
+            f"I can transfer you to {dept}. Their number is {number} in "
+            f"case we get disconnected. Would you like me to transfer you "
+            f"now?"
+        )
+    declines = _contains_any(
+        message_lower, ["no", "nope", "not right now", "no thank you", "no thanks"]
+    )
+    accepts = _contains_any(
+        message_lower, ["yes", "yeah", "yep", "sure", "ok", "okay", "please", "go ahead"]
+    )
+    if declines and not accepts:
+        xfer_stage = "complete"
+        requests_flow_active = False
+        return (
+            f"No problem. If you change your mind, {dept} can be reached "
+            f"at {number}. Is there anything else I can help you with today?"
+        )
+    if accepts:
+        xfer_stage = "complete"
+        requests_flow_active = False
+        return (
+            f"I'm transferring you to {dept} now. Should the call "
+            f"disconnect, their number is {number}. Thank you for calling "
+            f"Sykes Creek Primary Care. Have a great day!"
+        )
+    return f"Would you like me to transfer you to {dept} now?"
+
+
+def _handle_insurance_update(message, message_lower):
+    global ins_stage, ins_company, ins_member_number, requests_flow_active
+    if ins_stage is None:
+        ins_stage = "ask_company"
+        return (
+            "I can take that down for you. What is the name of your "
+            "insurance company?"
+        )
+    if ins_stage == "ask_company":
+        ins_company = message.strip().rstrip(".")
+        ins_stage = "ask_member"
+        return "Thank you. Could I get the member number on your card?"
+    if ins_stage == "ask_member":
+        ins_member_number = message.strip()
+        ins_stage = "complete"
+        requests_flow_active = False
+        return (
+            f"Thank you. I've put in a message for our office to update "
+            f"your chart with your {ins_company} insurance information. "
+            f"Please allow up to 72 business hours for it to be updated. "
+            f"Is there anything else I can help you with today?"
+        )
+    return None
+
+
+def _looks_like_close(message_lower):
+    """A short farewell/no-thanks after an external workflow finished."""
+    try:
+        import app as _app
+        if _app.is_conversation_closing_reply(message_lower):
+            return True
+    except Exception:
+        pass
+    words = message_lower.split()
+    if "?" in message_lower or len(words) > 10:
+        return False
+    if re.search(
+        r"\b(?:need|want|also|but|actually|another|question|how|what|when|"
+        r"where|why|can|could|would|please|wait|hold|one\s+more)\b",
+        message_lower,
+    ):
+        return False
+    return bool(re.search(
+        r"\b(?:no|nope|nothing|that'?s\s+all|thats\s+all|thanks?|thank\s+you|"
+        r"bye|goodbye|all\s+set|have\s+a\s+good|have\s+a\s+great)\b",
+        message_lower,
+    ))
+
+
+def _handle_external_close(message, message_lower):
+    """After an EXTERNAL-caller workflow finishes, Steve asks "anything
+    else?". That caller was never run through pre-chart, so app.py's
+    general closing block (pre_chart_complete) never sees their "no,
+    thanks" - close deterministically here. Any other reply releases the
+    flow (returns None) so new-intent capture and the normal pipeline own
+    it, exactly as before."""
+    global requests_active_workflow, requests_flow_active
+    if _looks_like_close(message_lower):
+        requests_active_workflow = None
+        requests_flow_active = False
+        return "Thank you for calling Sykes Creek Primary Care. Have a great day!"
+    return None
+
+
 # ─────────────────────────────────────────────
 # Main dispatcher
 # ─────────────────────────────────────────────
@@ -1852,6 +2476,14 @@ _WORKFLOW_HANDLERS = {
     "lab_order_request": _handle_lab_order_request,
     "imaging_clarity": _handle_imaging_clarity,
     "imaging_fax": _handle_imaging_fax,
+    "supervisor": _handle_practice_manager,  # supervisor == Practice Manager
+    "death_cert": _handle_death_certificate,
+    "wrong_office": _handle_wrong_office,
+    "fax_notice": _handle_fax_notice,
+    "transfer_lab": _handle_department_transfer,
+    "transfer_records": _handle_department_transfer,
+    "insurance_update": _handle_insurance_update,
+    "external_close": _handle_external_close,
 }
 
 
@@ -1870,6 +2502,13 @@ def handle_requests_flow(message, message_lower):
         requests_flow_active = False
         requests_active_workflow = None
         return None
+    global _ext_identity_owner, ext_patient_first, ext_patient_last, ext_patient_dob
+    if requests_active_workflow in ("life_insurance", "death_cert", "fax_notice"):
+        # A second external workflow in the same call must never inherit the
+        # previous workflow's patient/decedent identity.
+        if _ext_identity_owner != requests_active_workflow:
+            ext_patient_first = ext_patient_last = ext_patient_dob = None
+            _ext_identity_owner = requests_active_workflow
     response = handler(message, message_lower)
     if response is None:
         # Handler intentionally handed off (e.g. imaging/lab
@@ -1877,6 +2516,16 @@ def handle_requests_flow(message, message_lower):
         # own flow owns the rest of the conversation cleanly.
         requests_flow_active = False
         requests_active_workflow = None
+    elif (
+        not requests_flow_active
+        and requests_active_workflow in EXTERNAL_WORKFLOWS
+        and not any(_verified_patient_identity())
+    ):
+        # An EXTERNAL caller's workflow just finished and Steve asked
+        # "anything else?". Stay dispatchable for exactly one more turn so
+        # their "no thanks" is closed here (see _handle_external_close).
+        requests_active_workflow = "external_close"
+        requests_flow_active = True
     return response
 
 
