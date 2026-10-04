@@ -8602,6 +8602,9 @@ def chat():
                 # the med-pro keyword "doctor's office" but is a wrong_office
                 # request from a caller, not a medical professional.
                 and not Sprint17.detect_wrong_office(message_lower)
+                # A verified patient mentioning an outside medical facility
+                # must not be reclassified as a medical-professional caller.
+                and not (pre_chart_complete and caller_is_patient)
         ):
             is_medical_professional_caller = True
             pre_chart_complete = True
