@@ -816,7 +816,10 @@ def detect_home_health_follow(message_lower):
 
 def detect_home_health_instructions(message_lower):
     return bool(
-        _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
+        (
+            _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
+            or _home_health_caller_in_context()
+        )
         and (
                 _contains_any(message_lower, HOME_HEALTH_INSTRUCTIONS_TRIGGERS)
                 or _HH_INSTRUCTIONS_PATTERN.search(message_lower)
