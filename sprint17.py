@@ -885,12 +885,60 @@ _LAB_EXCLUDE = re.compile(
 )
 
 
+# A sentence that only states an existing wellness/physical appointment
+# ("I already have my physical scheduled next month.") is context, not
+# evidence about what is being requested. Words such as "have my" or
+# "scheduled" inside it must not exclude the lab request that follows.
+_WELLNESS_NOUN = (
+    r"(?:wellness|physical|check-?\s?up|annual|maw|comprehensive\s+health)"
+)
+_WELLNESS_NOUN_RE = re.compile(r"\b" + _WELLNESS_NOUN + r"\b")
+
+# The caller is ACTING on a wellness appointment (schedule/book/reschedule/
+# cancel/move/change it), as opposed to merely mentioning one. Past-tense
+# "scheduled"/"booked" describe state and deliberately do not match.
+_WELLNESS_ACTION_RE = re.compile(
+    r"\b(?:schedul(?:e|ing)|book(?:ing)?|reschedul(?:e|ing)|rebook(?:ing)?|"
+    r"cancel(?:l?ing)?|move|moving|change|changing|set(?:ting)?\s+up)\b"
+    r"(?:\W+\w+){0,5}?\W+" + _WELLNESS_NOUN + r"\b"
+    r"|\b" + _WELLNESS_NOUN + r"\b(?:\W+\w+){0,6}?\W+"
+    r"(?:reschedul(?:e|ing)|rebook|cancel|move|change|push)\b"
+)
+
+
+def wellness_mention_is_contextual(message_lower):
+    """True when a wellness/physical visit is only MENTIONED (e.g. as the
+    reason the caller wants labs, or inside a complaint) and the caller is
+    not asking to schedule/reschedule/cancel/change it. app.py uses this so
+    a contextual mention does not let Sprint14 pre-empt another recognised
+    patient workflow."""
+    return not _WELLNESS_ACTION_RE.search(message_lower)
+
+
+def _lab_exclusion_text(message_lower):
+    """Message text the lab-order exclusions are evaluated against:
+    sentences that only state a wellness appointment (wellness noun, no lab
+    wording) are dropped. Single-sentence messages are never altered."""
+    sentences = re.split(r"(?<=[.!?;])\s+", message_lower)
+    if len(sentences) < 2:
+        return message_lower
+    kept = [
+        sent for sent in sentences
+        if not (
+            _WELLNESS_NOUN_RE.search(sent)
+            and not _contains_any(sent, LAB_ORDER_NAME_TRIGGERS)
+            and not _contains_any(sent, _LAB_GENERIC_WORDS)
+        )
+    ]
+    return " ".join(kept) if kept else message_lower
+
+
 def detect_lab_order_request(message_lower):
     """A request for NEW lab work / a lab order. Only fires when no
     pickup/fax/results/scheduling/fasting wording is present, so the
     existing lab-order pickup, fax, EHR-guidance and lab-results flows in
     app.py/Sprint14 keep ownership of their own phrasing."""
-    if _LAB_EXCLUDE.search(message_lower):
+    if _LAB_EXCLUDE.search(_lab_exclusion_text(message_lower)):
         return False
     has_lab = (
             _contains_any(message_lower, LAB_ORDER_NAME_TRIGGERS)
