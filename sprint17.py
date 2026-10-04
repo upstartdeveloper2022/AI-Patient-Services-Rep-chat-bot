@@ -1109,6 +1109,22 @@ def detect_critical_lab_report(message_lower):
     return _contains_any(message_lower, CRITICAL_LAB_TRIGGERS)
 
 
+def _detect_fax_notice_unless_hh_instructions(message_lower):
+    """A heads-up that a request will be faxed is NOT the caller's intent
+    when it is only the DELIVERY METHOD of a Home Health written-
+    instructions request ("we need written instruction and we're also
+    going to fax the request over"). fax_notice is checked ahead of
+    hh_instructions, so it used to take ownership of that turn and turn
+    the request into a generic incoming-fax/provider-order note (72
+    business hours, no Home Health priority handling). Yield to
+    hh_instructions when that detector also matches. Fax notices without
+    written-instructions wording are unchanged."""
+    return (
+        detect_incoming_fax_notice(message_lower)
+        and not detect_home_health_instructions(message_lower)
+    )
+
+
 def detect_any_request_intent(message_lower):
     """Returns a workflow tag for app.py's early-capture pattern
     (mirrors Sprint13.phf_intent_detected / Sprint14.wellness_intent_detected),
@@ -1127,7 +1143,7 @@ def detect_any_request_intent(message_lower):
         ("supervisor", detect_supervisor_request),
         ("death_cert", detect_death_certificate),
         ("wrong_office", detect_wrong_office),
-        ("fax_notice", detect_incoming_fax_notice),
+        ("fax_notice", _detect_fax_notice_unless_hh_instructions),
         ("practice_manager", detect_practice_manager_request),
         ("total_care", detect_car_accident),
         ("patient_prior_auth", detect_patient_prior_auth_request),
@@ -1711,15 +1727,41 @@ def _handle_hh_instructions(message, message_lower):
                 "Let me get the medical assistant on the line for you "
                 "now. Please hold while I transfer you."
             )
-        hh_instructions_stage = "ask_contact"
         # The request is a provider-facing clinical message, which this
         # workflow has always notated at high priority; an explicit
         # escalation turn below confirms it rather than changing it.
         hh_instructions_high_priority = True
+        # The patient's DOB is required before the callback number. Take
+        # whatever the caller already volunteered (the first message
+        # usually carries the name, sometimes the DOB) and only ask for
+        # what is still missing.
+        _ext_capture_identity(message)
+        if not ext_patient_dob:
+            hh_instructions_stage = "ask_dob"
+            return (
+                "I'm sorry, the medical assistant is not available right "
+                "now. " + _hh_instructions_dob_question()
+            )
+        hh_instructions_stage = "ask_contact"
         return (
             "I'm sorry, the medical assistant is not available right "
             "now. May I get a good contact number for you?"
         )
+
+    if hh_instructions_stage == "ask_dob":
+        _ext_capture_identity(message, bare_reply=True)
+        if ext_patient_dob:
+            hh_instructions_stage = "ask_contact"
+            return "Thank you. May I get a good contact number for you?"
+        # An escalation request here keeps the flow's ownership and its
+        # urgency; the DOB is still owed before anything else.
+        if detect_priority_escalation(message_lower):
+            hh_instructions_high_priority = True
+            return (
+                "I can mark the message as high priority for the "
+                "provider. " + _hh_instructions_dob_question()
+            )
+        return _hh_instructions_dob_question()
 
     if hh_instructions_stage == "ask_contact":
         # The caller asked for this message to be made HIGH PRIORITY rather
@@ -1754,6 +1796,14 @@ def _handle_hh_instructions(message, message_lower):
         )
 
     return None
+
+
+def _hh_instructions_dob_question():
+    """Ask for the patient's missing DOB, by first name when the caller
+    already gave the patient's name."""
+    if ext_patient_first and ext_patient_last:
+        return f"Could I get {ext_patient_first}'s date of birth?"
+    return "Could I get the patient's first and last name and date of birth?"
 
 
 def _hh_instructions_close():
@@ -2597,6 +2647,31 @@ def _handle_external_close(message, message_lower):
     flow (returns None) so new-intent capture and the normal pipeline own
     it, exactly as before."""
     global requests_active_workflow, requests_flow_active
+    # The Home Health written-instructions message already exists (the
+    # flow completed and handed over to this closing stage) and the caller
+    # now asks to make it high priority. That is an escalation of the
+    # existing message - the same high-priority handling the workflow
+    # applies mid-intake - not a new request and not a generic provider
+    # order, so confirm it here instead of letting the LLM reject it with
+    # the 72-business-hour order turnaround. The closing stage stays
+    # active so a following "no thanks" still closes normally.
+    if (
+            hh_instructions_stage == "complete"
+            and not hh_instructions_ma_available
+            and detect_priority_escalation(message_lower)
+    ):
+        captured = hh_instructions_contact_number or ""
+        reference = (
+            captured if PHONE_PATTERN.search(captured)
+            else "the contact number you gave me"
+        )
+        return (
+            f"Of course. The message I put in for the provider is marked "
+            f"high priority, and there's no need to start a new one. The "
+            f"contact number I have on file is {reference}. Please allow "
+            f"up to 24 business hours for it to be processed. Is there "
+            f"anything else I can help you with today?"
+        )
     if _looks_like_close(message_lower):
         requests_active_workflow = None
         requests_flow_active = False
@@ -2650,7 +2725,8 @@ def handle_requests_flow(message, message_lower):
         requests_active_workflow = None
         return None
     global _ext_identity_owner, ext_patient_first, ext_patient_last, ext_patient_dob
-    if requests_active_workflow in ("life_insurance", "death_cert", "fax_notice"):
+    if requests_active_workflow in (
+            "life_insurance", "death_cert", "fax_notice", "hh_instructions"):
         # A second external workflow in the same call must never inherit the
         # previous workflow's patient/decedent identity.
         if _ext_identity_owner != requests_active_workflow:
