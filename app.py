@@ -8247,6 +8247,7 @@ def chat():
     # the exact reactivation bug fixed at the activation block below,
     # since that flag isn't consumed again until the flow next goes
     # idle (i.e. after the call has already moved on to closing).
+    _wellness_captured_this_turn = False
     if (
             not Sprint14.wellness_intent_detected
             and not Sprint14.wellness_flow_active
@@ -8254,6 +8255,7 @@ def chat():
         _wellness_intent = Sprint14.detect_wellness_intent(message_lower)
         if _wellness_intent:
             Sprint14.wellness_intent_detected = _wellness_intent
+            _wellness_captured_this_turn = True
     if (
             not Sprint14.wellness_flow_active
             and Sprint14.detect_refill_escalation_intent(message_lower)
@@ -8431,12 +8433,23 @@ def chat():
                 and not new_patient_flow_active
                 and not Sprint13.phf_flow_active and not Sprint13.phf_intent_detected
                 and not Sprint14.wellness_flow_active
-                and not Sprint14.wellness_intent_detected
+                # A wellness mention captured THIS turn that is only context
+                # (no schedule/reschedule/cancel action) must not pre-empt
+                # another recognised patient workflow.
+                and (
+                    not Sprint14.wellness_intent_detected
+                    or (
+                        _wellness_captured_this_turn
+                        and Sprint17.wellness_mention_is_contextual(message_lower)
+                    )
+                )
                 and not Sprint14.refill_intent_detected
                 and not Sprint14.lab_order_intent_detected
                 and not Sprint16.fax_flow_active and not Sprint16.fax_intent_detected
         ):
             Sprint17.requests_pending_workflow = _s17_intent
+            if _wellness_captured_this_turn:
+                Sprint14.wellness_intent_detected = None
 
     # --- Profanity check ---
     profanity_words = [
