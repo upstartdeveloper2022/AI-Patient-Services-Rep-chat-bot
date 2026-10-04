@@ -8513,50 +8513,6 @@ def chat():
             if check_response_time_stated(_s17_response):
                 response_time_stated = True
             return jsonify({"response": _s17_response})
-        # handle_requests_flow returned None, so it has released
-        # requests_flow_active. A completed workflow can deliberately hold
-        # that flag True to stay dispatchable for a same-subject
-        # escalation (samples - "make that message high priority"), and
-        # while it was held BOTH recapture sites above/below were skipped,
-        # because each is gated on "not requests_flow_active". The new
-        # request therefore reached the completed handler, got None, and
-        # fell through to the LLM instead of being routed. Retry the
-        # capture once now that the flag is actually free.
-        if not Sprint17.requests_flow_active:
-            _s17_retry = Sprint17.detect_any_request_intent(message_lower)
-            if (
-                    _s17_retry in Sprint17.PATIENT_WORKFLOWS
-                    and not is_medical_professional_caller
-                    and not is_medical_professional_message(user_message, message_lower)
-                    and not acute_same_day_established
-                    and not new_patient_flow_active
-                    and not Sprint13.phf_flow_active and not Sprint13.phf_intent_detected
-                    and not Sprint14.wellness_flow_active
-                    and not Sprint14.wellness_intent_detected
-                    and not Sprint14.refill_intent_detected
-                    and not Sprint14.lab_order_intent_detected
-                    and not Sprint16.fax_flow_active and not Sprint16.fax_intent_detected
-            ):
-                Sprint17.requests_active_workflow = _s17_retry
-                Sprint17.requests_flow_active = True
-                _s17_retry_response = Sprint17.handle_requests_flow(user_message, message_lower)
-                if _s17_retry_response is not None:
-                    conversation_history.append({"role": "user", "content": user_message})
-                    conversation_history.append({"role": "assistant", "content": _s17_retry_response})
-                    if check_response_time_stated(_s17_retry_response):
-                        response_time_stated = True
-                    return jsonify({"response": _s17_retry_response})
-            if _s17_retry in Sprint17.EXTERNAL_WORKFLOWS and not (
-                    pre_chart_complete and caller_is_patient):
-                Sprint17.requests_active_workflow = _s17_retry
-                Sprint17.requests_flow_active = True
-                _s17_retry_response = Sprint17.handle_requests_flow(user_message, message_lower)
-                if _s17_retry_response is not None:
-                    conversation_history.append({"role": "user", "content": user_message})
-                    conversation_history.append({"role": "assistant", "content": _s17_retry_response})
-                    if check_response_time_stated(_s17_retry_response):
-                        response_time_stated = True
-                    return jsonify({"response": _s17_retry_response})
         # Flow handed off to the standard FUTURE appointment scheduling
         # (imaging request, provider not aware, patient accepted an
         # appointment). Restate the request so the normal scheduling
@@ -8569,6 +8525,47 @@ def chat():
                 f"for {_s17_reason}"
             )
             message_lower = user_message.lower()
+
+    # Retry capture: handle_requests_flow may have released requests_flow_active
+    # (workflow completed), so retry intent detection to capture a new valid
+    # Sprint17 request in the same call. This executes regardless of whether
+    # requests_flow_active was True or False on entry, ensuring a completed
+    # workflow followed by a new valid request starts the new workflow.
+    if not Sprint17.requests_flow_active:
+        _s17_retry = Sprint17.detect_any_request_intent(message_lower)
+        if (
+                _s17_retry in Sprint17.PATIENT_WORKFLOWS
+                and not is_medical_professional_caller
+                and not is_medical_professional_message(user_message, message_lower)
+                and not acute_same_day_established
+                and not new_patient_flow_active
+                and not Sprint13.phf_flow_active and not Sprint13.phf_intent_detected
+                and not Sprint14.wellness_flow_active
+                and not Sprint14.wellness_intent_detected
+                and not Sprint14.refill_intent_detected
+                and not Sprint14.lab_order_intent_detected
+                and not Sprint16.fax_flow_active and not Sprint16.fax_intent_detected
+        ):
+            Sprint17.requests_active_workflow = _s17_retry
+            Sprint17.requests_flow_active = True
+            _s17_retry_response = Sprint17.handle_requests_flow(user_message, message_lower)
+            if _s17_retry_response is not None:
+                conversation_history.append({"role": "user", "content": user_message})
+                conversation_history.append({"role": "assistant", "content": _s17_retry_response})
+                if check_response_time_stated(_s17_retry_response):
+                    response_time_stated = True
+                return jsonify({"response": _s17_retry_response})
+        if _s17_retry in Sprint17.EXTERNAL_WORKFLOWS and not (
+                pre_chart_complete and caller_is_patient):
+            Sprint17.requests_active_workflow = _s17_retry
+            Sprint17.requests_flow_active = True
+            _s17_retry_response = Sprint17.handle_requests_flow(user_message, message_lower)
+            if _s17_retry_response is not None:
+                conversation_history.append({"role": "user", "content": user_message})
+                conversation_history.append({"role": "assistant", "content": _s17_retry_response})
+                if check_response_time_stated(_s17_retry_response):
+                    response_time_stated = True
+                return jsonify({"response": _s17_retry_response})
 
     # Bug fix: skip this intercept when the SAME message has already
     # signaled post-hospital-follow-up intent (Sprint13.phf_intent_detected,
@@ -9353,6 +9350,7 @@ def chat():
     if (
             pre_chart_complete and not Sprint13.phf_flow_active
             and not Sprint14.wellness_flow_active
+            and not Sprint17.requests_pending_workflow
     ):
         if Sprint14.wellness_intent_detected:
             Sprint14.wellness_flow_active = True
