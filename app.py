@@ -4071,7 +4071,17 @@ def handle_couple_six_month_followup_flow(message):
         if _name_m:
             spouse_first, spouse_last = _name_m.group(1), _name_m.group(2)
         else:
-            spouse_first, spouse_last = aggressive_name_extraction(message)
+            _combined_name_dob_m = re.match(
+                r"\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)\b",
+                message,
+            ) if detect_dob_in_message(message) else None
+            if _combined_name_dob_m:
+                spouse_first, spouse_last = (
+                    _combined_name_dob_m.group(1),
+                    _combined_name_dob_m.group(2),
+                )
+            else:
+                spouse_first, spouse_last = aggressive_name_extraction(message)
             if not spouse_first or not spouse_last:
                 parts = message.strip().split()
                 if len(parts) >= 2:
@@ -8428,7 +8438,25 @@ def chat():
         if (
                 _s17_intent in Sprint17.PATIENT_WORKFLOWS
                 and not is_medical_professional_caller
-                and (_s17_intent == "wrong_office" or not is_medical_professional_message(user_message, message_lower))
+                # A verified patient naming an outside facility inside their
+                # own request ("I'm establishing with a new provider at
+                # Robertson Medical Center and want to transfer my medical
+                # records") trips is_medical_professional_message() on the
+                # facility name alone - "medical center" is a
+                # MEDICAL_PROFESSIONAL_KEYWORDS entry. The
+                # medical-professional intercept below already exempts a
+                # verified patient from that same check, so without the
+                # identical exemption here the correctly-detected
+                # transfer_records intent was discarded, no workflow took
+                # ownership of the turn, and it fell through to the LLM,
+                # which improvised "I will process and send your records,
+                # what is their fax number?" instead of the deterministic
+                # Medical Records transfer (and its closed-office behavior).
+                and (
+                    _s17_intent == "wrong_office"
+                    or (pre_chart_complete and caller_is_patient)
+                    or not is_medical_professional_message(user_message, message_lower)
+                )
                 and not acute_same_day_established
                 and not new_patient_flow_active
                 and not Sprint13.phf_flow_active and not Sprint13.phf_intent_detected
@@ -8549,7 +8577,15 @@ def chat():
         if (
                 _s17_retry in Sprint17.PATIENT_WORKFLOWS
                 and not is_medical_professional_caller
-                and not is_medical_professional_message(user_message, message_lower)
+                # Same verified-patient exemption as the early-capture gate
+                # above and the medical-professional intercept: a verified
+                # patient naming an outside facility is not a medical
+                # professional, so their recognized request must still be
+                # able to start its workflow here.
+                and not (
+                    is_medical_professional_message(user_message, message_lower)
+                    and not (pre_chart_complete and caller_is_patient)
+                )
                 and not acute_same_day_established
                 and not new_patient_flow_active
                 and not Sprint13.phf_flow_active and not Sprint13.phf_intent_detected
@@ -8561,6 +8597,24 @@ def chat():
         ):
             Sprint17.requests_active_workflow = _s17_retry
             Sprint17.requests_flow_active = True
+            # Consume the pending slot when it names the workflow this turn
+            # is already serving. The early-capture block above may have
+            # armed the same intent a moment ago, and this branch answers it
+            # directly - but it left requests_pending_workflow set, so the
+            # post-pre-chart dispatch block (which exists only for an intent
+            # captured BEFORE pre-chart completed) fired that workflow a
+            # SECOND time on some later, unrelated turn. Traced on the
+            # Medical Records transfer: after the department information and
+            # "Is there anything else I can help you with today?", the
+            # caller's "No. Thank you" re-entered
+            # _handle_department_transfer - which has no terminal stage, so
+            # the word "no" read as a DECLINE and Steve repeated the Medical
+            # Records number and the same question instead of the normal
+            # deterministic farewell. Clearing the consumed slot leaves
+            # genuine second-intent handling untouched: a new valid request
+            # is re-detected from scratch by the two capture blocks above.
+            if Sprint17.requests_pending_workflow == _s17_retry:
+                Sprint17.requests_pending_workflow = None
             _s17_retry_response = Sprint17.handle_requests_flow(user_message, message_lower)
             if _s17_retry_response is not None:
                 conversation_history.append({"role": "user", "content": user_message})
