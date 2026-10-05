@@ -620,6 +620,31 @@ def _extract_phone(message):
     return match.group(0) if match else None
 
 
+def _pm_previous_callback_number():
+    """Return the latest patient number given in response to a callback ask."""
+    import sys
+
+    app_module = sys.modules.get("app")
+    history = getattr(app_module, "conversation_history", [])
+    for index in range(len(history) - 1, 0, -1):
+        assistant_turn = history[index - 1]
+        user_turn = history[index]
+        if (
+                assistant_turn.get("role") != "assistant"
+                or user_turn.get("role") != "user"
+                or not re.search(
+                    r"\b(?:callback|contact)\s+number\b",
+                    assistant_turn.get("content", ""),
+                    re.IGNORECASE,
+                )
+        ):
+            continue
+        phone = _extract_phone(user_turn.get("content", ""))
+        if phone:
+            return phone
+    return None
+
+
 def _looks_like_fax_number(message):
     return bool(_extract_phone(message))
 
@@ -1171,19 +1196,19 @@ def detect_any_request_intent(message_lower):
 # 1. Practice Manager complaint/compliment
 # ─────────────────────────────────────────────
 
-# Words that carry no information about WHAT a complaint or compliment is
-# about - politeness, the request verb, and the topic noun itself. Used
-# only to decide whether the caller volunteered the substance of their
-# message (see _pm_caller_stated_reason); they are stripped from the
-# caller's text, never echoed back.
+# Words that carry no information about WHY the caller wants the Practice
+# Manager - politeness, generic request wording, and the topic noun itself.
+# They are stripped only for reason detection, never echoed back.
 _PM_BOILERPLATE_PATTERN = re.compile(
-    r"\b(?:i|i'?d|i'?m|me|my|we|our|us|would|like|to|want|wish|need|"
+    r"\b(?:i'?d|i'?m|i|me|my|we|our|us|would|like|to|want|wish|need|"
     r"please|could|can|may|might|will|shall|file|make|making|lodge|give|"
     r"leave|send|talk|speak|with|about|a|an|the|and|for|of|there|is|it|"
     r"that|this|get|in|have|has|had|do|does|did|you|your|are|am|was|were|"
     r"be|been|so|if|or|at|up|out|now|also|just|really|still|when|"
+    r"actually|yes|how|what|question|questions|reason|issue|issues|"
+    r"concern|concerns|matter|matters|regarding|today|"
     r"someone|somebody|complain|complaint|complaints|compliment|"
-    r"compliments|practice|manager|monica|caldwell|ms|mrs|mr|office|"
+    r"compliments|practice|manager|management|monica|caldwell|ms|mrs|mr|office|"
     r"front|desk|staff|call|calling|connect|put|let|any|one|"
     r"something|anything|going|hope|feel|think|know|see)\b"
 )
@@ -1191,21 +1216,15 @@ _PM_NON_WORD_PATTERN = re.compile(r"[^a-z0-9]+")
 
 
 def _pm_caller_stated_reason(message_lower):
-    """True when a complaint/compliment message carries actual substance,
-    not just the topic.
+    """True when a Practice Manager request carries an actual reason.
 
-    The shortcut below used to fire on the mere PRESENCE of the word
-    "complaint"/"compliment", so "I would like to file a complaint with
-    the manager" was treated as a fully-stated reason: Steve asked
-    straight for a callback number and never learned what the message was
-    about. Monica then receives a message that says only "the patient
-    called about a complaint", which is exactly the note she needs the
-    details to act on.
+    Strip request scaffolding and generic phrases so a request to speak
+    with the manager "about a question" is still treated as missing its
+    reason, while a caller who says what the message is about is not asked
+    to repeat it.
 
-    Strip the politeness/boilerplate scaffolding ("I would like to file
-    a complaint with the manager") and look for real content words
-    ("about the rude front desk staff"). Content words present means the
-    caller said what it is about, so the shortcut is safe."""
+    Content words such as "helpful" in a compliment about the service
+    remain, so Steve records that reason rather than asking again."""
     stripped = _PM_BOILERPLATE_PATTERN.sub(" ", message_lower)
     return bool([word for word in _PM_NON_WORD_PATTERN.split(stripped) if word])
 
@@ -1214,9 +1233,12 @@ def _handle_practice_manager(message, message_lower):
     global pm_stage, pm_reason, pm_availability_determined, pm_available
     global pm_callback_number, requests_flow_active
 
-    if pm_stage is None and (
-            "complaint" in message_lower or "compliment" in message_lower
-    ) and _pm_caller_stated_reason(message_lower):
+    if pm_stage is None:
+        pm_callback_number = (
+            _extract_phone(message) or _pm_previous_callback_number()
+        )
+
+    if pm_stage is None and _pm_caller_stated_reason(message_lower):
         # The caller already stated the reason - do not ask again.
         pm_reason = message.strip()
         pm_availability_determined = True
@@ -1228,6 +1250,15 @@ def _handle_practice_manager(message, message_lower):
                 f"I'd be happy to connect you with our Practice Manager, "
                 f"{PRACTICE_MANAGER_NAME}. Let me transfer you now. "
                 f"Please hold."
+            )
+        if pm_callback_number:
+            pm_stage = "complete"
+            requests_flow_active = False
+            return (
+                f"Thank you. I've noted your callback number as "
+                f"{pm_callback_number} and left a message for "
+                f"{PRACTICE_MANAGER_FIRST_NAME}. Is there anything else "
+                f"I can help you with today?"
             )
         pm_stage = "await_callback"
         return (
@@ -1272,6 +1303,15 @@ def _handle_practice_manager(message, message_lower):
             return (
                 f"Thank you. Let me transfer you to {PRACTICE_MANAGER_FIRST_NAME} "
                 f"now. Please hold."
+            )
+        if pm_callback_number:
+            pm_stage = "complete"
+            requests_flow_active = False
+            return (
+                f"Thank you. I've noted your callback number as "
+                f"{pm_callback_number} and left a message for "
+                f"{PRACTICE_MANAGER_FIRST_NAME}. Is there anything else "
+                f"I can help you with today?"
             )
         pm_stage = "await_callback"
         return (
