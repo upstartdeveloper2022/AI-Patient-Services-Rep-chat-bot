@@ -4306,11 +4306,20 @@ def handle_generic_couple_cancel(message, message_lower):
         if _spouse_m:
             spouse_first, spouse_last = _spouse_m.group(1), _spouse_m.group(2)
         else:
-            spouse_first, spouse_last = aggressive_name_extraction(message)
-            if not spouse_first or not spouse_last:
-                parts = message.strip().split()
-                if len(parts) >= 2:
-                    spouse_first, spouse_last = parts[0], parts[1]
+            _bare_spouse_name = re.match(
+                r"\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)"
+                r"(?=\s*(?:[,.;]|and\b|(?:dob|date\s+of\s+birth)\b|"
+                r"\d|$))",
+                message,
+                re.IGNORECASE,
+            )
+            if _bare_spouse_name:
+                spouse_first, spouse_last = (
+                    _bare_spouse_name.group(1),
+                    _bare_spouse_name.group(2),
+                )
+            else:
+                spouse_first, spouse_last = None, None
         if not spouse_first or not spouse_last:
             return "May I have your spouse's first and last name and date of birth?"
         generic_couple_cancel_spouse_first = spouse_first
@@ -9556,6 +9565,19 @@ def chat():
         existing_generic_record = get_stored_generic_appointment_record(
             lookup_first, lookup_last
         )
+
+        if generic_couple_cancel_pending:
+            couple_cancel_response = handle_generic_couple_cancel(
+                user_message, message_lower
+            )
+            if couple_cancel_response is not None:
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": couple_cancel_response}
+                )
+                return jsonify({"response": couple_cancel_response})
 
         # Dual NEW-PATIENT household reschedule continuation (the caller
         # has never been seen at the office, so the spouse has never had
