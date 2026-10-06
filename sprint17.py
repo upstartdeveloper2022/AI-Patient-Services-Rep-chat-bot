@@ -2346,8 +2346,40 @@ _WRONG_OFFICE_RE = re.compile(
 )
 
 
+# "Is this the office of Dr. Woods?" / "Did I reach Dr. Smith's office?" -
+# a caller verifying WHICH office they reached. Names an outside (or one of
+# our own) provider/office; generic "is this the doctor's office" and our
+# own practice name never match. _handle_wrong_office decides whether the
+# named provider is one of ours (right office) or not (wrong office).
+_OFFICE_ID_LEAD = (
+    r"(?:is\s+this|did\s+i\s+(?:reach|get|call|dial)|"
+    r"have\s+i\s+(?:reached|gotten|called|dialed)|"
+    r"am\s+i\s+(?:speaking\s+(?:with|to)|talking\s+to|calling|at|"
+    r"through\s+to|reaching)|are\s+you)"
+)
+_OFFICE_ID_NAMED = (
+    r"(?:(?:the\s+)?(?:office|practice|clinic)\s+of\s+(?:dr|doctor)\b\.?\s+[a-z]"
+    r"|(?:dr|doctor)\b\.?\s+[a-z][\w'\-]*(?:\s+[a-z][\w'\-]*)?'?s?\s+"
+    r"(?:office|practice|clinic)"
+    r"|\b(?!(?:doctor|doctors|dentist|physician|provider|medical|primary|"
+    r"family|my|your|our|the)'s\b)[a-z][\w\-]+'s\s+(?:office|practice|clinic))"
+)
+_OFFICE_IDENTITY_RE = re.compile(
+    r"\b" + _OFFICE_ID_LEAD + r"\b[^.?!]{0,25}?" + _OFFICE_ID_NAMED
+)
+
+
+def detect_office_identity_question(message_lower):
+    return (
+        bool(_OFFICE_IDENTITY_RE.search(message_lower))
+        and "sykes creek" not in message_lower
+    )
+
+
 def detect_wrong_office(message_lower):
-    return bool(_WRONG_OFFICE_RE.search(message_lower))
+    return bool(_WRONG_OFFICE_RE.search(message_lower)) or (
+        detect_office_identity_question(message_lower)
+    )
 
 
 _FAX_NOTICE_FUTURE_RE = re.compile(
@@ -2492,8 +2524,56 @@ def _handle_death_certificate(message, message_lower):
     return None
 
 
+def _outside_office_label(message_lower):
+    """Readable label for the provider/office the caller asked about."""
+    m = re.search(r"(?:dr|doctor)\b\.?\s+([a-z][\w\-]*)", message_lower)
+    if m:
+        return "Dr. " + re.sub(r"'s?$", "", m.group(1)).title()
+    m = re.search(r"([a-z][\w\-]+)'s\s+(?:office|practice|clinic)", message_lower)
+    if m:
+        return m.group(1).title() + "'s office"
+    return "that office"
+
+
+def _our_provider_exact(message_lower):
+    """Whole-word match against our provider last names (the substring
+    match in app.detect_provider_in_message would read Dr. Parker as Dr.
+    Park)."""
+    try:
+        import app as _app
+        for last, full in _app.PROVIDER_LAST_NAMES.items():
+            if re.search(r"\b" + re.escape(last) + r"\b", message_lower):
+                return full
+    except Exception:
+        pass
+    return None
+
+
 def _handle_wrong_office(message, message_lower):
     global wo_stage, requests_flow_active
+    # Once resolved, a later turn (e.g. the PCP answer "Dr. Mitchell")
+    # must not be re-read as a wrong-office question.
+    if wo_stage == "complete":
+        return None
+    if wo_stage is None and detect_office_identity_question(message_lower):
+        ours = _our_provider_exact(message_lower)
+        wo_stage = "complete"
+        requests_flow_active = False
+        if ours:
+            return (
+                f"Yes, {ours} is one of our providers here at Sykes Creek "
+                f"Primary Care, so you have reached the right office. How "
+                f"can I help you today?"
+            )
+        return (
+            f"This is Sykes Creek Primary Care, and I don't have "
+            f"{_outside_office_label(message_lower)} here, so you may have "
+            f"reached the wrong office. I'm not able to transfer you to "
+            f"another practice or look up their number, but I recommend "
+            f"checking your appointment card, patient portal, or insurance "
+            f"provider directory for the correct number. Is there anything "
+            f"else I can help you with today?"
+        )
     ours = _our_provider_named(message_lower)
     if ours:
         wo_stage = "complete"
