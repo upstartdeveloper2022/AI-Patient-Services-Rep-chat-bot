@@ -334,7 +334,7 @@ def reset_state():
 
 def detect_fax_inquiry_intent(message_lower):
     if any(w in message_lower for w in _FAX_WORDS) and (
-        any(f in message_lower for f in _FAX_INQUIRY_FRAMING)
+        _has_fax_inquiry_framing(message_lower, _FAX_INQUIRY_FRAMING)
     ):
         return True
     if any(d in message_lower for d in _DOC_REQUEST_WORDS) and (
@@ -342,6 +342,15 @@ def detect_fax_inquiry_intent(message_lower):
     ):
         return True
     return False
+
+
+def _has_fax_inquiry_framing(message_lower, framing):
+    return any(
+        bool(re.search(r"\bour fax\b", message_lower))
+        if phrase == "our fax"
+        else phrase in message_lower
+        for phrase in framing
+    )
 
 
 _RECEIPT_STEM_PATTERN = re.compile(
@@ -371,7 +380,7 @@ def is_fax_receipt_question(message_lower):
     kept unchanged for shapes with no such stem (e.g. "resend", "our fax")."""
     if _RECEIPT_STEM_PATTERN.search(message_lower):
         return True
-    return any(f in message_lower for f in _RECEIPT_QUESTION_FRAMING)
+    return _has_fax_inquiry_framing(message_lower, _RECEIPT_QUESTION_FRAMING)
 
 
 # ─────────────────────────────────────────────
