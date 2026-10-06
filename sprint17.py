@@ -17,6 +17,7 @@ Covers 12 UAT-checklist request types that don't belong in the PHF
   11. Clarity on an existing imaging order (what body part it concerns)
   12. Faxing an imaging order to an outside facility
   13. Critical lab result reported by a lab representative
+  14. Outside office asking for OUR fax number (one-shot)
 
 ARCHITECTURE (mirrors Sprint13.py / Sprint14.py exactly):
   - Self-contained. Does not import Sprint13 or Sprint14 and never reads
@@ -36,11 +37,11 @@ ARCHITECTURE (mirrors Sprint13.py / Sprint14.py exactly):
     time in a third file).
 
 SPRINT 17 INTEGRATION STATUS (integrated into app.py via Sprint17 alias)
-  Enabled (10): practice_manager, total_care, samples, imaging_request,
+  Enabled (11): practice_manager, total_care, samples, imaging_request,
     imaging_clarity, imaging_fax (patient-type; activated after
-    pre-chart) and prior_auth, hh_decline, hh_follow, hh_instructions
-    (external callers; activated before the medical-professional
-    intercept and before pre-chart).
+    pre-chart) and prior_auth, hh_decline, hh_follow, hh_instructions,
+    office_fax_number (external callers; activated before the
+    medical-professional intercept and before pre-chart).
   Deliberately NOT enabled (see ENABLED_WORKFLOWS): critical_lab (already
     handled in app.py/Sprint16 med-pro flow), lab_order_request (already
     handled by app.py lab-work / Sprint14 lab-order flows), life_insurance
@@ -378,11 +379,12 @@ _ADDRESS_INDICATORS = [
 # Sprint 17 UAT additions (callers who are NOT verified patients - they are
 # activated before the medical-professional intercept and before pre-chart):
 #   life_insurance (previously staged), supervisor, death_cert,
-#   wrong_office, fax_notice.
+#   wrong_office, fax_notice, office_fax_number (a bare "what is your
+#   fax number?" needs no patient identity, so it is external-type).
 EXTERNAL_WORKFLOWS = frozenset({
     "prior_auth", "hh_decline", "hh_follow", "hh_instructions",
     "life_insurance", "supervisor", "death_cert", "wrong_office",
-    "fax_notice",
+    "fax_notice", "office_fax_number",
 })
 # Sprint 17 UAT additions (activated after pre-chart): transfer_lab,
 # transfer_records, insurance_update, lab_order_request (previously staged),
@@ -510,6 +512,7 @@ wo_stage = None  # wrong office: "ask_office"
 fn_stage = None  # fax notice: "ask_patient" -> "ask_contact"
 fn_provider = None
 fn_callback_number = None
+fn_followup_requested = False
 xfer_stage = None  # department transfer: "ask_transfer"
 xfer_numbers = {}  # department -> number, cached per call
 ins_stage = None  # insurance update: "ask_company" -> "ask_member"
@@ -541,7 +544,7 @@ def reset_state():
     global ext_patient_first, ext_patient_last, ext_patient_dob
     global requests_appointment_handoff_label
     global dc_stage, dc_callback_number, wo_stage
-    global fn_stage, fn_provider, fn_callback_number
+    global fn_stage, fn_provider, fn_callback_number, fn_followup_requested
     global xfer_stage, xfer_numbers
     global ins_stage, ins_company, ins_member_number, _ext_identity_owner
 
@@ -556,6 +559,7 @@ def reset_state():
     fn_stage = None
     fn_provider = None
     fn_callback_number = None
+    fn_followup_requested = False
     xfer_stage = None
     xfer_numbers = {}
     ins_stage = None
@@ -1169,6 +1173,10 @@ def detect_any_request_intent(message_lower):
         ("death_cert", detect_death_certificate),
         ("wrong_office", detect_wrong_office),
         ("fax_notice", _detect_fax_notice_unless_hh_instructions),
+        # Checked AFTER fax_notice: a message that both announces a
+        # future fax AND asks for our number keeps the full notice
+        # handling (which already quotes the office fax number).
+        ("office_fax_number", detect_office_fax_number_request),
         ("practice_manager", detect_practice_manager_request),
         ("total_care", detect_car_accident),
         ("patient_prior_auth", detect_patient_prior_auth_request),
@@ -2302,7 +2310,7 @@ def _office_fax_number():
 
 _ASK_OFFICE_FAX_RE = re.compile(
     r"\b(?:what(?:'s| is)?\s+(?:your|the)\s+fax|your\s+fax\s+number|"
-    r"fax\s+number\s+(?:is|for)|where\s+(?:do|should)\s+(?:i|we)\s+fax)\b"
+    r"fax\s+number\s+for|where\s+(?:do|should)\s+(?:i|we)\s+fax)\b"
 )
 
 # ── detectors ──
@@ -2391,6 +2399,11 @@ _FAX_NOTICE_RECEIPT_RE = re.compile(
     r"\breceiv\w*\b|\bdid\s+you\b|\bhave\s+you\b|\barriv\w*\b|"
     r"\bcame\s+through\b|\bresend\w*\b"
 )
+_FAX_NOTICE_FOLLOWUP_RE = re.compile(
+    r"\b(?:please|kindly|could\s+you|can\s+you|would\s+you)\b"
+    r"[^.?!]{0,30}\b(?:call|contact|follow\s+up|let\s+(?:me|us)\s+know)\b|"
+    r"\b(?:callback|call\s+back)\s+number\b"
+)
 
 
 def detect_incoming_fax_notice(message_lower):
@@ -2401,6 +2414,23 @@ def detect_incoming_fax_notice(message_lower):
             bool(_FAX_NOTICE_FUTURE_RE.search(message_lower))
             and bool(re.search(r"\b(?:request|order)s?\b", message_lower))
             and not _FAX_NOTICE_RECEIPT_RE.search(message_lower)
+    )
+
+
+def detect_office_fax_number_request(message_lower):
+    """An outside office asking for OUR fax number so they can send
+    something ("This is Tim from Dr. Talbott's office. What is your fax
+    number?", "Where should I fax this?"). UAT root cause: this phrasing
+    matched no workflow, so the turn fell through to Sprint16's
+    fax-status handling / the LLM, which treats every fax mention as a
+    status check and answered "Yes we did receive it." Receipt/status
+    questions ("Did you receive my fax?", "I faxed something yesterday.
+    Did you get it?") and future-tense send notices keep their existing
+    owners via the same exclusions detect_incoming_fax_notice uses."""
+    return (
+            bool(_ASK_OFFICE_FAX_RE.search(message_lower))
+            and not _FAX_NOTICE_RECEIPT_RE.search(message_lower)
+            and not _FAX_NOTICE_FUTURE_RE.search(message_lower)
     )
 
 
@@ -2603,7 +2633,10 @@ def _handle_wrong_office(message, message_lower):
 
 
 def _handle_fax_notice(message, message_lower):
-    global fn_stage, fn_provider, fn_callback_number, requests_flow_active
+    global fn_stage, fn_provider, fn_callback_number
+    global fn_followup_requested, requests_flow_active
+    if _FAX_NOTICE_FOLLOWUP_RE.search(message_lower):
+        fn_followup_requested = True
     first, last = _verified_patient_identity()
     if first and last and not ext_patient_first:
         globals()["ext_patient_first"], globals()["ext_patient_last"] = first, last
@@ -2627,6 +2660,15 @@ def _handle_fax_notice(message, message_lower):
                 f"{fax_line}Thank you. Could I get {ext_patient_first}'s "
                 f"date of birth?"
             )
+        if not fn_followup_requested:
+            fn_stage = "complete"
+            requests_flow_active = False
+            return (
+                f"{fax_line}Thank you. I've notated this in the patient's "
+                f"chart so the appropriate medical assistant knows to "
+                f"expect the fax. Is there anything else I can help you "
+                f"with today?"
+            )
         fn_stage = "ask_contact"
         return (
             f"{fax_line}Thank you. May I get a good callback number in case "
@@ -2648,6 +2690,19 @@ def _handle_fax_notice(message, message_lower):
             f"received. Is there anything else I can help you with today?"
         )
     return None
+
+
+def _handle_office_fax_number(message, message_lower):
+    """One-shot: give the caller our office fax number. Stateless (like
+    critical_lab) - nothing to collect, so the flow closes immediately.
+    Uses Sprint16's per-call number (STEVE_FORCE_FAX_NUMBER honored there)
+    rather than duplicating a constant."""
+    global requests_flow_active
+    requests_flow_active = False
+    return (
+        f"Our office fax number is {_office_fax_number()}. Is there "
+        f"anything else I can help you with today?"
+    )
 
 
 _DEPARTMENTS = {
@@ -2822,6 +2877,7 @@ _WORKFLOW_HANDLERS = {
     "death_cert": _handle_death_certificate,
     "wrong_office": _handle_wrong_office,
     "fax_notice": _handle_fax_notice,
+    "office_fax_number": _handle_office_fax_number,
     "transfer_lab": _handle_department_transfer,
     "transfer_records": _handle_department_transfer,
     "insurance_update": _handle_insurance_update,
