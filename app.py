@@ -554,12 +554,13 @@ med_pro_critical_lab_announced = False
 # when the high-priority-message ask fires and consumed on the next
 # turn. Reset alongside the other per-call state in home().
 med_not_in_stock_callback_pending = False
-# Pharmacist/med-pro caller asking to speak directly with the patient's
+# Medical-professional caller asking to speak directly with the patient's
 # PCP ("Can I speak with Dr. Mitchell?") after identity collection
 # completes. Stage machine: None | "regarding" (waiting for the reason)
-# | "await_callback" (provider was unavailable, waiting for the pharmacy's
+# | "await_callback" (provider was unavailable, waiting for the caller's
 # callback number). Reset alongside the other per-call state in home().
 med_pro_speak_stage = None
+med_pro_speak_requested = False
 
 # Outside-provider insurance question answered: set when Steve
 # deterministically tells the patient he cannot know whether an outside
@@ -4949,6 +4950,7 @@ def handle_med_pro_collection(message, message_lower):
     global med_pro_referral_reason
     global med_pro_call_topic, med_pro_dme_order_pending
     global pcp_collected
+    global med_pro_speak_requested
 
     # The topic is normally classified from the FIRST med-pro message at
     # interception time. A caller who only announces themselves up front
@@ -4957,6 +4959,8 @@ def handle_med_pro_collection(message, message_lower):
     # so re-classify here any time it is detected.
     if detect_critical_lab_call(message_lower):
         med_pro_call_topic = "critical_lab"
+    elif detect_speak_with_provider(message_lower):
+        med_pro_speak_requested = True
 
     if not med_pro_patient_first or not med_pro_patient_last:
         first, last = _extract_med_pro_patient_name(message)
@@ -5044,6 +5048,9 @@ def handle_med_pro_collection(message, message_lower):
         med_pro_collection_complete = True
         med_pro_referral_looked_up = True
         med_pro_call_topic = None
+        if med_pro_speak_requested:
+            med_pro_speak_requested = False
+            return _med_pro_provider_speak_response("your office")
         return "Thank you for that. How can I help today?"
 
     if med_pro_call_topic == "dme":
@@ -5154,14 +5161,34 @@ def detect_speak_with_provider(message_lower):
 
 
 def provider_is_available():
-    """Random availability check for a pharmacist asking to speak with
-    the patient's PCP: 25% available / 75% not. Env override
+    """Random availability check for a medical professional asking to speak
+    with the patient's PCP: 25% available / 75% not. Env override
     STEVE_FORCE_PROVIDER_AVAILABLE=true/false for deterministic UAT,
     mirroring the STEVE_FORCE_REFERRAL_FOUND harness pattern."""
     forced = os.environ.get("STEVE_FORCE_PROVIDER_AVAILABLE")
     if forced is not None and forced.lower() in ("true", "false", "1", "0", "yes", "no"):
         return forced.lower() in ("true", "1", "yes")
     return random.random() < 0.25
+
+
+def _med_pro_provider_speak_response(callback_for="the pharmacy"):
+    global med_pro_speak_stage
+    provider_short = med_pro_patient_pcp or "the provider"
+    if provider_short.startswith("Dr."):
+        provider_short = "Dr. " + provider_short.split()[-1]
+    if provider_is_available():
+        med_pro_speak_stage = None
+        return (
+            f"Of course. Please hold while I check with the medical "
+            f"assistant. (pause) {provider_short} is available to speak "
+            f"with you now. Let me connect you."
+        )
+    med_pro_speak_stage = "await_callback"
+    return (
+        f"I'm sorry, {provider_short} is not available to take your call "
+        f"right now. I will put in a high priority phone message. May I "
+        f"have a good callback number for {callback_for}?"
+    )
 
 
 def _new_patient_after_consent_response():
@@ -7735,6 +7762,7 @@ def home():
     global med_pro_dme_callback_pending, med_pro_critical_lab_announced
     global med_pro_dme_fax_pending, med_pro_dme_fax_items
     global med_not_in_stock_callback_pending, med_pro_speak_stage
+    global med_pro_speak_requested
     global outside_provider_insurance_responded
     global ma_request_reason_asked
     global ma_request_returning
@@ -8002,6 +8030,7 @@ def home():
     med_pro_critical_lab_announced = False
     med_not_in_stock_callback_pending = False
     med_pro_speak_stage = None
+    med_pro_speak_requested = False
     outside_provider_insurance_responded = False
     Sprint13.reset_state()
     Sprint14.reset_state()
@@ -8895,11 +8924,11 @@ def chat():
             )
             return jsonify({"response": med_substitution_response})
 
-    # Pharmacist asking to speak directly with the patient's PCP ("Can I
-    # speak with Dr. Mitchell?"). Steve asks what it is regarding, then
-    # checks with the medical assistant whether the provider is available:
-    # 25% available (transfer the pharmacist over) / 75% not (high-priority
-    # phone message + pharmacy callback number). Only relevant in the
+    # Medical-professional caller asking to speak directly with the
+    # patient's PCP ("Can I speak with Dr. Mitchell?"). Steve asks what it
+    # is regarding, then checks with the medical assistant whether the
+    # provider is available: 25% available (transfer the caller) / 75% not
+    # (high-priority phone message + callback number). Only relevant in the
     # generic completed-collection phase with no other pending flow.
     if (
             is_medical_professional_caller
@@ -8933,37 +8962,15 @@ def chat():
                 )
                 return jsonify({"response": speak_callback_response})
         elif med_pro_speak_stage == "regarding":
-            if provider_is_available():
-                med_pro_speak_stage = None
-                speak_transfer_response = (
-                    f"Of course. Please hold while I check with the "
-                    f"medical assistant. (pause) {provider_short} is "
-                    f"available to speak with you now. Let me connect "
-                    f"you."
-                )
-                conversation_history.append(
-                    {"role": "user", "content": user_message}
-                )
-                conversation_history.append(
-                    {"role": "assistant",
-                     "content": speak_transfer_response}
-                )
-                return jsonify({"response": speak_transfer_response})
-            med_pro_speak_stage = "await_callback"
-            speak_unavailable_response = (
-                f"I'm sorry, {provider_short} is not available to take "
-                f"your call right now. I will put in a high priority "
-                f"phone message. May I have a good callback number for "
-                f"the pharmacy?"
-            )
+            speak_response = _med_pro_provider_speak_response()
             conversation_history.append(
                 {"role": "user", "content": user_message}
             )
             conversation_history.append(
                 {"role": "assistant",
-                 "content": speak_unavailable_response}
+                 "content": speak_response}
             )
-            return jsonify({"response": speak_unavailable_response})
+            return jsonify({"response": speak_response})
         elif detect_speak_with_provider(message_lower):
             med_pro_speak_stage = "regarding"
             speak_regarding_response = (
