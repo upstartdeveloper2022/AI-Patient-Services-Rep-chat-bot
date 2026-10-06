@@ -547,7 +547,9 @@ def reset_state():
     global fn_stage, fn_provider, fn_callback_number, fn_followup_requested
     global xfer_stage, xfer_numbers
     global ins_stage, ins_company, ins_member_number, _ext_identity_owner
+    global script_verify_sent
 
+    script_verify_sent = None
     _ext_identity_owner = None
     ext_patient_first = None
     ext_patient_last = None
@@ -2516,6 +2518,78 @@ def detect_script_verification(message_lower):
             bool(_SCRIPT_VERIFY_RE.search(message_lower))
             and bool(_SCRIPT_WORD_RE.search(message_lower))
             and not re.search(r"\bfax\w*\b", message_lower)
+    )
+
+
+# Pharmacy "verify this script came from you" - simulated EMR lookup.
+# One outcome is rolled per call (75% on file / 25% not on file) and cached,
+# so a repeated question on the same call cannot contradict the first answer.
+# STEVE_FORCE_SCRIPT_SENT=true/false forces the outcome for UAT, mirroring
+# STEVE_FORCE_FAX_RECEIVED in Sprint16.
+script_verify_sent = None
+
+_SCRIPT_MED_STOPWORDS = frozenset({
+    "a", "an", "the", "my", "our", "your", "his", "her", "their", "this",
+    "that", "these", "those", "it", "patient", "patients", "medication",
+    "medicine", "prescription", "script", "refill", "one", "some", "him",
+    "them", "you", "us", "me",
+})
+_SCRIPT_MED_RE = re.compile(
+    r"\b(?:prescription|script|rx|e-?prescription)s?\s+(?:for|of)\s+"
+    r"(?:the\s+|a\s+|an\s+)?([a-z][a-z\-]{2,30})"
+    r"(?:\s+(\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|units?)))?",
+    re.IGNORECASE,
+)
+
+
+def _script_verified_by_office():
+    """75% EMR shows the script WAS sent by our office / 25% it was NOT."""
+    global script_verify_sent
+    if script_verify_sent is None:
+        forced = os.environ.get("STEVE_FORCE_SCRIPT_SENT")
+        if forced is not None and forced.lower() in (
+                "true", "false", "1", "0", "yes", "no"):
+            script_verify_sent = forced.lower() in ("true", "1", "yes")
+        else:
+            script_verify_sent = random.random() < 0.75
+    return script_verify_sent
+
+
+def _script_description(message):
+    """Medication (and dose) in the caller's own words, or a neutral
+    phrase. Nothing is hard-coded and nothing is assumed."""
+    match = _SCRIPT_MED_RE.search(message)
+    if match and match.group(1).lower() not in _SCRIPT_MED_STOPWORDS:
+        med = match.group(1).capitalize()
+        dose = re.sub(r"\s+", " ", match.group(2).strip()) if match.group(2) else ""
+        return f"the prescription for {med}{(' ' + dose) if dose else ''}"
+    return "that prescription"
+
+
+def handle_script_verification(message, message_lower):
+    """Pharmacy asks Steve to verify a script was actually sent by this
+    office. Returns (response, needs_callback). Only the prescription
+    RECORD is verified - no clinical authorization is claimed.
+
+    needs_callback=True (not on file) tells app.py to arm its existing
+    pharmacy high-priority-message callback capture, so the escalation
+    and its 24-business-hour close are the existing ones."""
+    described = _script_description(message)
+    if _script_verified_by_office():
+        return (
+            f"One moment while I check the prescription record. (pause) "
+            f"I can confirm that our records show {described} was sent by "
+            f"our office. I'm only able to verify the prescription record. "
+            f"Is there anything else I can help you with today?",
+            False,
+        )
+    return (
+        f"One moment while I check the prescription record. (pause) I'm "
+        f"sorry, but I am not able to verify {described} as originating "
+        f"from our office, because I do not see a record of it being sent. "
+        f"I will put in a high priority phone message so our team can "
+        f"follow up. May I have a good callback number for the pharmacy?",
+        True,
     )
 
 
