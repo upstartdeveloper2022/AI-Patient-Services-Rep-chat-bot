@@ -8868,12 +8868,22 @@ def chat():
                     {"response": med_substitution_callback_response}
                 )
         elif (
-                detect_med_not_in_stock_substitution(message_lower)
-                or (
-                    Sprint17.detect_script_verification(message_lower)
-                    and not detect_speak_with_provider(message_lower)
-                )
+                Sprint17.detect_script_verification(message_lower)
+                and not detect_speak_with_provider(message_lower)
+                and not detect_med_not_in_stock_substitution(message_lower)
         ):
+            # Pharmacy verifying a script: simulated EMR lookup (Sprint17).
+            script_verify_response, script_verify_escalate = (
+                Sprint17.handle_script_verification(user_message, message_lower)
+            )
+            if script_verify_escalate:
+                med_not_in_stock_callback_pending = True
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append(
+                {"role": "assistant", "content": script_verify_response}
+            )
+            return jsonify({"response": script_verify_response})
+        elif detect_med_not_in_stock_substitution(message_lower):
             med_not_in_stock_callback_pending = True
             med_substitution_response = (
                 "I'm going to put in a high priority phone message. "
