@@ -412,6 +412,10 @@ _IMAGING_BODY_PART_CHOICES = [
 # State variables
 # ─────────────────────────────────────────────
 
+# Law-enforcement caller identity ("Sgt. Jefferson"), kept SEPARATE from the
+# patient they are calling about. Set by app.py's pre-chart recognition; used
+# only so the closing never addresses the caller by the patient's name.
+law_enforcement_caller_name = None
 requests_flow_active = False
 requests_active_workflow = None  # one of the tags returned by detect_any_request_intent()
 requests_pending_workflow = None  # patient-type intent captured before pre-chart completes
@@ -508,6 +512,7 @@ ext_patient_dob = None
 requests_appointment_handoff_label = "an imaging order"
 dc_stage = None  # death certificate: "ask_decedent" -> "ask_contact"
 dc_callback_number = None
+dc_provider = None
 wo_stage = None  # wrong office: "ask_office"
 fn_stage = None  # fax notice: "ask_patient" -> "ask_contact"
 fn_provider = None
@@ -518,6 +523,7 @@ xfer_numbers = {}  # department -> number, cached per call
 ins_stage = None  # insurance update: "ask_company" -> "ask_member"
 ins_company = None
 ins_member_number = None
+ins_chart_record = None  # simulated chart: {"company": ..., "member_number": ...}
 _ext_identity_owner = None  # workflow that currently owns ext_patient_*
 
 
@@ -543,12 +549,14 @@ def reset_state():
     global requests_pending_workflow, requests_appointment_handoff_reason, tc_stage
     global ext_patient_first, ext_patient_last, ext_patient_dob
     global requests_appointment_handoff_label
-    global dc_stage, dc_callback_number, wo_stage
+    global dc_stage, dc_callback_number, dc_provider, wo_stage
     global fn_stage, fn_provider, fn_callback_number, fn_followup_requested
     global xfer_stage, xfer_numbers
     global ins_stage, ins_company, ins_member_number, _ext_identity_owner
-    global script_verify_sent
+    global ins_chart_record
+    global script_verify_sent, law_enforcement_caller_name
 
+    law_enforcement_caller_name = None
     script_verify_sent = None
     _ext_identity_owner = None
     ext_patient_first = None
@@ -557,6 +565,7 @@ def reset_state():
     requests_appointment_handoff_label = "an imaging order"
     dc_stage = None
     dc_callback_number = None
+    dc_provider = None
     wo_stage = None
     fn_stage = None
     fn_provider = None
@@ -567,6 +576,7 @@ def reset_state():
     ins_stage = None
     ins_company = None
     ins_member_number = None
+    ins_chart_record = None
     requests_flow_active = False
     requests_pending_workflow = None
     requests_appointment_handoff_reason = None
@@ -2336,6 +2346,7 @@ _DEATH_CERT_RE = re.compile(
 )
 _DEATH_CALLER_RE = re.compile(
     r"\b(?:coroner|medical\s+examiner|police|sheriff|officer|detective|"
+    r"sgt|sergeant|"
     r"funeral|mortuary|mortician|crematory|cremation|morgue|deputy|trooper)\b"
 )
 
@@ -2344,7 +2355,66 @@ def detect_death_certificate(message_lower):
     return bool(_DEATH_CERT_RE.search(message_lower)) and bool(
         _DEATH_CALLER_RE.search(message_lower)
         or _EXTERNAL_CALLER_CUE.search(message_lower)
+        or law_enforcement_caller_name
     )
+
+
+# ── Law-enforcement caller recognition (UAT) ──
+# "This is Sgt. Jefferson..." / "Officer Smith calling about..." A caller
+# who opens with a law-enforcement title + name is neither the patient nor a
+# family member, so pre-chart must not ask for a relationship or re-run
+# third-party authorization. Anchored to a SELF-introduction (start of the
+# message, or after "this is / I am / I'm / my name is") so a title that only
+# appears inside a sentence ("my son is an officer") never matches.
+_LE_TITLES = {"sgt": "Sgt.", "sergeant": "Sergeant", "officer": "Officer"}
+_LE_NOT_A_NAME = frozenset({
+    "calling", "from", "with", "here", "speaking", "at", "of", "and",
+    "about", "regarding", "for", "on", "in", "the", "a", "an", "i", "we",
+    "to", "is",
+})
+_LE_INTRO_RE = re.compile(
+    r"(?:^\s*|\b(?:this\s+is|i\s+am|i['\u2019]m|my\s+name\s+is)\s+)"
+    r"(?:(?:hi|hello|hey)\W+)?(?:the\s+)?"
+    r"(sgt|sergeant|officer)\b\.?\s+"
+    r"([A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*)?)",
+    re.IGNORECASE,
+)
+
+
+def detect_law_enforcement_caller(message):
+    """Returns (title, name) for a law-enforcement self-introduction
+    ("Sgt. Jefferson", "Officer Smith"), else None. Takes the ORIGINAL-case
+    message (names are title-cased on output)."""
+    for match in _LE_INTRO_RE.finditer(message):
+        # Stop at the first filler word so "Jefferson calling" -> Jefferson.
+        kept = []
+        for t in match.group(2).split():
+            if t.lower() in _LE_NOT_A_NAME:
+                break
+            kept.append(t)
+        if kept:
+            return _LE_TITLES[match.group(1).lower()], " ".join(
+                t.title() for t in kept
+            )
+    return None
+
+
+_LE_PATIENT_NAME_RE = re.compile(
+    r"\b(?:calling|call(?:ing)?)\s+(?:about|for|regarding|on)\s+"
+    r"(?:the\s+|a\s+)?patient\s+([A-Za-z][A-Za-z'\-]+)\s+([A-Za-z][A-Za-z'\-]+)",
+    re.IGNORECASE,
+)
+
+
+def law_enforcement_patient_name(message):
+    """(first, last) for "...calling about patient Danny Bezos". The generic
+    third-party name patterns in app.py have no "patient" keyword handling
+    and would read this as first="patient", last="Danny". Returns
+    (None, None) when the message does not use that phrasing."""
+    match = _LE_PATIENT_NAME_RE.search(message)
+    if match and match.group(1).lower() not in _LE_NOT_A_NAME:
+        return match.group(1).title(), match.group(2).title()
+    return None, None
 
 
 _WRONG_OFFICE_RE = re.compile(
@@ -2596,7 +2666,17 @@ def handle_script_verification(message, message_lower):
 # ── handlers ──
 
 def _handle_death_certificate(message, message_lower):
-    global dc_stage, dc_callback_number, requests_flow_active
+    global dc_stage, dc_callback_number, dc_provider, requests_flow_active
+    provider = _our_provider_named(message_lower)
+    if provider:
+        dc_provider = provider
+    if law_enforcement_caller_name:
+        import app as _app
+        if _app.patient_first_name and _app.patient_last_name:
+            globals()["ext_patient_first"] = _app.patient_first_name
+            globals()["ext_patient_last"] = _app.patient_last_name
+            if _app.established_patient_dob:
+                globals()["ext_patient_dob"] = _app.established_patient_dob
     if dc_stage in (None, "ask_decedent"):
         _ext_capture_identity(message, bare_reply=(dc_stage == "ask_decedent"))
         if not (ext_patient_first and ext_patient_last):
@@ -2618,10 +2698,19 @@ def _handle_death_certificate(message, message_lower):
         dc_callback_number = phone
         dc_stage = "complete"
         requests_flow_active = False
+        provider_team = "the provider and their medical assistant"
+        if dc_provider:
+            import app as _app
+            ma_name = _app.PROVIDER_MA_MAP.get(dc_provider)
+            provider_team = (
+                f"{dc_provider} and {ma_name}, {dc_provider}'s medical assistant"
+                if ma_name else f"{dc_provider}'s medical assistant"
+            )
         return (
-            "Thank you. I've put in a high priority message for the "
-            "provider regarding the death certificate and noted your "
-            "callback number. Please allow up to 24 business hours for "
+            f"Thank you. I've put in a high priority message for "
+            f"{provider_team} regarding {ext_patient_first} "
+            f"{ext_patient_last}'s death certificate and noted your "
+            f"callback number. Please allow up to 24 business hours for "
             "this to be processed. Is there anything else I can help you "
             "with today?"
         )
@@ -2841,6 +2930,7 @@ def _handle_department_transfer(message, message_lower):
 
 def _handle_insurance_update(message, message_lower):
     global ins_stage, ins_company, ins_member_number, requests_flow_active
+    global ins_chart_record
     if ins_stage is None:
         ins_stage = "ask_company"
         return (
@@ -2853,13 +2943,17 @@ def _handle_insurance_update(message, message_lower):
         return "Thank you. Could I get the member number on your card?"
     if ins_stage == "ask_member":
         ins_member_number = message.strip()
+        # Simulated chart update: Steve updates the insurance record
+        # himself - no provider/office message and no 72-hour turnaround.
+        ins_chart_record = {
+            "company": ins_company,
+            "member_number": ins_member_number,
+        }
         ins_stage = "complete"
         requests_flow_active = False
         return (
-            f"Thank you. I've put in a message for our office to update "
-            f"your chart with your {ins_company} insurance information. "
-            f"Please allow up to 72 business hours for it to be updated. "
-            f"Is there anything else I can help you with today?"
+            "I have updated this in your chart. Is there anything else "
+            "I can help you with today?"
         )
     return None
 
