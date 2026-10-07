@@ -569,6 +569,7 @@ med_pro_speak_requested = False
 # anyway.") can be answered with the scripted close instead of letting
 # the AI improvise a scheduling postscript. Reset in home().
 outside_provider_insurance_responded = False
+parking_lot_wheelchair_close_pending = False
 
 AVAILABLE_TIMES = [
     "9:00 AM", "9:30 AM", "10:00 AM", "10:30 AM",
@@ -784,6 +785,23 @@ THIRD_PARTY_PHRASES = [
     "my relative", "caregiver", "power of attorney",
     "for my", "behalf of"
 ]
+
+_PARKING_LOT_WHEELCHAIR_EXCLUSIONS = re.compile(
+    r"\b(?:power\s+wheelchair|dme|durable\s+medical|equipment\s+order|"
+    r"wheelchair\s+order|purchase|rent|repair|transportation|transport|ride)\b"
+)
+
+
+def is_parking_lot_wheelchair_assistance(message_lower):
+    return (
+        bool(re.search(r"\bwheel\s*chair\b", message_lower))
+        and bool(re.search(r"\bparking\s+lot\b", message_lower))
+        and bool(re.search(
+            r"\b(?:help|assist(?:ance)?|bring|meet|from|need)\b",
+            message_lower,
+        ))
+        and not _PARKING_LOT_WHEELCHAIR_EXCLUSIONS.search(message_lower)
+    )
 
 # Bug fix: THIRD_PARTY_PHRASES fires on a bare mention like "my
 # husband" anywhere in the message, so a caller speaking in first-
@@ -4718,6 +4736,14 @@ def active_speaker_first_name():
       3. Patient on the line / self-caller (caller_is_patient True, no
          guardian involved): address the patient.
       4. Ambiguous: fall back to patient, then caller (legacy)."""
+    # Outside/professional caller (law enforcement recognized at pre-chart, or
+    # any medical-professional caller): never address them by the PATIENT's
+    # name. Law enforcement keeps its own retained identity ("Sgt. Jefferson");
+    # a professional caller with no retained name gets a neutral close.
+    if Sprint17.law_enforcement_caller_name:
+        return Sprint17.law_enforcement_caller_name
+    if is_medical_professional_caller:
+        return caller_first_name or None
     if established_patient_minor_guardian_confirmed:
         return caller_first_name or None
     if third_party_detected and not caller_is_patient:
@@ -6673,6 +6699,33 @@ def determine_pre_chart_response(message, message_lower):
             return "Thank you. Could I get your first name please?"
         return "Thank you. Could I get your first and last name, please?"
 
+    # Sprint 17 (UAT): law-enforcement caller ("This is Sgt. Jefferson. I'm
+    # calling about Danny Bezos DOB 4/7/1945."). Recognized from the title +
+    # name self-introduction (Sprint17.detect_law_enforcement_caller); the
+    # caller is not the patient and not a family member, so no relationship
+    # or third-party authorization question is asked. Patient details
+    # already supplied are preserved. Requires the patient's first AND last
+    # name - without them the normal flow below is unchanged.
+    if not pre_chart_complete and not Sprint13.phf_intent_detected:
+        _le_caller = Sprint17.detect_law_enforcement_caller(message)
+        if _le_caller:
+            _le_names = extract_names_from_message(message)
+            _le_kw_first, _le_kw_last = Sprint17.law_enforcement_patient_name(message)
+            _le_pf = patient_first_name or _le_kw_first or _le_names["patient_first"]
+            _le_pl = patient_last_name or _le_kw_last or _le_names["patient_last"]
+            if _le_pf and _le_pl:
+                caller_first_name, caller_last_name = _le_caller
+                Sprint17.law_enforcement_caller_name = " ".join(_le_caller)
+                patient_first_name, patient_last_name = _le_pf, _le_pl
+                if detect_dob_in_message(message):
+                    dob_collected = True
+                    if not established_patient_dob:
+                        established_patient_dob = extract_dob_from_message(message)
+                if detect_provider_in_message(message_lower):
+                    pcp_collected = True
+                pre_chart_complete = True
+                return "How can I help today?"
+
     # Bug fix: mirror the Sprint13.phf_intent_detected guard used on the
     # equivalent medical-professional intercept in the /chat route. This
     # is a second, independent call to is_medical_professional_message()
@@ -7764,6 +7817,7 @@ def home():
     global med_not_in_stock_callback_pending, med_pro_speak_stage
     global med_pro_speak_requested
     global outside_provider_insurance_responded
+    global parking_lot_wheelchair_close_pending
     global ma_request_reason_asked
     global ma_request_returning
     global new_patient_flow_active, new_patient_requested_provider
@@ -8032,6 +8086,7 @@ def home():
     med_pro_speak_stage = None
     med_pro_speak_requested = False
     outside_provider_insurance_responded = False
+    parking_lot_wheelchair_close_pending = False
     Sprint13.reset_state()
     Sprint14.reset_state()
     Sprint16.reset_state()
@@ -8151,9 +8206,39 @@ def chat():
     global med_pro_dme_fax_pending, med_pro_dme_fax_items
     global med_not_in_stock_callback_pending, med_pro_speak_stage
     global outside_provider_insurance_responded
+    global parking_lot_wheelchair_close_pending
 
     user_message = request.json.get("message")
     message_lower = user_message.lower()
+
+    if parking_lot_wheelchair_close_pending:
+        parking_lot_wheelchair_close_pending = False
+        if is_conversation_closing_reply(message_lower):
+            closing_response = (
+                "Thank you for calling Sykes Creek Primary Care. Have a great day!"
+            )
+            conversation_history.extend([
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": closing_response},
+            ])
+            return jsonify({"response": closing_response})
+
+    if (
+            not pre_chart_complete
+            and not new_patient_flow_active
+            and is_parking_lot_wheelchair_assistance(message_lower)
+    ):
+        parking_lot_wheelchair_close_pending = True
+        assistance_response = (
+            "We are going to have someone bring a wheelchair and meet you "
+            "in the parking lot. Please pull up by the front door of the "
+            "building. Is there anything else I can help you with today?"
+        )
+        conversation_history.extend([
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": assistance_response},
+        ])
+        return jsonify({"response": assistance_response})
 
     if (
             "cancel" in message_lower
