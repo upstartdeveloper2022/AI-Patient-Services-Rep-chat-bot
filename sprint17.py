@@ -37,15 +37,12 @@ ARCHITECTURE (mirrors Sprint13.py / Sprint14.py exactly):
     time in a third file).
 
 SPRINT 17 INTEGRATION STATUS (integrated into app.py via Sprint17 alias)
-  Enabled (11): practice_manager, total_care, samples, imaging_request,
-    imaging_clarity, imaging_fax (patient-type; activated after
-    pre-chart) and prior_auth, hh_decline, hh_follow, hh_instructions,
-    office_fax_number (external callers; activated before the
-    medical-professional intercept and before pre-chart).
-  Deliberately NOT enabled (see ENABLED_WORKFLOWS): critical_lab (already
-    handled in app.py/Sprint16 med-pro flow), lab_order_request (already
-    handled by app.py lab-work / Sprint14 lab-order flows), life_insurance
-    (staged; set aside to stay within the 10-workflow Sprint 17 limit).
+  Patient-type workflows are activated after pre-chart; external-caller
+  workflows (including life_insurance) are activated before the
+  medical-professional intercept and before pre-chart. The enabled set is
+  defined by ENABLED_WORKFLOWS below.
+  critical_lab is deliberately excluded because it is handled by
+  app.py/Sprint16's medical-professional flow.
   Detection helpers use word-boundary matching so short triggers such as
   "mri" or "ave" cannot match inside unrelated words.
 """
@@ -449,10 +446,8 @@ pa_patient_ma = None
 pa_patient_contact_number = None
 
 # 4. Life insurance disability claim
-li_stage = None  # "ask_contact" -> "ask_fax" -> "ask_confirmation" -> "complete"
-li_contact_number = None
-li_fax_number = None
-li_confirmation_number = None
+li_stage = None  # "ask_patient" -> "complete"
+li_documentation_found = None
 
 # 5. Home health - decline (referred elsewhere)
 hh_decline_stage = None  # "ask_contact" -> "complete"
@@ -534,7 +529,7 @@ def reset_state():
     global pa_stage, pa_fax_number, pa_portal_accepted, pa_confirmation_number
     global pa_patient_stage, pa_patient_insurance, pa_patient_medication
     global pa_patient_ma, pa_patient_contact_number
-    global li_stage, li_contact_number, li_fax_number, li_confirmation_number
+    global li_stage, li_documentation_found
     global hh_decline_stage, hh_decline_contact_number
     global hh_follow_stage, hh_follow_contact_number
     global hh_instructions_stage, hh_instructions_ma_available, hh_instructions_contact_number
@@ -598,9 +593,7 @@ def reset_state():
     pa_patient_ma = None
     pa_patient_contact_number = None
     li_stage = None
-    li_contact_number = None
-    li_fax_number = None
-    li_confirmation_number = None
+    li_documentation_found = None
     hh_decline_stage = None
     hh_decline_contact_number = None
     hh_follow_stage = None
@@ -793,6 +786,20 @@ def detect_life_insurance_disability(message_lower):
     return _contains_any(
         message_lower, LIFE_INSURANCE_DISABILITY_TRIGGERS
     ) and bool(_EXTERNAL_CALLER_CUE.search(message_lower))
+
+
+def _life_insurance_documentation_on_file():
+    """Return the simulated chart lookup, preserving the existing on-file
+    default while allowing deterministic found/not-found UAT cases."""
+    global li_documentation_found
+    if li_documentation_found is None:
+        forced = os.environ.get("STEVE_FORCE_LIFE_INSURANCE_DOCS_FOUND")
+        if forced is not None and forced.lower() in (
+                "true", "false", "1", "0", "yes", "no"):
+            li_documentation_found = forced.lower() in ("true", "1", "yes")
+        else:
+            li_documentation_found = True
+    return li_documentation_found
 
 
 def _home_health_caller_in_context():
@@ -1564,14 +1571,31 @@ def _handle_patient_prior_auth(message, message_lower):
 # ─────────────────────────────────────────────
 
 def _handle_life_insurance(message, message_lower):
-    global li_stage, li_contact_number, li_fax_number
-    global li_confirmation_number, requests_flow_active
+    global li_stage, requests_flow_active
+
+    if li_stage == "complete":
+        if _life_insurance_documentation_on_file():
+            status = (
+                "I can confirm the disability paperwork is on file, but "
+                "the chart does not show whether it has been completed and "
+                "sent back yet. I'll route your status question to the "
+                "appropriate team for confirmation."
+            )
+        else:
+            status = (
+                "I'm not seeing the disability paperwork on file, so I "
+                "can't confirm that it has been completed or sent back. "
+                "Please resend the documentation to our office for review."
+            )
+        requests_flow_active = False
+        return (
+            f"{status} No additional information is needed from your office "
+            "right now. Is there anything else I can help you with today?"
+        )
 
     if li_stage in (None, "ask_patient"):
-        # Sprint 17 UAT: the representative is not a verified patient and
-        # no identity has been collected yet, so the patient's name and
-        # date of birth come first (the chart cannot be checked without
-        # them). Existing downstream stages are unchanged.
+        # The representative is not a verified patient, so collect only
+        # the patient identity needed to perform this chart lookup.
         _ext_capture_identity(message, bare_reply=(li_stage == "ask_patient"))
         if not (ext_patient_first and ext_patient_last):
             li_stage = "ask_patient"
@@ -1582,33 +1606,25 @@ def _handle_life_insurance(message, message_lower):
         if not ext_patient_dob:
             li_stage = "ask_patient"
             return f"Thank you. Could I get {ext_patient_first}'s date of birth?"
-        li_stage = "ask_contact"
-        return (
-            "One moment while I check the chart. (pause) I do see the "
-            "disability claim documentation on file. Could I get a good "
-            "contact number for your office?"
-        )
-
-    if li_stage == "ask_contact":
-        phone = _extract_phone(message)
-        li_contact_number = phone or message.strip()
-        li_stage = "ask_fax"
-        return "Thank you. Could I also get a good fax number?"
-
-    if li_stage == "ask_fax":
-        fax = _extract_phone(message)
-        li_fax_number = fax or message.strip()
-        li_stage = "ask_confirmation"
-        return "And could I get a confirmation number for this request?"
-
-    if li_stage == "ask_confirmation":
-        li_confirmation_number = message.strip()
         li_stage = "complete"
         requests_flow_active = False
+        if _life_insurance_documentation_on_file():
+            status = (
+                "I do see the disability claim documentation on file. "
+                "The chart does not show a current claim determination or "
+                "processing update, so the claim status will need to be "
+                "confirmed through the insurance carrier's claim system."
+            )
+        else:
+            status = (
+                "I'm not seeing disability claim documentation on file. "
+                "The next step is to resend the documentation to our office "
+                "for review."
+            )
         return (
-            "Thank you, I've put in a message with that information for "
-            "the provider. Is there anything else I can help you with "
-            "today?"
+            f"One moment while I check the chart. (pause) {status} "
+            "No additional information is needed from your office right now. "
+            "Is there anything else I can help you with today?"
         )
 
     return None
@@ -3015,6 +3031,18 @@ def _handle_external_close(message, message_lower):
             f"up to 24 business hours for it to be processed. Is there "
             f"anything else I can help you with today?"
         )
+    if (
+            li_stage == "complete"
+            and re.search(
+                r"\b(?:paperwork|claim\s+status|claim\s+update|"
+                r"completed\s+and\s+sent|sent\s+(?:it|the\s+paperwork)\s+back|"
+                r"returned\s+(?:it|the\s+paperwork))\b",
+                message_lower,
+            )
+    ):
+        requests_active_workflow = "life_insurance"
+        requests_flow_active = True
+        return _handle_life_insurance(message, message_lower)
     if _looks_like_close(message_lower):
         requests_active_workflow = None
         requests_flow_active = False
