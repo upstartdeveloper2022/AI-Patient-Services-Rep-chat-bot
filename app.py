@@ -304,6 +304,8 @@ current_covering_provider_same_day_available = None
 same_day_virtual_clinic_offer_pending = False
 next_available_options_pending = False
 next_day_or_urgent_care_pending = False
+virtual_appointment_scheduling_active = False
+virtual_florida_booking_pending = None
 
 # Scenario 16/17: Reschedule / Cancel Acute Visit
 acute_existing_appt_day = None
@@ -4521,6 +4523,27 @@ def patient_wants_to_decline(message_lower):
     return any(phrase in message_lower for phrase in NEW_PATIENT_DECLINE_PHRASES)
 
 
+def is_virtual_appointment_request(message_lower, history):
+    if not re.search(r"\b(?:virtual|video|telehealth)\b", message_lower):
+        return False
+    if re.search(
+            r"\b(?:schedule|book|set up|make|request|want|need|prefer|"
+            r"choose|select|do|have)\b.{0,50}\b(?:virtual|video|telehealth)\b",
+            message_lower
+    ):
+        return True
+    for turn in reversed(history):
+        if turn.get("role") == "assistant":
+            previous = turn.get("content", "").lower()
+            return (
+                ("in-person" in previous or "in person" in previous)
+                and ("virtual" in previous or "video" in previous)
+            )
+        if turn.get("role") == "user":
+            break
+    return False
+
+
 # RT13 fix: general conversation-closing phrase list, used when Steve's
 # own last message asked "anything else I can help you with today?" -
 # see is_conversation_closing_reply() below. Matched against the FULL
@@ -7852,6 +7875,7 @@ def home():
     global same_day_virtual_clinic_offer_pending
     global next_available_options_pending
     global next_day_or_urgent_care_pending
+    global virtual_appointment_scheduling_active, virtual_florida_booking_pending
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
@@ -7924,6 +7948,8 @@ def home():
     same_day_virtual_clinic_offer_pending = False
     next_available_options_pending = False
     next_day_or_urgent_care_pending = False
+    virtual_appointment_scheduling_active = False
+    virtual_florida_booking_pending = None
     acute_existing_appt_day = None
     acute_existing_appt_time = None
     acute_reschedule_confirm_pending = False
@@ -8116,6 +8142,7 @@ def chat():
     global same_day_virtual_clinic_offer_pending
     global next_available_options_pending
     global next_day_or_urgent_care_pending
+    global virtual_appointment_scheduling_active, virtual_florida_booking_pending
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
@@ -8210,6 +8237,51 @@ def chat():
 
     user_message = request.json.get("message")
     message_lower = user_message.lower()
+
+    if virtual_florida_booking_pending:
+        pending_booking = virtual_florida_booking_pending
+        conversation_history.append({"role": "user", "content": user_message})
+        if re.match(r"^\s*(?:no|nope|not|i won.t|i will not)\b", message_lower):
+            virtual_florida_booking_pending = None
+            declined_response = (
+                "I'm sorry, virtual visits can only be scheduled when you'll "
+                "be in Florida. Would you like to schedule an in-person "
+                "appointment instead?"
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": declined_response}
+            )
+            return jsonify({"response": declined_response})
+        if (
+                re.match(
+                    r"^\s*(?:yes|yeah|yep|sure|i will|i'll be|i am|i'm)\b",
+                    message_lower,
+                )
+                or re.search(r"\b(?:in|inside)\s+florida\b", message_lower)
+        ):
+            store_generic_appointment_record(
+                pending_booking["first_name"],
+                pending_booking["last_name"],
+                pending_booking["appointment_day"],
+                reason=pending_booking["reason"],
+            )
+            virtual_florida_booking_pending = None
+            confirmation_response = (
+                "Your virtual appointment is confirmed for "
+                f"{pending_booking['appointment_day']}."
+            )
+            conversation_history.append(
+                {"role": "assistant", "content": confirmation_response}
+            )
+            return jsonify({"response": confirmation_response})
+        repeat_response = "Will you be in FLorida during that time?"
+        conversation_history.append(
+            {"role": "assistant", "content": repeat_response}
+        )
+        return jsonify({"response": repeat_response})
+
+    if is_virtual_appointment_request(message_lower, conversation_history):
+        virtual_appointment_scheduling_active = True
 
     if parking_lot_wheelchair_close_pending:
         parking_lot_wheelchair_close_pending = False
@@ -11807,6 +11879,8 @@ def chat():
             and patient_wants_to_proceed(message_lower)
             and not is_medical_professional_caller
     )
+    if virtual_visit_accepted_now:
+        virtual_appointment_scheduling_active = True
 
     # Sprint 12: patient just accepted checking with Catherine about
     # Elizabeth Horowitz (the covering provider) after their own PCP's
@@ -11954,6 +12028,7 @@ def chat():
                 "next week", "this week"
             ])
             or virtual_visit_accepted_now
+            or virtual_appointment_scheduling_active
             or same_day_virtual_clinic_declined_now
             or next_available_options_pending
             or appointment_reason_just_requested
@@ -11965,6 +12040,7 @@ def chat():
     ) and not individual_three_month_followup_active and not nurse_visit_active:
         if (
                 not is_same_day or virtual_visit_accepted_now
+                or virtual_appointment_scheduling_active
                 or same_day_virtual_clinic_declined_now
                 or next_available_options_pending
                 or appointment_reason_just_requested
@@ -13451,14 +13527,32 @@ def chat():
             pre_chart_complete
             and not is_medical_professional_caller
             and caller_is_patient
-            and "appointment" in message_lower
-            and ("schedule" in message_lower or "book" in message_lower)
+            and (
+                (
+                    "appointment" in message_lower
+                    and ("schedule" in message_lower or "book" in message_lower)
+                )
+                or virtual_appointment_scheduling_active
+            )
             and not appointment_reason_just_requested
             and not next_available_options_pending
             and not virtual_visit_accepted_now
             and not is_same_day
             and not _is_appointment_transaction_turn(user_message)
-            and not _appointment_reason_already_stated()
+            and (
+                (
+                    virtual_appointment_scheduling_active
+                    and not any(
+                        turn.get("role") == "assistant"
+                        and "what is the reason" in turn.get("content", "").lower()
+                        for turn in conversation_history
+                    )
+                )
+                or (
+                    not virtual_appointment_scheduling_active
+                    and not _appointment_reason_already_stated()
+                )
+            )
     ):
         _reason_question_response = "What is the reason for the appointment?"
         conversation_history.append(
@@ -13662,6 +13756,24 @@ def chat():
                 f"reply trimmed from {len(assistant_message)} to {len(trimmed)} chars"
             )
             assistant_message = trimmed
+        virtual_confirmation = _extract_generic_appointment_confirmation(
+            assistant_message
+        )
+        if (
+                virtual_appointment_scheduling_active
+                and virtual_confirmation
+                and pre_chart_complete
+                and not is_medical_professional_caller
+                and not Sprint13.phf_flow_active
+        ):
+            virtual_florida_booking_pending = {
+                "first_name": patient_first_name or caller_first_name,
+                "last_name": patient_last_name or caller_last_name,
+                "appointment_day": virtual_confirmation,
+                "reason": _derive_generic_appointment_reason(),
+            }
+            virtual_appointment_scheduling_active = False
+            assistant_message = "Will you be in FLorida during that time?"
         conversation_history.append(
             {"role": "assistant", "content": assistant_message}
         )
