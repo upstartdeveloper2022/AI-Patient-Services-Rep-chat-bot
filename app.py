@@ -572,6 +572,7 @@ med_pro_speak_requested = False
 # the AI improvise a scheduling postscript. Reset in home().
 outside_provider_insurance_responded = False
 parking_lot_wheelchair_close_pending = False
+mychart_access_close_pending = False
 
 AVAILABLE_TIMES = [
     "9:00 AM", "9:30 AM", "10:00 AM", "10:30 AM",
@@ -7814,6 +7815,27 @@ def _handle_household_cancel_continuation(message):
 
 # ─────────────────────────────────────────────
 # Routes
+
+
+def is_mychart_access_problem(message_lower):
+    if not re.search(r"\bmy\s*chart\b|\bmychart\b", message_lower):
+        return False
+    if re.search(r"\b(?:download|print|printing|downloaded)\b", message_lower):
+        return False
+    if re.search(
+        r"\b(?:transfer|send|release|request)\b.{0,50}\b"
+        r"(?:my\s+)?(?:medical\s+)?records?\b|"
+        r"\b(?:my\s+)?(?:medical\s+)?records?\b.{0,50}\b"
+        r"(?:transfer|send|release)\b",
+        message_lower,
+    ):
+        return False
+    return bool(re.search(
+        r"\b(?:can't|cannot|unable|trouble|problem|issue|forgot|forget|"
+        r"locked out|not working|access\w*|login|log\s*in|sign\s*in|"
+        r"password)\b",
+        message_lower,
+    ))
 # ─────────────────────────────────────────────
 
 @app.route("/")
@@ -7841,6 +7863,7 @@ def home():
     global med_pro_speak_requested
     global outside_provider_insurance_responded
     global parking_lot_wheelchair_close_pending
+    global mychart_access_close_pending
     global ma_request_reason_asked
     global ma_request_returning
     global new_patient_flow_active, new_patient_requested_provider
@@ -8113,6 +8136,7 @@ def home():
     med_pro_speak_requested = False
     outside_provider_insurance_responded = False
     parking_lot_wheelchair_close_pending = False
+    mychart_access_close_pending = False
     Sprint13.reset_state()
     Sprint14.reset_state()
     Sprint16.reset_state()
@@ -8234,6 +8258,7 @@ def chat():
     global med_not_in_stock_callback_pending, med_pro_speak_stage
     global outside_provider_insurance_responded
     global parking_lot_wheelchair_close_pending
+    global mychart_access_close_pending
 
     user_message = request.json.get("message")
     message_lower = user_message.lower()
@@ -8311,6 +8336,39 @@ def chat():
             {"role": "assistant", "content": assistance_response},
         ])
         return jsonify({"response": assistance_response})
+
+    if mychart_access_close_pending:
+        mychart_access_close_pending = False
+        if is_conversation_closing_reply(message_lower):
+            closing_response = (
+                "Thank you for calling Sykes Creek Primary Care. Have a great day!"
+            )
+            conversation_history.extend([
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": closing_response},
+            ])
+            return jsonify({"response": closing_response})
+
+    if (
+            not is_medical_professional_caller
+            and is_mychart_access_problem(message_lower)
+    ):
+        mychart_access_close_pending = True
+        support_number = f"321-555-01{random.randint(0, 99):02d}"
+        support_response = (
+            "For MyChart login help, visit [Priority Care MyChart Login]"
+            "(https://mychart.pc.org/Mychart/Authentication/Login). Below "
+            'the password box, click "Forgot login information." Enter the '
+            "email address or phone number originally used to create your "
+            'MyChart account, then click "Send code." If you are still '
+            f"unable to access MyChart, call MyChart Support at {support_number}. "
+            "Is there anything else I can help you with today?"
+        )
+        conversation_history.extend([
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": support_response},
+        ])
+        return jsonify({"response": support_response})
 
     if (
             "cancel" in message_lower
