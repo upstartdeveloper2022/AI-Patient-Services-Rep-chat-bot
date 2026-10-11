@@ -2531,7 +2531,7 @@ _LAB_XFER_RE = re.compile(
     + r"\b[^.?!]{0,30}\b(?:the\s+)?lab(?:oratory)?\b"
 )
 _LAB_SCHED_RE = re.compile(
-    r"\b(?:schedule|book|make|set\s+up)\b[^.?!]{0,40}\b(?:labs?|lab\s+work|"
+    r"\b(?:schedule|book|make|set\s+up)\b[^.?!]{0,40}\b(?:labs?|lab\s*work|"
     r"blood\s*work|blood\s+draw|lab\s+draw|lab\s+appointment)\b"
 )
 _LAB_XFER_EXCLUDE = re.compile(
