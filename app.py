@@ -4875,6 +4875,20 @@ def _extract_med_pro_patient_name(message):
     )
     if dense and _is_med_pro_patient_name(dense.group(1), dense.group(2)):
         return dense.group(1), dense.group(2)
+    # Bare reply to "Can I get the patient's first and last name and date of
+    # birth?" - "Jose Cuervo dob 6/3/1969". The name opens the message and is
+    # immediately followed by the DOB token (or the date itself), so no
+    # "for/about/name is" lead-in exists for the patterns above. Anchored to
+    # the START of the message, so a title ("Dr. Suarez dob ...") or a name
+    # buried mid-sentence cannot match.
+    lead = re.match(
+        r"\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)\s*,?\s*"
+        r"(?i:(?:(?:his|her|their)\s+)?(?:dob|d\.o\.b\.?|date\s+of\s+birth|born)\b"
+        r"|\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
+        message,
+    )
+    if lead and _is_med_pro_patient_name(lead.group(1), lead.group(2)):
+        return lead.group(1), lead.group(2)
     first, last = aggressive_name_extraction(message)
     if first and last and _is_med_pro_patient_name(first, last):
         return first, last
