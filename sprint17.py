@@ -2367,11 +2367,34 @@ _DEATH_CALLER_RE = re.compile(
 )
 
 
+def _death_cert_caller_in_context():
+    """True when an EARLIER caller turn of this call was a self-introduction
+    by a death-certificate-type caller (funeral home, coroner, ...). The
+    detectors here are stateless per message, so a caller who introduces
+    themselves in turn 1 ("This is Paul from ... Funeral Home...") and only
+    says "death certificate" in turn 2 lost that context and fell through to
+    the LLM. Both a caller word AND a self-introduction cue are required in
+    the same earlier turn, so a family member merely mentioning a funeral
+    home is not treated as an outside caller. Read-only access to app.py,
+    same pattern as _home_health_caller_in_context()."""
+    try:
+        import app as _app
+        return any(
+            turn.get("role") == "user"
+            and _DEATH_CALLER_RE.search(turn.get("content", "").lower())
+            and _EXTERNAL_CALLER_CUE.search(turn.get("content", "").lower())
+            for turn in getattr(_app, "conversation_history", [])
+        )
+    except Exception:
+        return False
+
+
 def detect_death_certificate(message_lower):
     return bool(_DEATH_CERT_RE.search(message_lower)) and bool(
         _DEATH_CALLER_RE.search(message_lower)
         or _EXTERNAL_CALLER_CUE.search(message_lower)
         or law_enforcement_caller_name
+        or _death_cert_caller_in_context()
     )
 
 
@@ -2570,8 +2593,8 @@ def detect_records_transfer(message_lower):
 
 _INS_GIVE_RE = re.compile(
     r"\b(?:update|updating|add|adding|change|changing|changed|switch(?:ed|ing)?|"
-    r"give|provide|put|new)\b[^.?!]{0,40}\b(?:insurance|coverage)\b|"
-    r"\b(?:insurance|coverage)\b[^.?!]{0,40}\b(?:changed|is\s+new|"
+    r"give|provide|put|new)\b[^.?!]{0,40}\b(?:insurances?|coverages?)\b|"
+    r"\b(?:insurances?|coverages?)\b[^.?!]{0,40}\b(?:changed|is\s+new|"
     r"information|info|card|update|updated)\b"
 )
 _INS_EXCLUDE_RE = re.compile(
@@ -2594,16 +2617,63 @@ _SCRIPT_WORD_RE = re.compile(
 )
 
 
+# The same question is usually asked as an ORIGIN question with no
+# "verify"/"confirm" word at all ("Was this sent from your office?", "Did
+# your office send this prescription?"). Those matched neither half of the
+# check above, so the turn fell to the LLM, which offered a phone note.
+# Both patterns name OUR office as the source; a bare "from your office"
+# (refill/fax/other pharmacy wording) does not match.
+_SCRIPT_ORIGIN_RE = re.compile(
+    r"\b(?:sent|send|came|come|coming|originat\w*|issued|written|"
+    r"authori[sz]ed|e-?prescribed|called\s+in|prescribed)\b[^.?!]{0,30}"
+    r"\b(?:from|by|out\s+of)\b[^.?!]{0,25}"
+    r"\b(?:your|this|the)\s+(?:office|practice|clinic)\b"
+    r"|\b(?:did|does|has|have)\s+your\s+(?:office|practice|clinic)\b"
+    r"[^.?!]{0,20}\b(?:send|sent|issue|issued|write|written|authori[sz]e|"
+    r"authori[sz]ed|prescribe|prescribed)\b"
+    r"|\b(?:legit\w*|authentic|genuine|valid|real)\b[^.?!]{0,20}"
+    r"\bfrom\s+(?:your|this|the)\s+(?:office|practice|clinic)\b"
+)
+# Origin wording about something other than a prescription keeps its owner.
+_SCRIPT_ORIGIN_EXCLUDE = re.compile(
+    r"\b(?:results?|labs?|referrals?|records?|paperwork|forms?|orders?|"
+    r"imaging|refills?|substitut\w*|in\s+stock)\b"
+)
+
+
+def _script_word_in_caller_history():
+    """True when an EARLIER caller turn already named the prescription, so
+    "Was this sent from your office?" keeps its referent. Read-only app.py
+    access, same pattern as _home_health_caller_in_context; scoped to
+    medical-professional callers (the only path that reaches this flow)."""
+    try:
+        import app as _app
+        if not getattr(_app, "is_medical_professional_caller", False):
+            return False
+        return any(
+            turn.get("role") == "user"
+            and _SCRIPT_WORD_RE.search(turn.get("content", "").lower())
+            for turn in getattr(_app, "conversation_history", [])
+        )
+    except Exception:
+        return False
+
+
 def detect_script_verification(message_lower):
     """A pharmacy verifying a script/prescription that was sent in. Used by
     app.py's EXISTING pharmacy high-priority-message flow (same flow as the
     not-in-stock substitution call) - no second flow is built here. A
     caller who asks to speak with the provider keeps the speak-with-provider
     flow, and fax wording keeps Sprint16."""
-    return (
-            bool(_SCRIPT_VERIFY_RE.search(message_lower))
-            and bool(_SCRIPT_WORD_RE.search(message_lower))
-            and not re.search(r"\bfax\w*\b", message_lower)
+    if re.search(r"\bfax\w*\b", message_lower):
+        return False
+    if _SCRIPT_VERIFY_RE.search(message_lower) and _SCRIPT_WORD_RE.search(message_lower):
+        return True
+    return bool(_SCRIPT_ORIGIN_RE.search(message_lower)) and not (
+        _SCRIPT_ORIGIN_EXCLUDE.search(message_lower)
+    ) and (
+        bool(_SCRIPT_WORD_RE.search(message_lower))
+        or _script_word_in_caller_history()
     )
 
 
@@ -2652,6 +2722,21 @@ def _script_description(message):
     return "that prescription"
 
 
+def _script_description_from_history():
+    """Medication/dose from the caller's earlier turn when the verification
+    question itself names none (\"Was this sent from your office?\")."""
+    try:
+        import app as _app
+        for turn in reversed(getattr(_app, "conversation_history", [])):
+            if turn.get("role") == "user":
+                found = _script_description(turn.get("content", ""))
+                if found != "that prescription":
+                    return found
+    except Exception:
+        pass
+    return None
+
+
 def handle_script_verification(message, message_lower):
     """Pharmacy asks Steve to verify a script was actually sent by this
     office. Returns (response, needs_callback). Only the prescription
@@ -2661,6 +2746,8 @@ def handle_script_verification(message, message_lower):
     pharmacy high-priority-message callback capture, so the escalation
     and its 24-business-hour close are the existing ones."""
     described = _script_description(message)
+    if described == "that prescription":
+        described = _script_description_from_history() or described
     if _script_verified_by_office():
         return (
             f"One moment while I check the prescription record. (pause) "
@@ -2693,6 +2780,32 @@ def _handle_death_certificate(message, message_lower):
             globals()["ext_patient_last"] = _app.patient_last_name
             if _app.established_patient_dob:
                 globals()["ext_patient_dob"] = _app.established_patient_dob
+    else:
+        # A professional caller (funeral home, ...) whose decedent name/DOB/
+        # provider were already collected by app.py's medical-professional
+        # intake in an earlier turn: reuse them instead of re-asking. Anything
+        # the caller states in THIS message takes precedence.
+        _ext_capture_identity(message)
+        try:
+            import app as _app
+            if (
+                _app.is_medical_professional_caller
+                and not (ext_patient_first and ext_patient_last)
+                and getattr(_app, "med_pro_patient_first", None)
+                and getattr(_app, "med_pro_patient_last", None)
+            ):
+                globals()["ext_patient_first"] = _app.med_pro_patient_first
+                globals()["ext_patient_last"] = _app.med_pro_patient_last
+                if getattr(_app, "med_pro_patient_dob", None):
+                    globals()["ext_patient_dob"] = _app.med_pro_patient_dob
+            if (
+                _app.is_medical_professional_caller
+                and not dc_provider
+                and getattr(_app, "med_pro_patient_pcp", None)
+            ):
+                dc_provider = _app.med_pro_patient_pcp
+        except Exception:
+            pass
     if dc_stage in (None, "ask_decedent"):
         _ext_capture_identity(message, bare_reply=(dc_stage == "ask_decedent"))
         if not (ext_patient_first and ext_patient_last):
