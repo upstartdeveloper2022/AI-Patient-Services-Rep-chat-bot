@@ -99,6 +99,10 @@ LIFE_INSURANCE_DISABILITY_TRIGGERS = [
     "disability claim follow-up", "checking on a disability claim",
     "status of a disability claim", "disability claim status",
 ]
+DISABILITY_PAPERWORK_TRIGGERS = [
+    "disability paperwork", "disability form", "disability forms",
+    "disability documentation",
+]
 
 # ── 5/6/7. Home health (all require the base context word) ──
 HOME_HEALTH_CONTEXT_WORDS = ["home health"]
@@ -783,9 +787,17 @@ def detect_life_insurance_disability(message_lower):
     # A representative-style introduction is required so a PATIENT who
     # merely mentions their life insurance or a disability claim is not
     # treated as a company representative.
-    return _contains_any(
+    external_caller = bool(_EXTERNAL_CALLER_CUE.search(message_lower))
+    existing_disability_intent = _contains_any(
         message_lower, LIFE_INSURANCE_DISABILITY_TRIGGERS
-    ) and bool(_EXTERNAL_CALLER_CUE.search(message_lower))
+    )
+    insurer_paperwork_intent = (
+        _contains_any(message_lower, DISABILITY_PAPERWORK_TRIGGERS)
+        and bool(re.search(r"\b(?:insurance|insurer|carrier)\b", message_lower))
+    )
+    return external_caller and (
+        existing_disability_intent or insurer_paperwork_intent
+    )
 
 
 def _life_insurance_documentation_on_file():
@@ -2280,6 +2292,8 @@ def _ext_capture_identity(message, bare_reply=False):
         for pattern in (_NAME_DENSE_RE, _NAME_KEYWORD_RE):
             for match in pattern.finditer(message):
                 first, last = match.group(1), match.group(2)
+                if last.lower().endswith("'s"):
+                    last = last[:-2]
                 if _name_ok(first, last):
                     ext_patient_first, ext_patient_last = first, last
                     break
