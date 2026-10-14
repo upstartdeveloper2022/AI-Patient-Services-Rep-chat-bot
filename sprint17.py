@@ -2351,8 +2351,15 @@ def _office_fax_number():
 
 
 _ASK_OFFICE_FAX_RE = re.compile(
-    r"\b(?:what(?:'s| is)?\s+(?:your|the)\s+fax|your\s+fax\s+number|"
-    r"fax\s+number\s+for|where\s+(?:do|should)\s+(?:i|we)\s+fax)\b"
+    r"\b(?:what(?:'s| is)?\s+(?:(?:your|the)\s+)?(?:office\s+)?fax|"
+    r"(?:(?:your|the)\s+)?(?:office\s+)?fax\s+number\s+for|"
+    r"where\s+(?:do|should)\s+(?:i|we)\s+fax|"
+    r"where\s+(?:is|can\s+(?:i|we)\s+find)\s+"
+    r"(?:(?:your|the)\s+)?(?:office\s+)?fax|"
+    r"(?:can|could|may)\s+(?:i|we)\s+(?:get|have)\s+"
+    r"(?:(?:your|the)\s+)?(?:office\s+)?fax|"
+    r"(?:can|could)\s+you\s+(?:give|tell)\s+(?:me\s+)?"
+    r"(?:(?:your|the)\s+)?(?:office\s+)?fax)\b"
 )
 
 # ── detectors ──
@@ -2532,12 +2539,16 @@ _FAX_NOTICE_FOLLOWUP_RE = re.compile(
 
 
 def detect_incoming_fax_notice(message_lower):
-    """Heads-up that another office WILL fax a request for an order from
-    the PCP. Future tense only, so a past-tense receipt question ("did you
-    receive the fax we sent") stays with Sprint16."""
+    """Heads-up that another office WILL fax a request, order, or patient
+    information. Future tense only, so a past-tense receipt question stays
+    with Sprint16."""
     return (
             bool(_FAX_NOTICE_FUTURE_RE.search(message_lower))
-            and bool(re.search(r"\b(?:request|order)s?\b", message_lower))
+            and bool(re.search(
+                r"\b(?:request|order)s?\b|\b(?:information|documents?|"
+                r"paperwork)\b",
+                message_lower,
+            ))
             and not _FAX_NOTICE_RECEIPT_RE.search(message_lower)
     )
 
