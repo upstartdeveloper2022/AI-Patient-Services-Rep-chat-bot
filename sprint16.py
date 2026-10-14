@@ -130,7 +130,8 @@ _FAX_INQUIRY_FRAMING = [
     "checking on a fax", "checking on the fax", "check on a fax",
     "check on the fax", "check an", "following up on a fax",
     "follow up on a fax", "follow up on the fax", "followed up on the fax",
-    "did you receive", "have you received", "did you guys receive",
+    "did you receive", "have you received", "was the fax received",
+    "was our fax received", "did you guys receive",
     "did you get", "received the fax", "receive the fax",
     "received our fax", "receive our fax", "regarding the fax",
     "about the fax", "the fax we sent", "fax we sent",
@@ -201,7 +202,8 @@ _DOC_REQUEST_FRAMING = [
 # clarification sentence still resolves through the normal 75/25 roll.
 _RECEIPT_QUESTION_FRAMING = (
     "did you receive", "did you guys receive", "did you folks receive",
-    "have you received", "did you get", "did you get that request",
+    "have you received", "was the fax received", "was our fax received",
+    "did you get", "did you get that request",
     "did the office receive", "did your office receive",
     "did the doctor's office receive", "did the team receive",
     "did your practice receive",
@@ -297,6 +299,19 @@ _GOODBYE_PHRASES = [
 _CALL_ENDING_PHRASES = (
     "goodbye", "good bye", "bye", "have a great day", "nothing else",
     "that's all", "thats all", "all set",
+    "no", "no thank you", "no thanks", "nope", "nope thank you",
+    "nope thanks",
+)
+
+
+def _canonical_call_ending(message_lower):
+    normalized = message_lower.lower().replace("'", "").replace("\u2019", "")
+    normalized = re.sub(r"[.,!?]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+_CANONICAL_CALL_ENDINGS = frozenset(
+    _canonical_call_ending(phrase) for phrase in _CALL_ENDING_PHRASES
 )
 
 
@@ -819,11 +834,46 @@ def _compose_received_confirmation(message, message_lower,
 
 
 def _is_goodbye(message_lower):
-    return any(p in message_lower for p in _GOODBYE_PHRASES)
+    goodbye_phrases = {
+        _canonical_call_ending(phrase) for phrase in _GOODBYE_PHRASES
+    }
+    return _canonical_call_ending(message_lower) in goodbye_phrases
 
 
 def _is_call_ending(message_lower):
-    return any(p in message_lower for p in _CALL_ENDING_PHRASES)
+    normalized = _canonical_call_ending(message_lower)
+    if normalized in _CANONICAL_CALL_ENDINGS:
+        return True
+
+    for prefix in ("no", "nope"):
+        if normalized.startswith(prefix + " "):
+            remainder = normalized[len(prefix) + 1:]
+            if remainder in _CANONICAL_CALL_ENDINGS:
+                return True
+            for suffix in ("thank you", "thanks"):
+                if remainder.endswith(" " + suffix) and (
+                    remainder[:-(len(suffix) + 1)] in _CANONICAL_CALL_ENDINGS
+                ):
+                    return True
+    return False
+
+
+def _is_receipt_acknowledgement(message_lower):
+    return _canonical_call_ending(message_lower) in {
+        "thank you",
+        "thanks",
+        "yes we received it thanks",
+        "yes we did receive it thanks",
+        "got it thanks",
+    }
+
+
+def _finish_fax_flow():
+    global fax_flow_active, fax_intent_detected, fax_stage
+    fax_flow_active = False
+    fax_intent_detected = False
+    fax_stage = "closed"
+    return "Thank you for calling Sykes Creek Primary Care. Have a great day!"
 
 
 # ─────────────────────────────────────────────
@@ -966,8 +1016,9 @@ def handle_fax_flow(message, message_lower):
         if _extract_phone(message) or _asks_for_fax_number(message_lower):
             fax_stage = "received_callback"
         elif _is_call_ending(message_lower):
-            fax_stage = "closed"
-            return "Thank you for calling. Have a great day!"
+            return _finish_fax_flow()
+        elif _is_receipt_acknowledgement(message_lower):
+            return None
         else:
             # RT16-11 fix: the receipt question is already answered, and
             # this turn is the caller stating their actual business need
@@ -1077,8 +1128,8 @@ def handle_fax_flow(message, message_lower):
         return "May I get a good callback number for our team to follow up?"
 
     if fax_stage == "closed":
-        if _is_goodbye(message_lower):
-            return "Thank you for calling. Have a great day!"
+        if _is_goodbye(message_lower) or _is_call_ending(message_lower):
+            return _finish_fax_flow()
         # A representative who asks for the office fax number must get it at
         # ANY point in the call, including after the flow has already closed.
         # On the NOT-RECEIVED path this is the whole point - Steve told them
