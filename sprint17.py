@@ -11,13 +11,14 @@ Covers 12 UAT-checklist request types that don't belong in the PHF
   5.  In-house home health: cannot accept patient (referred elsewhere)
   6.  Home health: will the PCP follow the patient for home health?
   7.  Home health nurse requesting written treatment instructions
-  8.  Medication samples inquiry
-  9.  Imaging order / imaging request
-  10. Lab order request
-  11. Clarity on an existing imaging order (what body part it concerns)
-  12. Faxing an imaging order to an outside facility
-  13. Critical lab result reported by a lab representative
-  14. Outside office asking for OUR fax number (one-shot)
+  8.  Home health nurse visit notification
+  9.  Medication samples inquiry
+  10. Imaging order / imaging request
+  11. Lab order request
+  12. Clarity on an existing imaging order (what body part it concerns)
+  13. Faxing an imaging order to an outside facility
+  14. Critical lab result reported by a lab representative
+  15. Outside office asking for OUR fax number (one-shot)
 
 ARCHITECTURE (mirrors Sprint13.py / Sprint14.py exactly):
   - Self-contained. Does not import Sprint13 or Sprint14 and never reads
@@ -223,6 +224,20 @@ HOME_HEALTH_INSTRUCTIONS_TRIGGERS = [
     "orders to treat the patient", "care instructions for the patient",
 ]
 
+_HH_VISIT_NOTICE_PATTERN = re.compile(
+    r"\b(?:nurse|nursing\s+staff)\b[^.?!]{0,80}"
+    r"\b(?:scheduled|schedule|visiting|visit|seeing|see|coming)\b|"
+    r"\b(?:scheduled|schedule|visiting|visit|seeing|see|coming)\b"
+    r"[^.?!]{0,80}\b(?:nurse|nursing\s+staff)\b",
+    re.IGNORECASE,
+)
+_HH_VISIT_TIME_PATTERN = re.compile(
+    r"\b(?:today|tomorrow|tonight|this\s+(?:morning|afternoon|evening)|"
+    r"next\s+(?:week|month)|(?:next\s+)?(?:monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday))\b",
+    re.IGNORECASE,
+)
+
 # The same written-instructions request is often qualified by the KIND of
 # care between "written" and "instructions" ("written WOUND-CARE
 # instructions", "written medication instructions"), so none of the fixed
@@ -384,6 +399,7 @@ _ADDRESS_INDICATORS = [
 #   fax number?" needs no patient identity, so it is external-type).
 EXTERNAL_WORKFLOWS = frozenset({
     "prior_auth", "hh_decline", "hh_follow", "hh_instructions",
+    "hh_visit_notice",
     "life_insurance", "supervisor", "death_cert", "wrong_office",
     "fax_notice", "office_fax_number",
 })
@@ -887,6 +903,30 @@ def detect_home_health_instructions(message_lower):
     )
 
 
+def detect_home_health_visit_notice(message_lower):
+    """A Home Health professional notifying the office of an upcoming nurse
+    visit is an informational handoff, not a personal caller's HIPAA request
+    or a referral-status inquiry."""
+    home_health_caller = (
+        _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
+        or _home_health_caller_in_context()
+    )
+    if not home_health_caller:
+        return False
+    try:
+        import app as _app
+        professional_caller = getattr(
+            _app, "is_medical_professional_caller", False
+        )
+    except Exception:
+        professional_caller = False
+    professional_intro = bool(_EXTERNAL_CALLER_CUE.search(message_lower))
+    return bool(
+        (professional_caller or professional_intro)
+        and _HH_VISIT_NOTICE_PATTERN.search(message_lower)
+    )
+
+
 def detect_medication_samples(message_lower):
     return _contains_any(message_lower, MEDICATION_SAMPLES_TRIGGERS)
 
@@ -1219,6 +1259,7 @@ def detect_any_request_intent(message_lower):
         ("hh_decline", detect_home_health_decline),
         ("hh_follow", detect_home_health_follow),
         ("hh_instructions", detect_home_health_instructions),
+        ("hh_visit_notice", detect_home_health_visit_notice),
         ("samples", detect_medication_samples),
         ("imaging_clarity", detect_imaging_clarity),
         ("imaging_fax", detect_imaging_fax),
@@ -1884,6 +1925,34 @@ def _handle_hh_instructions(message, message_lower):
         )
 
     return None
+
+
+def _handle_hh_visit_notice(message, message_lower):
+    """Acknowledge a professional's Home Health visit update without
+    requesting patient authorization or treating it as a referral lookup."""
+    global requests_flow_active
+    _ext_capture_identity(message)
+    try:
+        import app as _app
+        first = (
+            getattr(_app, "med_pro_patient_first", None)
+            or ext_patient_first
+        )
+        last = (
+            getattr(_app, "med_pro_patient_last", None)
+            or ext_patient_last
+        )
+    except Exception:
+        first, last = ext_patient_first, ext_patient_last
+    patient = f"{first} {last}" if first and last else "the patient"
+    visit_time = _HH_VISIT_TIME_PATTERN.search(message)
+    when = f" {visit_time.group(0)}" if visit_time else ""
+    requests_flow_active = False
+    return (
+        f"Thank you. I've noted the upcoming Home Health nurse visit for "
+        f"{patient}{when} and will share this information with the care team. "
+        "Is there anything else I can help you with today?"
+    )
 
 
 def _hh_instructions_dob_question():
@@ -3206,6 +3275,7 @@ _WORKFLOW_HANDLERS = {
     "hh_decline": _handle_hh_decline,
     "hh_follow": _handle_hh_follow,
     "hh_instructions": _handle_hh_instructions,
+    "hh_visit_notice": _handle_hh_visit_notice,
     "samples": _handle_medication_samples,
     "imaging_request": _handle_imaging_request,
     "lab_order_request": _handle_lab_order_request,
@@ -3240,7 +3310,8 @@ def handle_requests_flow(message, message_lower):
         return None
     global _ext_identity_owner, ext_patient_first, ext_patient_last, ext_patient_dob
     if requests_active_workflow in (
-            "life_insurance", "death_cert", "fax_notice", "hh_instructions"):
+            "life_insurance", "death_cert", "fax_notice", "hh_instructions",
+            "hh_visit_notice"):
         # A second external workflow in the same call must never inherit the
         # previous workflow's patient/decedent identity.
         if _ext_identity_owner != requests_active_workflow:
