@@ -2523,9 +2523,13 @@ def detect_wrong_office(message_lower):
 
 
 _FAX_NOTICE_FUTURE_RE = re.compile(
-    r"\b(?:will|going\s+to|gonna|about\s+to|'ll)\s+(?:be\s+)?"
-    r"(?:faxing|fax|sending\s+(?:over\s+)?(?:you\s+)?a\s+fax)\b|"
-    r"\b(?:will|going\s+to|gonna|about\s+to)\s+be\s+sending\b[^.?!]{0,30}\bfax\b"
+    r"\b(?:will|going\s+to|gonna|about\s+to|'ll|we're|we are|i'm|i am)\s+"
+    r"(?:be\s+)?(?:faxing|fax|sending(?:\s+over)?|"
+    r"sending\s+(?:over\s+)?(?:you\s+)?a\s+fax)\b|"
+    r"\b(?:will|going\s+to|gonna|about\s+to)\s+be\s+sending\b"
+    r"[^.?!]{0,60}\bfax\b|"
+    r"\b(?:is|are|will\s+be|will)\s+coming\s+(?:over\s+)?"
+    r"(?:by|via)\s+fax\b"
 )
 _FAX_NOTICE_RECEIPT_RE = re.compile(
     r"\breceiv\w*\b|\bdid\s+you\b|\bhave\s+you\b|\barriv\w*\b|"
@@ -2545,8 +2549,8 @@ def detect_incoming_fax_notice(message_lower):
     return (
             bool(_FAX_NOTICE_FUTURE_RE.search(message_lower))
             and bool(re.search(
-                r"\b(?:request|order)s?\b|\b(?:information|documents?|"
-                r"paperwork)\b",
+                r"\b(?:request|order)s?\b|\b(?:information|info|records?|"
+                r"documents?|paperwork|materials?)\b",
                 message_lower,
             ))
             and not _FAX_NOTICE_RECEIPT_RE.search(message_lower)
