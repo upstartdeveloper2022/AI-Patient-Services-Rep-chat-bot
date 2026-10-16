@@ -10967,6 +10967,26 @@ def chat():
                 )
             ):
                 patient_self_announce_pattern = True
+        if not patient_self_announce_pattern:
+            patient_taking_over = bool(re.search(
+                r"\b(?:handed|passed|gave)\s+me\s+the\s+(?:phone|line)\b"
+                r"|\b(?:i(?:'ll| will))\s+take\s+"
+                r"(?:it|the call|the phone)\s+from here\b",
+                message_lower, re.IGNORECASE
+            ))
+            patient_identifies_self = bool(
+                patient_first_name
+                and re.search(
+                    r"(?:this is|i am|i'm|it's|it is)\s+"
+                    + re.escape(patient_first_name) + r"\b",
+                    message_lower, re.IGNORECASE
+                )
+            ) or bool(re.search(
+                r"\b(?:i am|i'm)\s+the patient\b",
+                message_lower, re.IGNORECASE
+            ))
+            if patient_taking_over and patient_identifies_self:
+                patient_self_announce_pattern = True
         if patient_self_announce_pattern:
             caller_is_patient = True
 
