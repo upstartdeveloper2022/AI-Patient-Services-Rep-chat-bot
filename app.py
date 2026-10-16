@@ -789,6 +789,16 @@ THIRD_PARTY_PHRASES = [
     "for my", "behalf of"
 ]
 
+_PATIENT_RELATIONSHIP_WORDS = (
+    r"wife|husband|mother|father|son|daughter|sister|brother|"
+    r"grandmother|grandfather|spouse|partner|relative|friend"
+)
+_PATIENT_POSSESSIVE_RELATION_PATTERN = re.compile(
+    r"\b([A-Za-z][A-Za-z'-]*)\s+([A-Za-z][A-Za-z'-]*)[’']s\s+"
+    r"(?:" + _PATIENT_RELATIONSHIP_WORDS + r")\b",
+    re.IGNORECASE,
+)
+
 _PARKING_LOT_WHEELCHAIR_EXCLUSIONS = re.compile(
     r"\b(?:power\s+wheelchair|dme|durable\s+medical|equipment\s+order|"
     r"wheelchair\s+order|purchase|rent|repair|transportation|transport|ride)\b"
@@ -6573,11 +6583,25 @@ def extract_names_from_message(message):
                     matched_first.lower() == patient_first_name.lower() and
                     matched_last.lower() == patient_last_name.lower()
             )
-            if not is_patient_self_announce:
+            possessive_patient = _PATIENT_POSSESSIVE_RELATION_PATTERN.search(
+                message
+            )
+            is_patient_named_as_relationship = bool(
+                possessive_patient
+                and matched_first.lower() == possessive_patient.group(1).lower()
+                and matched_last.lower() == possessive_patient.group(2).lower()
+            )
+            if not is_patient_self_announce and not is_patient_named_as_relationship:
                 result["caller_first"] = matched_first
                 result["caller_last"] = matched_last
             break
     patient_patterns = [
+        # Possessive introductions name the patient before the caller's
+        # relationship ("I'm John Smith's son", "I'm Lisa Carter, Robert
+        # Carter's daughter"). The person in the possessive is the patient,
+        # not the caller.
+        r"\b([A-Za-z][A-Za-z'-]*)\s+([A-Za-z][A-Za-z'-]*)[’']s\s+(?:"
+        + _PATIENT_RELATIONSHIP_WORDS + r")\b",
         # Accept optional punctuation or the word 'named' after the
         # relationship so constructions like "calling for my husband,
         # William Vance" or "calling for my husband named William
@@ -6816,7 +6840,10 @@ def determine_pre_chart_response(message, message_lower):
             caller_is_patient = True
 
     if (
-            any(phrase in message_lower for phrase in THIRD_PARTY_PHRASES)
+            (
+                any(phrase in message_lower for phrase in THIRD_PARTY_PHRASES)
+                or _PATIENT_POSSESSIVE_RELATION_PATTERN.search(message)
+            )
             and not _JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower)
             and not _VIRTUAL_WAIT_SELF_PATTERN.search(message_lower)
     ):
