@@ -173,6 +173,7 @@ pcp_collected = False
 verbal_consent_requested = False
 third_party_consent_asked = False
 third_party_consent_obtained = False
+patient_voluntary_takeover = False
 response_time_stated = False
 office_hours_stated = False
 lab_result_fax_active = False
@@ -776,6 +777,26 @@ PATIENT_PRESENT_PHRASES = [
     "she is with me", "he is with me",
     "she's with me", "he's with me"
 ]
+
+def _is_spontaneous_patient_takeover(message_lower, patient_first_name):
+    if not re.search(
+        r"\b(?:handed|passed|gave)\s+me\s+the\s+(?:phone|line)\b"
+        r"|\b(?:i(?:'ll| will))\s+take\s+"
+        r"(?:it|the call|the phone)\s+from here\b",
+        message_lower, re.IGNORECASE
+    ):
+        return False
+    return bool(
+        patient_first_name
+        and re.search(
+            r"(?:this is|i am|i'm|it's|it is)\s+"
+            + re.escape(patient_first_name) + r"\b",
+            message_lower, re.IGNORECASE
+        )
+    ) or bool(re.search(
+        r"\b(?:i am|i'm)\s+the patient\b",
+        message_lower, re.IGNORECASE
+    ))
 
 THIRD_PARTY_PHRASES = [
     "calling on behalf", "calling for my", "calling for",
@@ -7886,6 +7907,7 @@ def home():
     global verbal_consent_requested, response_time_stated, office_hours_stated
     global patient_self_dob_verified, patient_self_last_name_verified
     global third_party_consent_asked, third_party_consent_obtained
+    global patient_voluntary_takeover
     global urgent_symptoms_active, urgent_can_wait_asked
     global acute_same_day_established
     global ma_availability_determined, current_ma_availability
@@ -7991,6 +8013,7 @@ def home():
     verbal_consent_requested = False
     third_party_consent_asked = False
     third_party_consent_obtained = False
+    patient_voluntary_takeover = False
     response_time_stated = False
     office_hours_stated = False
     lab_result_fax_active = False
@@ -8192,6 +8215,7 @@ def chat():
     global patient_self_dob_verified, patient_self_last_name_verified
     global pcp_collected, verbal_consent_requested, third_party_consent_asked
     global third_party_consent_obtained, response_time_stated
+    global patient_voluntary_takeover
     global office_hours_stated, lab_result_fax_active
     global lab_result_inquiry_active
     global contagious_visit_active, contagious_same_day_check_pending
@@ -9325,26 +9349,12 @@ def chat():
             and not new_patient_flow_active
             and third_party_detected
             and caller_is_patient is False
-            and patient_first_name
-            and re.search(
-                r"\b(?:handed|passed|gave)\s+me\s+the\s+"
-                r"(?:phone|line)\b|\b(?:i(?:'ll| will))\s+take\s+"
-                r"(?:it|the call|the phone)\s+from here\b",
-                message_lower, re.IGNORECASE
-            )
-            and (
-                re.search(
-                    r"(?:this is|i am|i'm|it's|it is)\s+"
-                    + re.escape(patient_first_name) + r"\b",
-                    message_lower, re.IGNORECASE
-                )
-                or re.search(
-                    r"\b(?:i am|i'm)\s+the patient\b",
-                    message_lower, re.IGNORECASE
-                )
+            and _is_spontaneous_patient_takeover(
+                message_lower, patient_first_name
             )
     ):
         caller_is_patient = True
+        patient_voluntary_takeover = True
 
     if third_party_detected and caller_is_patient:
         if (
@@ -11005,26 +11015,11 @@ def chat():
                 )
             ):
                 patient_self_announce_pattern = True
-        if not patient_self_announce_pattern:
-            patient_taking_over = bool(re.search(
-                r"\b(?:handed|passed|gave)\s+me\s+the\s+(?:phone|line)\b"
-                r"|\b(?:i(?:'ll| will))\s+take\s+"
-                r"(?:it|the call|the phone)\s+from here\b",
-                message_lower, re.IGNORECASE
-            ))
-            patient_identifies_self = bool(
-                patient_first_name
-                and re.search(
-                    r"(?:this is|i am|i'm|it's|it is)\s+"
-                    + re.escape(patient_first_name) + r"\b",
-                    message_lower, re.IGNORECASE
-                )
-            ) or bool(re.search(
-                r"\b(?:i am|i'm)\s+the patient\b",
-                message_lower, re.IGNORECASE
-            ))
-            if patient_taking_over and patient_identifies_self:
-                patient_self_announce_pattern = True
+        if _is_spontaneous_patient_takeover(
+            message_lower, patient_first_name
+        ):
+            patient_self_announce_pattern = True
+            patient_voluntary_takeover = True
         if patient_self_announce_pattern:
             caller_is_patient = True
 
@@ -11079,6 +11074,21 @@ def chat():
                 {"role": "assistant", "content": verification_response}
             )
             return jsonify({"response": verification_response})
+
+    if (
+        patient_voluntary_takeover
+        and third_party_detected
+        and caller_is_patient
+        and patient_self_dob_verified
+        and (patient_self_last_name_verified or not patient_last_name)
+    ):
+        third_party_detected = False
+        patient_voluntary_takeover = False
+        conversation_history.extend([
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": "How can I help you today?"},
+        ])
+        return jsonify({"response": "How can I help you today?"})
 
     # HIPAA Third-Party Consent Gate (deterministic).
     # Once the patient has verified their OWN identity (last name and
