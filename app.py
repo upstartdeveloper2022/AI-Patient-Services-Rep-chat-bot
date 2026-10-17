@@ -2400,6 +2400,7 @@ RESCHEDULE_ACUTE_VISIT_TRIGGERS = [
 
 CANCEL_ACUTE_VISIT_TRIGGERS = [
     "cancel my appointment", "cancel the appointment",
+    "cancel that appointment",
     "cancel my visit", "need to cancel my appointment",
     "want to cancel my appointment", "cancel my acute visit",
     "cancel it", "cancel this", "like to cancel",
