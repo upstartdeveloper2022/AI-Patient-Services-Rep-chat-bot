@@ -216,6 +216,7 @@ new_patient_requested_provider = None
 new_patient_is_minor = None
 new_patient_minor_age = None
 new_patient_parent_on_line_pending = None
+new_patient_guardian_on_line = False
 # Sprint 15 (established patients): the under-18 DOB gate lives in the
 # new-patient flow, but existing patients (e.g. "I'm a patient of Dr.
 # Smith") never enter handle_new_patient_flow - determine_pre_chart_response
@@ -306,6 +307,7 @@ same_day_virtual_clinic_offer_pending = False
 next_available_options_pending = False
 next_day_or_urgent_care_pending = False
 virtual_appointment_scheduling_active = False
+in_person_appointment_scheduling_active = False
 virtual_florida_booking_pending = None
 
 # Scenario 16/17: Reschedule / Cancel Acute Visit
@@ -1502,9 +1504,16 @@ def _appointment_reason_already_stated():
     reason = _derive_generic_appointment_reason()
     if reason is None:
         return False
-    return reason.strip().strip(".,!?").lower() not in (
-        _DEGENERATE_APPOINTMENT_REASONS
-    )
+    normalized_reason = reason.strip().strip(".,!?")
+    if normalized_reason.lower() in _DEGENERATE_APPOINTMENT_REASONS:
+        return False
+    if re.fullmatch(
+        r"(?:with\s+)?dr\.?\s+[a-z][a-z'-]*(?:\s+[a-z][a-z'-]*)?",
+        normalized_reason,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
 
 
 # Deterministic condensation of a captured appointment reason so the
@@ -1756,6 +1765,23 @@ GENERIC_APPOINTMENT_INQUIRY_TRIGGERS = [
     "when am i scheduled to see", "when am i scheduled",
     "what time is my appointment", "check my appointment",
 ]
+
+
+def detect_be_seen_appointment_intent(message_lower):
+    """Recognize a patient's request to be seen as future scheduling."""
+    return bool(re.search(
+        r"\b(?:i['’]?d like|i would like|would like|want|need|hope|"
+        r"trying|looking)\b[^.!?]{0,40}\bto be seen\b",
+        message_lower,
+    ))
+
+
+def detect_explicit_appointment_request(message_lower):
+    return bool(re.search(
+        r"\b(?:need|want|would like|like|looking for)\b"
+        r"[^.!?]{0,40}\bappointment\b",
+        message_lower,
+    ))
 
 
 def detect_generic_appointment_inquiry_intent(message_lower):
@@ -4859,6 +4885,28 @@ def start_demographics_name_question(is_minor):
     return "Could I get your first and last name?"
 
 
+def accepted_new_patient_insurance_response():
+    global new_patient_demographics_stage
+    if new_patient_first_name and new_patient_last_name:
+        new_patient_demographics_stage = "dob"
+        if new_patient_is_minor:
+            return (
+                "Great news, we do accept that insurance. Could I get "
+                "the patient's date of birth?"
+            )
+        return "We do accept that insurance. Could I get your date of birth?"
+    if new_patient_is_minor:
+        return (
+            "Great news, we do accept that insurance. Could I get the "
+            "first and last name of the patient we will be scheduling "
+            "the appointment for?"
+        )
+    return (
+        "Great news, we do accept that insurance. Could I get your "
+        "first and last name to get started?"
+    )
+
+
 _MED_PRO_NON_NAME_WORDS = {
     "name", "os", "an", "a", "the", "order", "orders", "referral",
     "patient", "prescription", "medication", "insurance", "equipment",
@@ -5429,6 +5477,7 @@ def handle_new_patient_flow(message, message_lower):
     global new_patient_flow_active, new_patient_requested_provider
     global new_patient_is_minor, new_patient_minor_age
     global new_patient_parent_on_line_pending
+    global new_patient_guardian_on_line
     global caller_first_name, caller_last_name
     global new_patient_eligible_providers, new_patient_offered_provider
     global new_patient_accepting_checked, new_patient_no_provider_available
@@ -5451,24 +5500,6 @@ def handle_new_patient_flow(message, message_lower):
           f"is_minor={new_patient_is_minor!r} "
           f"accepting_checked={new_patient_accepting_checked!r} "
           f"offered_provider={new_patient_offered_provider!r}")
-
-    # Bug fix: a caller often states their own name in the very same
-    # message that also identifies them as a new patient (e.g. "This
-    # is Sarah Smith. I'm not a patient yet. I'm looking to schedule
-    # new patient appointments for myself and my spouse..."). Unlike
-    # determine_pre_chart_response() (which never runs for this flow -
-    # new_patient_flow_active short-circuits it entirely), nothing in
-    # handle_new_patient_flow() itself ever looked at a message for a
-    # name until the "name" demographics stage is reached, many turns
-    # later - so a name stated up front was silently discarded, and
-    # the "name" stage re-asked for something already given. Captures
-    # it opportunistically, once, the first time it appears in any
-    # turn's message; the "name" stage skip logic just below uses it.
-    if new_patient_first_name is None:
-        _early_name = extract_names_from_message(message)
-        if _early_name["caller_first"] and _early_name["caller_last"]:
-            new_patient_first_name = _early_name["caller_first"]
-            new_patient_last_name = _early_name["caller_last"]
 
     if detect_self_pay_intent(message_lower):
         new_patient_self_pay_intent = True
@@ -5517,6 +5548,33 @@ def handle_new_patient_flow(message, message_lower):
             new_patient_is_minor = True
         else:
             new_patient_is_minor = False
+    # Capture the patient's name only after determining whether the caller
+    # is registering a minor; in that case the caller's own introduction
+    # must not be stored as the patient.
+    if new_patient_first_name is None:
+        _early_name = extract_names_from_message(message)
+        if (
+            new_patient_is_minor
+            and _early_name["caller_first"]
+            and _early_name["caller_last"]
+            and not caller_first_name
+        ):
+            caller_first_name = _early_name["caller_first"]
+            caller_last_name = _early_name["caller_last"]
+        _name_key = "patient" if new_patient_is_minor else "caller"
+        if _early_name[f"{_name_key}_first"] and _early_name[f"{_name_key}_last"]:
+            new_patient_first_name = _early_name[f"{_name_key}_first"]
+            new_patient_last_name = _early_name[f"{_name_key}_last"]
+    if (
+        new_patient_is_minor
+        and re.search(
+            r"\bmy\s+(?:[\w'-]+\s+){0,4}(son|daughter|child|kid|boy|girl)\b",
+            message_lower,
+        )
+        and caller_first_name
+        and caller_last_name
+    ):
+        new_patient_guardian_on_line = True
 
     # ---- EARLY INSURANCE CHECK: Medicaid stated before provider chosen ----
     # If the caller already told us they have Medicaid before we ever asked
@@ -5781,11 +5839,7 @@ def handle_new_patient_flow(message, message_lower):
                 new_patient_insurance_collected = True
                 new_patient_insurance_accepted = True
                 if new_patient_is_minor:
-                    return (
-                        "Great news, we do accept that insurance. Could I "
-                        "get the first and last name of the patient we "
-                        "will be scheduling the appointment for?"
-                    )
+                    return accepted_new_patient_insurance_response()
                 if new_patient_first_name and new_patient_last_name:
                     new_patient_demographics_stage = "dob"
                     return "We do accept that insurance. Could I get your date of birth?"
@@ -5843,11 +5897,7 @@ def handle_new_patient_flow(message, message_lower):
         new_patient_insurance_collected = True
         if new_patient_insurance_accepted:
             if new_patient_is_minor:
-                return (
-                    "Great news, we do accept that insurance. Could I "
-                    "get the first and last name of the patient we will "
-                    "be scheduling the appointment for?"
-                )
+                return accepted_new_patient_insurance_response()
             return (
                 "Great news, we do accept that insurance. Could I get "
                 "your first and last name to get started?"
@@ -5932,11 +5982,7 @@ def handle_new_patient_flow(message, message_lower):
                 new_patient_insurance_accepted = True
                 new_patient_insurance_collected = True
                 if new_patient_is_minor:
-                    return (
-                        "Great news, we do accept that insurance. Could "
-                        "I get the first and last name of the patient we "
-                        "will be scheduling the appointment for?"
-                    )
+                    return accepted_new_patient_insurance_response()
                 return (
                     "Great news, we do accept that insurance. Could I "
                     "get your first and last name to get started?"
@@ -5978,11 +6024,7 @@ def handle_new_patient_flow(message, message_lower):
 
         if new_patient_insurance_accepted:
             if new_patient_is_minor:
-                return (
-                    "Great news, we do accept that insurance. Could I "
-                    "get the first and last name of the patient we will "
-                    "be scheduling the appointment for?"
-                )
+                return accepted_new_patient_insurance_response()
             return (
                 "Great news, we do accept that insurance. Could I get "
                 "your first and last name to get started?"
@@ -6035,10 +6077,7 @@ def handle_new_patient_flow(message, message_lower):
         if hf_confirmed:
             new_patient_insurance_collected = True
             new_patient_insurance_accepted = True
-            return (
-                "Great news, we do accept that insurance. Could I get "
-                "your first and last name to get started?"
-            )
+            return accepted_new_patient_insurance_response()
         if non_hf_ma or patient_wants_to_decline(message_lower):
             new_patient_insurance_collected = True
             new_patient_insurance_accepted = False
@@ -6086,14 +6125,11 @@ def handle_new_patient_flow(message, message_lower):
     if new_patient_insurance_accepted and new_patient_insurance_collected:
         if new_patient_demographics_stage is None:
             if (
-                    not new_patient_is_minor
-                    and new_patient_first_name and new_patient_last_name
+                    new_patient_first_name and new_patient_last_name
             ):
-                # Bug fix: the caller's name was already captured
-                # earlier in this call (see the opportunistic capture
-                # at the top of this function) - skip the redundant
-                # name question entirely and continue straight to
-                # asking for DOB.
+                # The patient's identity may have been captured before
+                # insurance was confirmed; continue to DOB rather than
+                # restarting the name step.
                 new_patient_demographics_stage = "dob"
             else:
                 new_patient_demographics_stage = "name"
@@ -6144,7 +6180,7 @@ def handle_new_patient_flow(message, message_lower):
                     # route straight to address collection so the parent
                     # continues the registration with the patient beside
                     # them on the line.
-                    pf, pl = aggressive_name_extraction(message)
+                    pf, pl = _established_parent_name_from_message(message)
                     if pf and pl:
                         caller_first_name = pf
                         caller_last_name = pl
@@ -6190,13 +6226,19 @@ def handle_new_patient_flow(message, message_lower):
                     # rather than silently swallowed by the caller stage.
                     new_patient_is_minor = True
                     new_patient_minor_age = dob_age
-                    new_patient_parent_on_line_pending = True
+                    if not new_patient_guardian_on_line:
+                        new_patient_parent_on_line_pending = True
+                        return (
+                            f"Thank you for that. Since the patient is "
+                            f"{dob_age} and under 18, I need to confirm a "
+                            f"parent or guardian is on the line with you. "
+                            f"Would it be okay to put the patient's parent "
+                            f"or guardian on the phone now?"
+                        )
+                    new_patient_demographics_stage = "address"
                     return (
-                        f"Thank you for that. Since the patient is "
-                        f"{dob_age} and under 18, I need to confirm a "
-                        f"parent or guardian is on the line with you. "
-                        f"Would it be okay to put the patient's parent "
-                        f"or guardian on the phone now?"
+                        "Thank you. Could I get the street address where "
+                        "the patient lives?"
                     )
                 # After collecting the patient's DOB, ask who is on the
                 # call (caller) before continuing with address collection.
@@ -6445,9 +6487,13 @@ def handle_new_patient_flow(message, message_lower):
                 reason=_derive_generic_appointment_reason(),
             )
             address_name = caller_first_name if caller_first_name else new_patient_first_name
+            scheduled_subject = (
+                f"{new_patient_first_name} is scheduled"
+                if new_patient_is_minor else "You are scheduled"
+            )
             confirmation = (
                 f"Thank you, {address_name}. I have you all set. "
-                f"You are scheduled with "
+                f"{scheduled_subject} with "
                 f"{new_patient_offered_provider} for "
                 f"{new_patient_appointment_selection}."
             )
@@ -6617,6 +6663,12 @@ def extract_names_from_message(message):
                 result["caller_last"] = matched_last
             break
     patient_patterns = [
+        # A parent often gives a child's name after the relationship in
+        # new-patient openings ("my 14-year-old son, Ethan Turner").
+        r"\bmy\s+(?:(?:\d{1,2}[- ]year[- ]old|"
+        r"\d{1,2}\s+years?\s+old)\s+)?"
+        r"(?:son|daughter|child|kid|boy|girl)\s*,?\s+"
+        r"([A-Za-z][A-Za-z'-]*)\s+([A-Za-z][A-Za-z'-]*)\b",
         # Possessive introductions name the patient before the caller's
         # relationship ("I'm John Smith's son", "I'm Lisa Carter, Robert
         # Carter's daughter"). The person in the possessive is the patient,
@@ -7932,6 +7984,7 @@ def home():
     global new_patient_flow_active, new_patient_requested_provider
     global new_patient_is_minor, new_patient_minor_age
     global new_patient_parent_on_line_pending
+    global new_patient_guardian_on_line
     global established_patient_minor_pending, established_patient_minor_age
     global established_patient_minor_guardian_confirmed, established_patient_dob
     global established_patient_minor_waiting
@@ -7962,6 +8015,7 @@ def home():
     global next_available_options_pending
     global next_day_or_urgent_care_pending
     global virtual_appointment_scheduling_active, virtual_florida_booking_pending
+    global in_person_appointment_scheduling_active
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
@@ -8036,6 +8090,7 @@ def home():
     next_available_options_pending = False
     next_day_or_urgent_care_pending = False
     virtual_appointment_scheduling_active = False
+    in_person_appointment_scheduling_active = False
     virtual_florida_booking_pending = None
     acute_existing_appt_day = None
     acute_existing_appt_time = None
@@ -8131,6 +8186,7 @@ def home():
     new_patient_is_minor = None
     new_patient_minor_age = None
     new_patient_parent_on_line_pending = None
+    new_patient_guardian_on_line = False
     established_patient_minor_pending = None
     established_patient_minor_age = None
     established_patient_minor_guardian_confirmed = False
@@ -8232,6 +8288,7 @@ def chat():
     global next_available_options_pending
     global next_day_or_urgent_care_pending
     global virtual_appointment_scheduling_active, virtual_florida_booking_pending
+    global in_person_appointment_scheduling_active
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
     global acute_new_time_pending
@@ -12041,9 +12098,29 @@ def chat():
                     virtual_visit_recently_offered = True
                 break
 
+    in_person_visit_selected = bool(re.search(
+        r"^\s*(?:(?:yes|okay|ok|sure)[, ]+)?"
+        r"(?:in[- ]person|in the office)\b|"
+        r"\b(?:prefer|choose|select|want)\s+(?:an?\s+)?in[- ]person\b",
+        message_lower,
+    ))
+    visit_type_choice_was_offered = False
+    if in_person_visit_selected:
+        for turn in reversed(conversation_history):
+            if turn.get("role") == "assistant":
+                previous = turn.get("content", "").lower()
+                visit_type_choice_was_offered = (
+                    ("virtual" in previous or "video" in previous)
+                    and ("in-person" in previous or "in person" in previous)
+                    and "?" in previous
+                )
+                break
+    if visit_type_choice_was_offered:
+        in_person_appointment_scheduling_active = True
     virtual_visit_accepted_now = (
             virtual_visit_recently_offered
             and patient_wants_to_proceed(message_lower)
+            and not in_person_visit_selected
             and not is_medical_professional_caller
     )
     if virtual_visit_accepted_now:
@@ -12106,6 +12183,7 @@ def chat():
                      and "appointment" in last_assistant_lower
                      and "?" in last_assistant_lower)
                     or "what is the reason" in last_assistant_lower
+                    or "seen for" in last_assistant_lower
             ):
                 appointment_reason_just_requested = True
             break
@@ -12196,6 +12274,10 @@ def chat():
             ])
             or virtual_visit_accepted_now
             or virtual_appointment_scheduling_active
+            or (
+                in_person_appointment_scheduling_active
+                and not is_same_day
+            )
             or same_day_virtual_clinic_declined_now
             or next_available_options_pending
             or appointment_reason_just_requested
@@ -12208,6 +12290,10 @@ def chat():
         if (
                 not is_same_day or virtual_visit_accepted_now
                 or virtual_appointment_scheduling_active
+                or (
+                    in_person_appointment_scheduling_active
+                    and not is_same_day
+                )
                 or same_day_virtual_clinic_declined_now
                 or next_available_options_pending
                 or appointment_reason_just_requested
@@ -13695,6 +13781,9 @@ def chat():
             and not is_medical_professional_caller
             and caller_is_patient
             and (
+                detect_be_seen_appointment_intent(message_lower)
+                or detect_explicit_appointment_request(message_lower)
+                or
                 (
                     "appointment" in message_lower
                     and ("schedule" in message_lower or "book" in message_lower)
@@ -13721,7 +13810,11 @@ def chat():
                 )
             )
     ):
-        _reason_question_response = "What is the reason for the appointment?"
+        _reason_question_response = (
+            "What would you like to be seen for?"
+            if detect_be_seen_appointment_intent(message_lower)
+            else "What is the reason for the appointment?"
+        )
         conversation_history.append(
             {"role": "assistant", "content": _reason_question_response}
         )
@@ -13926,6 +14019,8 @@ def chat():
         virtual_confirmation = _extract_generic_appointment_confirmation(
             assistant_message
         )
+        if in_person_appointment_scheduling_active and virtual_confirmation:
+            in_person_appointment_scheduling_active = False
         if (
                 virtual_appointment_scheduling_active
                 and virtual_confirmation
