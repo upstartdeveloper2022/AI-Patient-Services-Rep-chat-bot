@@ -9320,6 +9320,44 @@ def chat():
                 caller_is_patient = False
                 pre_chart_complete = True
 
+    if (
+            not pre_chart_complete
+            and not new_patient_flow_active
+            and third_party_detected
+            and caller_is_patient is False
+            and patient_first_name
+            and re.search(
+                r"\b(?:handed|passed|gave)\s+me\s+the\s+"
+                r"(?:phone|line)\b|\b(?:i(?:'ll| will))\s+take\s+"
+                r"(?:it|the call|the phone)\s+from here\b",
+                message_lower, re.IGNORECASE
+            )
+            and (
+                re.search(
+                    r"(?:this is|i am|i'm|it's|it is)\s+"
+                    + re.escape(patient_first_name) + r"\b",
+                    message_lower, re.IGNORECASE
+                )
+                or re.search(
+                    r"\b(?:i am|i'm)\s+the patient\b",
+                    message_lower, re.IGNORECASE
+                )
+            )
+    ):
+        caller_is_patient = True
+
+    if third_party_detected and caller_is_patient:
+        if (
+            patient_last_name
+            and re.search(
+                r"\b" + re.escape(patient_last_name) + r"\b",
+                message_lower, re.IGNORECASE
+            )
+        ):
+            patient_self_last_name_verified = True
+        if detect_dob_in_message(message_lower):
+            patient_self_dob_verified = True
+
     if ( new_patient_flow_active
         and not any(
                 trigger in message_lower
