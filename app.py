@@ -22,6 +22,7 @@ import re
 import random
 import secrets
 import json
+import tempfile
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify
 from groq import Groq
@@ -380,6 +381,7 @@ generic_couple_cancel_pending = False
 generic_couple_cancel_spouse_first = None
 generic_couple_cancel_spouse_last = None
 generic_couple_cancel_spouse_dob = None
+generic_couple_cancel_spouse_only_pending = False
 
 # Virtual-visit wait workflow: the patient is awaiting a scheduled
 # virtual visit and reports the PCP hasn't joined (or shows any sign of
@@ -1238,14 +1240,41 @@ def _load_generic_appointment_records():
 
 
 def _save_generic_appointment_records():
+    temporary_path = None
     try:
-        with open(GENERIC_APPOINTMENT_RECORDS_FILE, "w") as f:
+        directory = os.path.dirname(
+            os.path.abspath(GENERIC_APPOINTMENT_RECORDS_FILE)
+        )
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=directory, delete=False
+        ) as f:
+            temporary_path = f.name
             json.dump(generic_appointment_records, f)
-    except OSError:
-        pass
+        os.replace(temporary_path, GENERIC_APPOINTMENT_RECORDS_FILE)
+        return True
+    except OSError as exc:
+        print(f"[generic-appointments] failed to save records: {exc}")
+        return False
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError as exc:
+                print(
+                    "[generic-appointments] failed to remove temporary "
+                    f"record file: {exc}"
+                )
 
 
 generic_appointment_records = _load_generic_appointment_records()
+
+
+_GENERIC_APPOINTMENT_NON_NAME_TOKENS = frozenset({
+    "my", "husband", "wife", "spouse", "partner", "son", "daughter",
+    "mother", "father", "parent", "guardian", "yes", "yeah", "yep",
+    "of", "of'", "his", "her", "their", "your", "the", "a", "an",
+    "is", "and", "dob", "date", "birth",
+})
 
 
 def _generic_patient_record_key(first_name, last_name):
@@ -1255,7 +1284,16 @@ def _generic_patient_record_key(first_name, last_name):
     operating on an entirely separate dict/file - no shared state."""
     if not first_name or not last_name:
         return None
-    return f"{first_name.strip().lower()}_{last_name.strip().lower()}"
+    first = first_name.strip().lower()
+    last = last_name.strip().lower()
+    if (
+        not first
+        or not last
+        or first in _GENERIC_APPOINTMENT_NON_NAME_TOKENS
+        or last in _GENERIC_APPOINTMENT_NON_NAME_TOKENS
+    ):
+        return None
+    return f"{first}_{last}"
 
 
 def store_generic_appointment_record(first_name, last_name, day_time_text, provider=None, reason=None):
@@ -1298,10 +1336,71 @@ def cancel_generic_appointment_record(first_name, last_name):
     if key not in generic_appointment_records:
         generic_appointment_records.update(_load_generic_appointment_records())
     if key in generic_appointment_records:
-        del generic_appointment_records[key]
-        _save_generic_appointment_records()
-        return True
+        record = generic_appointment_records.pop(key)
+        if _save_generic_appointment_records():
+            return True
+        generic_appointment_records[key] = record
     return False
+
+
+def cancel_generic_appointment_records(identities):
+    """Persist an all-or-none group of generic appointment cancellations."""
+    disk_records = _load_generic_appointment_records()
+    requested_keys = {
+        key for first_name, last_name in identities
+        if (key := _generic_patient_record_key(first_name, last_name))
+    }
+    if not requested_keys or not requested_keys.issubset(disk_records):
+        return set()
+    removed_records = {key: disk_records[key] for key in requested_keys}
+    # Disk is the source of truth. update() left stale in-memory records in
+    # place, allowing a later group save to resurrect a record it did not
+    # actually remove from the current file.
+    generic_appointment_records.clear()
+    generic_appointment_records.update(disk_records)
+    for key in requested_keys:
+        generic_appointment_records.pop(key, None)
+    if _save_generic_appointment_records():
+        return requested_keys
+    generic_appointment_records.update(removed_records)
+    return None
+
+
+def _is_generic_six_month_followup_record(record):
+    reason = (record or {}).get("reason") or ""
+    return bool(re.search(
+        r"\b(?:6|six)[\s-]+month[\s-]+follow[\s-]?ups?\b",
+        reason,
+        re.IGNORECASE,
+    ))
+
+
+def _named_generic_followup_cancel_target(message, caller_first, caller_last):
+    if not re.search(r"\b(?:too|also|as\s+well)\b", message, re.IGNORECASE):
+        return None
+    match = re.search(
+        r"\bcancel\s+(?:my\s+)?([A-Za-z][A-Za-z'-]+)",
+        message,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    requested_first = match.group(1).lower()
+    if requested_first.endswith("'s"):
+        requested_first = requested_first[:-2]
+    caller_key = _generic_patient_record_key(caller_first, caller_last)
+    records = _load_generic_appointment_records()
+    generic_appointment_records.update(records)
+    matches = [
+        key for key, record in records.items()
+        if key != caller_key
+        and key.split("_", 1)[0] == requested_first
+        and _is_generic_six_month_followup_record(record)
+    ]
+    if len(matches) != 1:
+        return None
+    first, last = matches[0].split("_", 1)
+    return first.title(), last.title()
 
 
 # Prefixes to strip from a patient's raw request message when deriving
@@ -4097,42 +4196,59 @@ def handle_couple_six_month_followup_flow(message):
             if not detect_dob_in_message(message):
                 return f"Could I get {possessive} date of birth?"
             spouse_first = couple_followup_spouse_first_name
-            cancelled_parts = []
             caller_record = get_stored_generic_appointment_record(
                 caller_first_name, caller_last_name
             )
-            if caller_record is not None:
-                cancel_generic_appointment_record(
-                    caller_first_name, caller_last_name
-                )
-                cancelled_parts.append(
-                    f"your visit on {caller_record['appointment_day']}"
-                )
             spouse_record = get_stored_generic_appointment_record(
                 spouse_first, couple_followup_spouse_last_name
             )
-            if spouse_record is not None:
-                cancel_generic_appointment_record(
-                    spouse_first, couple_followup_spouse_last_name
+            # The prior GF-13 patch deleted each record separately. A failed
+            # spouse lookup or save could therefore cancel the caller, discard
+            # the spouse context, and still confirm a joint cancellation.
+            if (
+                    caller_record is None or spouse_record is None
+            ):
+                couple_followup_flow_active = False
+                couple_followup_cancel_active = False
+                couple_followup_spouse_stage = None
+                return (
+                    "I couldn't find both six-month follow-up appointments "
+                    "on file, so neither appointment was cancelled."
                 )
-                cancelled_parts.append(
-                    f"{spouse_first}'s visit on "
-                    f"{spouse_record['appointment_day']}"
+            cancelled_keys = cancel_generic_appointment_records([
+                (caller_first_name, caller_last_name),
+                (spouse_first, couple_followup_spouse_last_name),
+            ])
+            expected_keys = {
+                _generic_patient_record_key(caller_first_name, caller_last_name),
+                _generic_patient_record_key(
+                    spouse_first, couple_followup_spouse_last_name
+                ),
+            }
+            if cancelled_keys is None:
+                # Preserve the verified identities so a persistence failure
+                # can be retried without re-asking for appointment details.
+                return (
+                    "I couldn't complete the cancellation because the "
+                    "appointment records could not be updated. Neither "
+                    "cancellation is confirmed. Please try again."
+                )
+            if cancelled_keys != expected_keys:
+                couple_followup_flow_active = False
+                couple_followup_cancel_active = False
+                couple_followup_spouse_stage = None
+                return (
+                    "I couldn't find both six-month follow-up appointments "
+                    "on file, so neither appointment was cancelled."
                 )
             couple_followup_flow_active = False
             couple_followup_cancel_active = False
             couple_followup_spouse_stage = None
-            if not cancelled_parts:
-                return (
-                    f"I couldn't find any upcoming six-month follow-up "
-                    f"appointments on file for {spouse_first} or yourself "
-                    f"to cancel. Is there anything else I can help you "
-                    f"with today?"
-                )
             return (
-                "I've cancelled "
-                + " and ".join(cancelled_parts)
-                + ". Is there anything else I can help you with today?"
+                f"I've cancelled your visit on {caller_record['appointment_day']} "
+                f"and {spouse_first}'s visit on "
+                f"{spouse_record['appointment_day']}. Is there anything else "
+                "I can help you with today?"
             )
 
     # Spouse-identity collection stages. Entered after the caller's own
@@ -4142,30 +4258,7 @@ def handle_couple_six_month_followup_flow(message):
     # their record is persisted (mirrors the individual six-month flow's
     # name-first -> DOB -> schedule household machine).
     if couple_followup_spouse_stage == "name":
-        _name_m = re.search(
-            r"\b(?:my|her|his|your|their)\s+"
-            r"(?:(?:wife|husband|spouse|partner|son|daughter)'s\s+)?"
-            r"name\s+is\s+([A-Za-z]+)\s+([A-Za-z]+)",
-            message, re.IGNORECASE
-        )
-        if _name_m:
-            spouse_first, spouse_last = _name_m.group(1), _name_m.group(2)
-        else:
-            _combined_name_dob_m = re.match(
-                r"\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)\b",
-                message,
-            ) if detect_dob_in_message(message) else None
-            if _combined_name_dob_m:
-                spouse_first, spouse_last = (
-                    _combined_name_dob_m.group(1),
-                    _combined_name_dob_m.group(2),
-                )
-            else:
-                spouse_first, spouse_last = aggressive_name_extraction(message)
-            if not spouse_first or not spouse_last:
-                parts = message.strip().split()
-                if len(parts) >= 2:
-                    spouse_first, spouse_last = parts[0], parts[1]
+        spouse_first, spouse_last = _extract_spouse_name_from_message(message)
         if spouse_first and spouse_last:
             couple_followup_spouse_first_name = spouse_first
             couple_followup_spouse_last_name = spouse_last
@@ -4364,6 +4457,7 @@ def handle_generic_couple_cancel(message, message_lower):
     global generic_couple_cancel_pending
     global generic_couple_cancel_spouse_first, generic_couple_cancel_spouse_last
     global generic_couple_cancel_spouse_dob
+    global generic_couple_cancel_spouse_only_pending
     if not generic_couple_cancel_pending:
         if is_generic_couple_cancel_request(message_lower):
             generic_couple_cancel_pending = True
@@ -4377,29 +4471,34 @@ def handle_generic_couple_cancel(message, message_lower):
             and is_generic_couple_cancel_request(message_lower)):
         return "May I have your spouse's first and last name and date of birth?"
     if not generic_couple_cancel_spouse_first or not generic_couple_cancel_spouse_last:
-        _spouse_m = re.search(
-            r"\b(?:my|her|his|your|their)\s+"
-            r"(?:(?:wife|husband|spouse|partner|son|daughter)'s\s+)?"
-            r"name\s+is\s+([A-Za-z]+)\s+([A-Za-z]+)",
-            message, re.IGNORECASE
-        )
-        if _spouse_m:
-            spouse_first, spouse_last = _spouse_m.group(1), _spouse_m.group(2)
-        else:
-            _bare_spouse_name = re.match(
-                r"\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)"
-                r"(?=\s*(?:[,.;]|and\b|(?:dob|date\s+of\s+birth)\b|"
-                r"\d|$))",
-                message,
-                re.IGNORECASE,
+        try:
+            spouse_first, spouse_last = _extract_spouse_name_from_message(message)
+        except Exception:
+            spouse_first, spouse_last = None, None
+        if not spouse_first or not spouse_last:
+            _spouse_m = re.search(
+                r"\b(?:my|her|his|your|their)\s+"
+                r"(?:(?:wife|husband|spouse|partner|son|daughter)'s\s+)?"
+                r"name\s+is\s+([A-Za-z]+)\s+([A-Za-z]+)",
+                message, re.IGNORECASE
             )
-            if _bare_spouse_name:
-                spouse_first, spouse_last = (
-                    _bare_spouse_name.group(1),
-                    _bare_spouse_name.group(2),
-                )
+            if _spouse_m:
+                spouse_first, spouse_last = _spouse_m.group(1), _spouse_m.group(2)
             else:
-                spouse_first, spouse_last = None, None
+                _bare_spouse_name = re.match(
+                    r"\s*([A-Z][a-z]+)\s+([A-Z][a-z]+)"
+                    r"(?=\s*(?:[,.;]|and\b|(?:dob|date\s+of\s+birth)\b|"
+                    r"\d|$))",
+                    message,
+                    re.IGNORECASE,
+                )
+                if _bare_spouse_name:
+                    spouse_first, spouse_last = (
+                        _bare_spouse_name.group(1),
+                        _bare_spouse_name.group(2),
+                    )
+                else:
+                    spouse_first, spouse_last = None, None
         if not spouse_first or not spouse_last:
             return "May I have your spouse's first and last name and date of birth?"
         generic_couple_cancel_spouse_first = spouse_first
@@ -4419,16 +4518,54 @@ def handle_generic_couple_cancel(message, message_lower):
     spouse_record = get_stored_generic_appointment_record(
         spouse_first, generic_couple_cancel_spouse_last
     )
+    identities_to_cancel = []
     cancelled_parts = []
-    if caller_record is not None:
-        cancel_generic_appointment_record(caller_first_name, caller_last_name)
+    if caller_record is not None and not generic_couple_cancel_spouse_only_pending:
+        identities_to_cancel.append(
+            (caller_first_name, caller_last_name)
+        )
+    if spouse_record is not None:
+        identities_to_cancel.append(
+            (spouse_first, generic_couple_cancel_spouse_last)
+        )
+    if (
+            spouse_record is None
+            or (
+                not generic_couple_cancel_spouse_only_pending
+                and caller_record is None
+            )
+    ):
+        return (
+            "I couldn't find both appointments on file, so neither "
+            "appointment was cancelled."
+        )
+    expected_keys = {
+        _generic_patient_record_key(first_name, last_name)
+        for first_name, last_name in identities_to_cancel
+    }
+    cancelled_keys = cancel_generic_appointment_records(identities_to_cancel)
+    if cancelled_keys is None:
+        return (
+            "I couldn't complete the cancellation because the appointment "
+            "records could not be updated. Neither cancellation is "
+            "confirmed. Please try again."
+        )
+    if cancelled_keys != expected_keys:
+        return (
+            "I couldn't find both appointments on file, so neither "
+            "appointment was cancelled."
+        )
+    caller_key = _generic_patient_record_key(
+        caller_first_name, caller_last_name
+    )
+    spouse_key = _generic_patient_record_key(
+        spouse_first, generic_couple_cancel_spouse_last
+    )
+    if caller_record is not None and caller_key in cancelled_keys:
         cancelled_parts.append(
             f"your visit on {caller_record['appointment_day']}"
         )
-    if spouse_record is not None:
-        cancel_generic_appointment_record(
-            spouse_first, generic_couple_cancel_spouse_last
-        )
+    if spouse_record is not None and spouse_key in cancelled_keys:
         cancelled_parts.append(
             f"{spouse_first}'s visit on {spouse_record['appointment_day']}"
         )
@@ -4436,6 +4573,7 @@ def handle_generic_couple_cancel(message, message_lower):
     generic_couple_cancel_spouse_first = None
     generic_couple_cancel_spouse_last = None
     generic_couple_cancel_spouse_dob = None
+    generic_couple_cancel_spouse_only_pending = False
     if not cancelled_parts:
         return (
             "I couldn't find any upcoming appointments on file for "
@@ -4552,6 +4690,47 @@ def aggressive_name_extraction(message):
                 return first, last
             return None, None
     return None, None
+
+
+_SPOUSE_IDENTITY_NON_NAME_TOKENS = frozenset({
+    "my", "husband", "wife", "spouse", "partner", "yes", "yeah", "yep",
+    "of", "his", "her", "their", "your", "the", "a", "an", "is", "and",
+    "dob", "date", "birth",
+})
+
+
+def _extract_spouse_name_from_message(message):
+    """Extract a spouse's name without treating relationship wording as it."""
+    match = re.search(
+        r"\b(?:my|her|his|your|their)\s+"
+        r"(?:[A-Za-z'-]+\s+)?(?:is|name\s+is)\s+"
+        r"([A-Za-z][A-Za-z'-]+)\s+([A-Za-z][A-Za-z'-]+)\b",
+        message, re.IGNORECASE,
+    )
+    if not match and detect_dob_in_message(message):
+        match = re.match(
+            r"\s*([A-Z][A-Za-z'-]+)\s+([A-Z][A-Za-z'-]+)\b",
+            message,
+        )
+    if match:
+        first, last = match.group(1), match.group(2)
+    else:
+        first, last = aggressive_name_extraction(message)
+    if not first or not last:
+        match = re.fullmatch(
+            r"\s*([A-Z][A-Za-z'-]+)\s+([A-Z][A-Za-z'-]+)[.,!?]*\s*",
+            message,
+        )
+        if match:
+            first, last = match.group(1), match.group(2)
+    if (
+        not first
+        or not last
+        or first.lower() in _SPOUSE_IDENTITY_NON_NAME_TOKENS
+        or last.lower() in _SPOUSE_IDENTITY_NON_NAME_TOKENS
+    ):
+        return None, None
+    return first, last
 
 
 NEW_PATIENT_PROCEED_PHRASES = [
@@ -8029,6 +8208,9 @@ def home():
     global generic_household_reschedule_stage, generic_household_spouse_first
     global generic_household_spouse_last, generic_household_spouse_dob
     global generic_household_spouse_old_slot, generic_household_spouse_relation
+    global generic_couple_cancel_pending, generic_couple_cancel_spouse_first
+    global generic_couple_cancel_spouse_last, generic_couple_cancel_spouse_dob
+    global generic_couple_cancel_spouse_only_pending
     global virtual_wait_active, virtual_wait_choice_pending
     global virtual_wait_reschedule_pending, virtual_wait_reschedule_schedule
     global virtual_wait_reschedule_provider
@@ -8124,6 +8306,7 @@ def home():
     generic_couple_cancel_spouse_first = None
     generic_couple_cancel_spouse_last = None
     generic_couple_cancel_spouse_dob = None
+    generic_couple_cancel_spouse_only_pending = False
     virtual_wait_active = False
     virtual_wait_choice_pending = False
     virtual_wait_reschedule_pending = False
@@ -8308,6 +8491,7 @@ def chat():
     global generic_household_cancel_spouse_old_slot, generic_household_cancel_spouse_relation
     global generic_couple_cancel_pending, generic_couple_cancel_spouse_first
     global generic_couple_cancel_spouse_last, generic_couple_cancel_spouse_dob
+    global generic_couple_cancel_spouse_only_pending
     global virtual_wait_active, virtual_wait_choice_pending
     global virtual_wait_reschedule_pending, virtual_wait_reschedule_schedule
     global virtual_wait_reschedule_provider
@@ -9538,11 +9722,9 @@ def chat():
     ):
         spouse_response = None
         if individual_six_month_followup_spouse_stage == "name":
-            spouse_first, spouse_last = aggressive_name_extraction(user_message)
-            if not spouse_first or not spouse_last:
-                parts = user_message.strip().split()
-                if len(parts) >= 2:
-                    spouse_first, spouse_last = parts[0], parts[1]
+            spouse_first, spouse_last = _extract_spouse_name_from_message(
+                user_message
+            )
             if spouse_first and spouse_last:
                 individual_six_month_followup_spouse_first_name = spouse_first
                 individual_six_month_followup_spouse_last_name = spouse_last
@@ -9663,6 +9845,80 @@ def chat():
             return jsonify({"response": spouse_response})
 
     if pre_chart_complete and not Sprint13.phf_flow_active:
+        if not is_medical_professional_caller:
+            named_cancel_target = _named_generic_followup_cancel_target(
+                user_message, caller_first_name, caller_last_name
+            )
+            if named_cancel_target:
+                if not generic_couple_cancel_pending:
+                    generic_couple_cancel_spouse_only_pending = True
+                generic_couple_cancel_pending = True
+                (
+                    generic_couple_cancel_spouse_first,
+                    generic_couple_cancel_spouse_last,
+                ) = named_cancel_target
+                cancel_response = handle_generic_couple_cancel(
+                    user_message, message_lower
+                )
+                conversation_history.extend([
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": cancel_response},
+                ])
+                return jsonify({"response": cancel_response})
+
+            if generic_couple_cancel_pending:
+                cancel_response = handle_generic_couple_cancel(
+                    user_message, message_lower
+                )
+                conversation_history.extend([
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": cancel_response},
+                ])
+                return jsonify({"response": cancel_response})
+
+            current_first = patient_first_name or caller_first_name
+            current_last = patient_last_name or caller_last_name
+            current_record = get_stored_generic_appointment_record(
+                current_first, current_last
+            )
+            explicitly_post_hospital = bool(re.search(
+                r"\bpost[\s-]?hospital\b|\bhospital\s+follow[\s-]?up\b",
+                message_lower,
+            ))
+            if (
+                    not explicitly_post_hospital
+                    and Sprint13.detect_phf_cancel_intent(message_lower)
+                    and _is_generic_six_month_followup_record(current_record)
+            ):
+                record_key = _generic_patient_record_key(
+                    current_first, current_last
+                )
+                removed = cancel_generic_appointment_records([
+                    (current_first, current_last)
+                ])
+                if removed is None:
+                    cancel_response = (
+                        "I couldn't complete the cancellation because the "
+                        "appointment record could not be updated. The "
+                        "cancellation is not confirmed. Please try again."
+                    )
+                elif record_key in removed:
+                    cancel_response = (
+                        f"I've cancelled your appointment on "
+                        f"{current_record['appointment_day']}. Is there "
+                        "anything else I can help you with today?"
+                    )
+                else:
+                    cancel_response = (
+                        "I couldn't find that appointment on file to cancel. "
+                        "Is there anything else I can help you with today?"
+                    )
+                conversation_history.extend([
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": cancel_response},
+                ])
+                return jsonify({"response": cancel_response})
+
         if Sprint13.phf_intent_detected:
             Sprint13.phf_flow_active = True
             # Copy pre-chart patient data
