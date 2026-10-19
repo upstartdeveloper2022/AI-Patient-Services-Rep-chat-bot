@@ -3158,7 +3158,7 @@ def _handle_department_transfer(message, message_lower):
 def _handle_insurance_update(message, message_lower):
     global ins_stage, ins_company, ins_member_number, requests_flow_active
     global ins_chart_record
-    if ins_stage is None:
+    if ins_stage is None or ins_stage == "complete":
         ins_stage = "ask_company"
         return (
             "I can take that down for you. What is the name of your "
