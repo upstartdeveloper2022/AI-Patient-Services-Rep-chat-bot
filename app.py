@@ -3803,17 +3803,44 @@ def is_couple_six_month_followup_request(message_lower):
     )
 
 
+def is_couple_back_to_back_followup_request(message_lower):
+    return (
+        bool(_JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower))
+        and bool(re.search(r"\bback[\s-]+to[\s-]+back\b", message_lower))
+        and bool(re.search(r"\bfollow[\s-]?ups?\b", message_lower))
+        and bool(re.search(
+            r"\b(?:schedule|book|make|set\s+up)\b|"
+            r"\bfollow[\s-]?up\s+appointments?\b",
+            message_lower,
+        ))
+    )
+
+
 def is_generic_couple_cancel_request(message_lower):
     """Detect a couple-size joint cancellation that has no specialized
     flow of its own: "Please cancel appointments for my wife and myself"
-    (or "for myself and my wife"). Satisfying all of: a cancel intent,
-    joint spouse-and-self phrasing, NO six-month follow-up phrase (the
+    (or "for myself and my wife"). Satisfying all of: cancellation
+    wording, joint spouse-and-self phrasing, NO six-month follow-up phrase (the
     couple six-month flow owns that wording), NO new-patient household
     phrasing (generic_joint_cancel_pending owns that), and NOT a
     Sprint13/14 or Form-1823 phrasing. Note the joint pattern carries a
     self-last mirror alternation precisely so "my wife and myself"
     registers here instead of falling through to the LLM fallback."""
-    if "cancel" not in message_lower:
+    cancellation_wording = (
+        "cancel" in message_lower
+        or bool(re.search(
+            r"\b(?:remove|delete)\s+(?:(?:both|all)\s+)?"
+            r"(?:our\s+)?(?:appointments?|visits?)\b"
+            r"|\btake\s+(?:both|all)\s+(?:our\s+)?"
+            r"(?:appointments?|visits?)\s+off\b"
+            r"|\bneither\s+of\s+us\b.{0,80}\b"
+            r"(?:can|cannot|can't|won't\s+be\s+able\s+to|"
+            r"will\s+not\s+be\s+able\s+to)\s+"
+            r"(?:come|attend|make\s+it)\b",
+            message_lower,
+        ))
+    )
+    if not cancellation_wording:
         return False
     if not _JOINT_APPOINTMENT_REFERENCE_PATTERN.search(message_lower):
         return False
@@ -8698,7 +8725,10 @@ def chat():
     ):
         generic_couple_cancel_pending = True
 
-    if is_couple_six_month_followup_request(message_lower):
+    if (
+            is_couple_six_month_followup_request(message_lower)
+            or is_couple_back_to_back_followup_request(message_lower)
+    ):
         couple_followup_flow_active = True
     elif is_six_month_followup_request(message_lower):
         individual_six_month_followup_active = True
