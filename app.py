@@ -8778,6 +8778,20 @@ def chat():
     # survives any earlier-return path (e.g. pre-chart collection).
     if Sprint13.detect_post_hospital_intent(message_lower):
         Sprint13.phf_intent_detected = True
+        if (
+                not Sprint13.phf_discharge_date
+                and re.search(r"\b(?:discharg\w*|released)\b", message_lower)
+        ):
+            stated_discharge_date = Sprint13.detect_discharge_date_in_message(
+                user_message
+            )
+            if stated_discharge_date:
+                Sprint13.phf_discharge_date = stated_discharge_date
+                Sprint13.phf_follow_up_deadline = (
+                    Sprint13.calculate_follow_up_deadline(
+                        stated_discharge_date
+                    )
+                )
 
     # Sprint 13: Capture appointment-inquiry intent early too, for the
     # same reason. A caller asking "when is my post hospital follow up?"
@@ -9956,7 +9970,9 @@ def chat():
                 Sprint13.phf_patient_first_name = patient_first_name
             if patient_last_name:
                 Sprint13.phf_patient_last_name = patient_last_name
-            if dob_collected:
+            if established_patient_dob:
+                Sprint13.phf_patient_dob = established_patient_dob
+            elif dob_collected:
                 Sprint13.phf_patient_dob = "collected"
             if pcp_collected:
                 provider = detect_provider_in_message(message_lower)
