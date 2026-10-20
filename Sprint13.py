@@ -69,7 +69,18 @@ POST_HOSPITAL_FOLLOWUP_TRIGGERS = [
     "post hospitalization follow-up", "post-hospitalization follow-up",
     "follow up after being discharged", "follow-up after being discharged",
     "schedule follow up after hospital", "schedule follow-up after hospital",
+    "hospitalized and need to schedule a follow up",
+    "hospitalized and need to schedule a follow-up",
+    "hospitalized and need a follow up",
+    "hospitalized and need a follow-up",
 ]
+
+_PHF_DISCHARGE_APPOINTMENT_PATTERN = re.compile(
+    r"(?=.*\b(?:discharg\w*|released|got\s+out(?:\s+of)?)\b)"
+    r"(?=.*\b(?:hospital|medical\s+center)\b)"
+    r"(?=.*\b(?:appointment|follow[\s-]?up)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 PHF_RESCHEDULE_TRIGGERS = [
     "reschedule my follow up", "reschedule my follow-up",
@@ -159,7 +170,10 @@ def reset_state():
 
 
 def detect_post_hospital_intent(message_lower):
-    return any(trigger in message_lower for trigger in POST_HOSPITAL_FOLLOWUP_TRIGGERS)
+    return (
+        any(trigger in message_lower for trigger in POST_HOSPITAL_FOLLOWUP_TRIGGERS)
+        or bool(_PHF_DISCHARGE_APPOINTMENT_PATTERN.search(message_lower))
+    )
 
 
 def detect_phf_reschedule_intent(message_lower):
@@ -229,7 +243,11 @@ def detect_discharge_date_in_message(message):
     patterns = [
         r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b',
         r'\b(january|february|march|april|may|june|july|august|'
-        r'september|october|november|december)\s+\d{1,2},?\s+\d{4}\b',
+        r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?'
+        r'(?:,\s*|\s+)\d{4}\b',
+        r'\b(january|february|march|april|may|june|july|august|'
+        r'september|october|november|december)\s+\d{1,2}'
+        r'(?:st|nd|rd|th)?\b',
     ]
     for pattern in patterns:
         match = re.search(pattern, message, re.IGNORECASE)
@@ -269,13 +287,22 @@ def _offered_slot_day_matches(message, message_lower, date_key):
 
 
 def parse_discharge_date(date_str):
+    date_str = re.sub(
+        r"(?<=\d)(?:st|nd|rd|th)\b", "", date_str.strip(),
+        flags=re.IGNORECASE,
+    )
     formats = [
         "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
-        "%B %d, %Y", "%B %d %Y",
+        "%B %d, %Y", "%B %d %Y", "%B %d",
     ]
     for fmt in formats:
         try:
-            return datetime.strptime(date_str.strip(), fmt)
+            parsed = datetime.strptime(date_str, fmt)
+            if fmt == "%B %d":
+                parsed = parsed.replace(year=datetime.now().year)
+                if parsed.date() > datetime.now().date():
+                    parsed = parsed.replace(year=parsed.year - 1)
+            return parsed
         except ValueError:
             continue
     return None
@@ -289,50 +316,7 @@ def calculate_follow_up_deadline(discharge_date_str):
     return None
 
 
-# ─────────────────────────────────────────────
-# Sprint 13 Test Harness
-# ─────────────────────────────────────────────
-# Lets Scenario 7 (PCP available), Scenario 8 (covering provider
-# available), and Scenario 9 (neither available / work-in triggered) be
-# tested deterministically, without depending on random.choice()
-# outcomes. Both PHF scheduling and PHF rescheduling call
-# generate_pcp_availability_within_7_days() and
-# generate_covering_provider_availability_within_7_days() for their
-# availability, so forcing the outcome here covers both flows with no
-# separate scheduling/rescheduling harness code needed.
-#
-# PHF_TEST_MODE must be explicitly set to True to activate this at all.
-# With PHF_TEST_MODE = False (the default), both generator functions
-# below execute exactly as before this change - the harness gate is a
-# single early-return checked before anything else runs, so none of the
-# existing random-generation logic is touched, reordered, or altered.
-PHF_TEST_MODE = False
-
-# One of: "PCP_AVAILABLE", "COVERING_AVAILABLE", "NO_AVAILABILITY"
-TEST_SCENARIO = "PCP_AVAILABLE"
-
-
-def _test_fixed_availability():
-    """Deterministic, weekday-safe near-term slot set used only when
-    PHF_TEST_MODE is True. Same {date_str: [times]} shape the real
-    generators return, so every downstream consumer (slot matching,
-    format_availability, follow-up deadline calculation, appointment
-    persistence) works completely unmodified."""
-    today = datetime.now()
-    day_offset = 1
-    date = today + timedelta(days=day_offset)
-    while date.weekday() >= 5:
-        day_offset += 1
-        date = today + timedelta(days=day_offset)
-    date_str = date.strftime("%A, %B %d")
-    return {date_str: ["10:00 AM", "2:00 PM"]}
-
-
 def generate_pcp_availability_within_7_days():
-    if PHF_TEST_MODE:
-        if TEST_SCENARIO == "PCP_AVAILABLE":
-            return _test_fixed_availability()
-        return {}
     availability = {}
     if not random.choice([True, False]):
         return availability
@@ -351,10 +335,6 @@ def generate_pcp_availability_within_7_days():
 
 
 def generate_covering_provider_availability_within_7_days():
-    if PHF_TEST_MODE:
-        if TEST_SCENARIO == "COVERING_AVAILABLE":
-            return _test_fixed_availability()
-        return {}
     availability = {}
     if not random.choice([True, False]):
         return availability
@@ -542,17 +522,16 @@ def handle_post_hospital_flow(message, message_lower):
     global phf_reschedule_pending, phf_cancel_pending, phf_work_in_requested
     global phf_inquiry_pending
 
-    # Capture patient name from app.py globals if not already set in PHF context
+    # Capture patient name from appbeforeclaude9272026.py globals if not already set in PHF context
     import app
     if not phf_patient_first_name and hasattr(app, 'patient_first_name') and app.patient_first_name:
         phf_patient_first_name = app.patient_first_name
     if not phf_patient_last_name and hasattr(app, 'patient_last_name') and app.patient_last_name:
         phf_patient_last_name = app.patient_last_name
-    if not phf_patient_dob and hasattr(app, 'dob_collected') and app.dob_collected:
-        # Note: app.py doesn't store the actual DOB, just the flag; PHF will detect it from context
-        pass
+    if not phf_patient_dob and getattr(app, "established_patient_dob", None):
+        phf_patient_dob = app.established_patient_dob
     if not phf_patient_pcp and hasattr(app, 'pcp_collected') and app.pcp_collected:
-        # Note: app.py doesn't store the actual PCP, just the flag; PHF will detect it from context
+        # Note: appbeforeclaude9272026.py doesn't store the actual PCP, just the flag; PHF will detect it from context
         pass
 
     patient_full = None
@@ -716,42 +695,12 @@ def handle_post_hospital_flow(message, message_lower):
 
     # Stage: Collect discharge info
     if phf_stage == "discharge_info":
-        if not phf_hospital_name:
-            hospital_match = re.search(
-                r"(?:at|from|at the|from the)\s+([A-Z][A-Za-z\s\-'.]+(?:Hospital|Medical Center|Health Center|Clinic))",
-                message, re.IGNORECASE
-            )
-            if hospital_match:
-                phf_hospital_name = hospital_match.group(1).strip()
-            else:
-                # Fallback for bare hospital name without prefix
-                hospital_match = re.search(
-                    r"\b([A-Z][A-Za-z\s\-'.]+(?:Hospital|Medical Center|Health Center|Clinic))\b",
-                    message, re.IGNORECASE
-                )
-                if hospital_match:
-                    extracted = hospital_match.group(1).strip()
-                    extracted_lower = extracted.lower()
-                    if "post" not in extracted_lower and "hospitalized" not in extracted_lower:
-                        phf_hospital_name = extracted
-                elif phf_admission_date and phf_discharge_date:
-                    # Neither regex matched, but by this point in the
-                    # sequential discharge_info Q&A, admission and
-                    # discharge dates are already known - meaning this
-                    # message is the caller's direct answer to "Which
-                    # hospital were you discharged from?" Not every real
-                    # hospital name ends in Hospital/Medical Center/
-                    # Health Center/Clinic (e.g. "Orlando Health"), so
-                    # accept a short direct reply as-is rather than
-                    # requiring that suffix. Bounded to a short reply so
-                    # an unrelated longer sentence doesn't get misread as
-                    # a hospital name.
-                    stripped_msg = message.strip().rstrip(".")
-                    if stripped_msg and len(stripped_msg.split()) <= 6:
-                        phf_hospital_name = stripped_msg
-
         admission_date_just_set = False
-        if not phf_admission_date:
+        states_discharge = bool(re.search(
+            r"\b(?:discharg\w*|released|got\s+out(?:\s+of)?)\b",
+            message_lower,
+        ))
+        if not phf_admission_date and not states_discharge:
             date_str = detect_discharge_date_in_message(message)
             if date_str:
                 phf_admission_date = date_str
@@ -769,6 +718,59 @@ def handle_post_hospital_flow(message, message_lower):
             if date_str:
                 phf_discharge_date = date_str
                 phf_follow_up_deadline = calculate_follow_up_deadline(date_str)
+
+        if not phf_hospital_name:
+            hospital_match = re.search(
+                r"(?:at|from|at the|from the)\s+([A-Z][A-Za-z\s\-'.]+(?:Hospital|Medical Center|Health Center|Clinic))",
+                message, re.IGNORECASE
+            )
+            if hospital_match:
+                hospital_candidate = hospital_match.group(1).strip()
+                if hospital_candidate.lower() not in {
+                        "hospital", "the hospital", "medical center",
+                        "the medical center", "health center",
+                        "the health center", "clinic", "the clinic",
+                }:
+                    phf_hospital_name = hospital_candidate
+            else:
+                # Fallback for bare hospital name without prefix
+                hospital_match = re.search(
+                    r"\b([A-Z][A-Za-z\s\-'.]+(?:Hospital|Medical Center|Health Center|Clinic))\b",
+                    message, re.IGNORECASE
+                )
+                if hospital_match:
+                    extracted = hospital_match.group(1).strip()
+                    extracted_lower = extracted.lower()
+                    generic_hospital_reference = re.search(
+                        r"\b(?:got\s+out\s+of|discharged\s+from|"
+                        r"released\s+from)\s+(?:the\s+)?hospital\b",
+                        message,
+                        re.IGNORECASE,
+                    )
+                    if (
+                            "post" not in extracted_lower
+                            and "hospitalized" not in extracted_lower
+                            and not generic_hospital_reference
+                    ):
+                        phf_hospital_name = extracted
+                elif (
+                        phf_admission_date and phf_discharge_date
+                        and not detect_discharge_date_in_message(message)
+                ):
+                    # Neither regex matched, but by this point in the
+                    # sequential discharge_info Q&A, admission and
+                    # discharge dates are already known - meaning this
+                    # message is the caller's direct answer to "Which
+                    # hospital were you discharged from?" Not every real
+                    # hospital name ends in Hospital/Medical Center/
+                    # Health Center/Clinic (e.g. "Orlando Health"), so
+                    # accept a short direct reply as-is rather than
+                    # requiring that suffix. Bounded to a short reply so
+                    # an unrelated longer sentence doesn't get misread as
+                    # a hospital name.
+                    stripped_msg = message.strip().rstrip(".")
+                    if stripped_msg and len(stripped_msg.split()) <= 6:
+                        phf_hospital_name = stripped_msg
 
         if not phf_reason_for_admission:
             reason_match = re.search(
@@ -999,7 +1001,7 @@ def handle_post_hospital_flow(message, message_lower):
             phf_work_in_requested = True
             return (
                 f"I'm sorry, no covering provider is available. "
-                f"May I get a good callback number for a work-in request?"
+                f"May I get a callback number for a work-in request?"
             )
 
     # Stage: Schedule confirmation
