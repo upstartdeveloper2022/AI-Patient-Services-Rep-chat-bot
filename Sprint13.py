@@ -103,6 +103,15 @@ PHF_GENERIC_RESCHEDULE_TRIGGERS = [
     "move my appointment", "reschedule it",
 ]
 
+# Generic cancel phrasing ("cancel my appointment") that does not name
+# post-hospital follow-up. Like PHF_GENERIC_RESCHEDULE_TRIGGERS, this is
+# only treated as PHF cancel intent when the caller actually has a PHF
+# appointment record on file (checked at the call site in app.py).
+PHF_GENERIC_CANCEL_TRIGGERS = [
+    "cancel my appointment", "cancel the appointment",
+    "cancel appointment", "cancel that appointment",
+]
+
 PHF_CANCEL_TRIGGERS = [
     "cancel my follow up", "cancel my follow-up",
     "cancel post hospital appointment", "cancel my post-hospital appointment",
@@ -182,6 +191,10 @@ def detect_phf_reschedule_intent(message_lower):
 
 def detect_generic_reschedule_intent(message_lower):
     return any(trigger in message_lower for trigger in PHF_GENERIC_RESCHEDULE_TRIGGERS)
+
+
+def detect_generic_cancel_intent(message_lower):
+    return any(trigger in message_lower for trigger in PHF_GENERIC_CANCEL_TRIGGERS)
 
 
 def detect_phf_cancel_intent(message_lower):
@@ -484,8 +497,9 @@ def _save_phf_appointment_records():
     try:
         with open(_PHF_RECORDS_FILE, "w") as f:
             json.dump(phf_appointment_records, f)
+        return True
     except OSError:
-        pass
+        return False
 
 
 phf_appointment_records = _load_phf_appointment_records()
@@ -527,6 +541,36 @@ def get_stored_appointment_record(first_name, last_name):
     if key not in phf_appointment_records:
         phf_appointment_records.update(_load_phf_appointment_records())
     return phf_appointment_records.get(key)
+
+
+def cancel_phf_appointment_record(first_name, last_name):
+    """Remove this patient's persisted PHF appointment record.
+
+    The file on disk is the source of truth, so it is re-read first (the
+    in-memory dict can be stale). Returns (status, record):
+      ("removed", record) - record deleted and the file re-read to confirm
+      ("none", None)      - no PHF record on file for this patient
+      ("error", record)   - record exists but could not be removed; the
+                            in-memory state is restored so nothing is lost
+    """
+    key = _patient_record_key(first_name, last_name)
+    if not key:
+        return "none", None
+    disk_records = _load_phf_appointment_records()
+    if disk_records:
+        phf_appointment_records.clear()
+        phf_appointment_records.update(disk_records)
+    record = phf_appointment_records.get(key)
+    if record is None:
+        return "none", None
+    del phf_appointment_records[key]
+    if (
+        not _save_phf_appointment_records()
+        or key in _load_phf_appointment_records()
+    ):
+        phf_appointment_records[key] = record
+        return "error", record
+    return "removed", record
 
 
 # ─────────────────────────────────────────────
@@ -655,9 +699,41 @@ def handle_post_hospital_flow(message, message_lower):
 
     # ── CANCELLATION WORKFLOW ──
     if phf_cancel_pending:
+        phf_cancel_pending = False
+        # Use the patient's actual persisted appointment and only confirm
+        # once it has really been removed from the record store.
+        cancel_status, cancelled_record = cancel_phf_appointment_record(
+            phf_patient_first_name, phf_patient_last_name
+        )
+        if cancel_status == "error":
+            return (
+                "I couldn't complete the cancellation because the "
+                "appointment record could not be updated. The cancellation "
+                "is not confirmed. Please try again."
+            )
+        if cancel_status == "removed":
+            phf_stage = "complete"
+            stored_appt = cancelled_record.get("appointment_day") or ""
+            if " @ " in stored_appt:
+                phf_existing_appt_day, phf_existing_appt_time = stored_appt.split(" @ ", 1)
+            else:
+                phf_existing_appt_day, phf_existing_appt_time = stored_appt, None
+            when = (
+                f"{phf_existing_appt_day} at {phf_existing_appt_time}"
+                if phf_existing_appt_time else f"{phf_existing_appt_day}"
+            )
+            return (
+                f"Your post-hospital follow-up appointment on {when} has "
+                f"been cancelled. Please keep in mind that follow-up care "
+                f"after a hospital stay is very important for your "
+                f"recovery. If you change your mind, please call us back "
+                f"to reschedule. Is there anything else I can help you "
+                f"with today?"
+            )
+        # No stored record: legacy behaviour (explicit PHF cancel wording
+        # with nothing persisted) is left unchanged.
         if not phf_existing_appt_day:
             phf_existing_appt_day, phf_existing_appt_time = generate_existing_phf_appointment()
-        phf_cancel_pending = False
         return (
             f"Your post-hospital follow-up appointment on "
             f"{phf_existing_appt_day} at {phf_existing_appt_time} has been "
