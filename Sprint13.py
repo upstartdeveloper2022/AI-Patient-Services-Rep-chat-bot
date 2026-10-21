@@ -293,7 +293,7 @@ def parse_discharge_date(date_str):
     )
     formats = [
         "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
-        "%B %d, %Y", "%B %d %Y", "%B %d",
+        "%A, %B %d, %Y", "%B %d, %Y", "%B %d %Y", "%B %d",
     ]
     for fmt in formats:
         try:
@@ -314,6 +314,28 @@ def calculate_follow_up_deadline(discharge_date_str):
         deadline = discharge_dt + timedelta(days=7)
         return deadline.strftime("%A, %B %d, %Y")
     return None
+
+
+def _availability_on_or_before_deadline(availability):
+    if not phf_follow_up_deadline:
+        return availability
+    deadline = parse_discharge_date(phf_follow_up_deadline)
+    if not deadline:
+        return {}
+    filtered = {}
+    today = datetime.now().date()
+    for date_key, slots in availability.items():
+        try:
+            slot_date = datetime.strptime(
+                f"{date_key}, {today.year}", "%A, %B %d, %Y"
+            ).date()
+            if slot_date < today:
+                slot_date = slot_date.replace(year=slot_date.year + 1)
+        except ValueError:
+            continue
+        if slot_date <= deadline.date():
+            filtered[date_key] = slots
+    return filtered
 
 
 def generate_pcp_availability_within_7_days():
@@ -545,7 +567,11 @@ def handle_post_hospital_flow(message, message_lower):
         # appointment was originally created, possibly in an earlier
         # call) instead of fabricating a brand-new, unrelated discharge
         # date and appointment every time a reschedule is requested.
-        if not phf_discharge_date or not phf_existing_appt_day:
+        if (
+            not phf_discharge_date
+            or not phf_existing_appt_day
+            or not phf_follow_up_deadline
+        ):
             stored_record = get_stored_appointment_record(
                 phf_patient_first_name, phf_patient_last_name
             )
@@ -553,6 +579,8 @@ def handle_post_hospital_flow(message, message_lower):
                 if not phf_discharge_date and stored_record.get("discharge_date"):
                     phf_discharge_date = stored_record["discharge_date"]
                     phf_follow_up_deadline = calculate_follow_up_deadline(phf_discharge_date)
+                if stored_record.get("follow_up_deadline"):
+                    phf_follow_up_deadline = stored_record["follow_up_deadline"]
                 if not phf_hospital_name and stored_record.get("hospital_name"):
                     phf_hospital_name = stored_record["hospital_name"]
                 if not phf_existing_appt_day and stored_record.get("appointment_day"):
@@ -567,6 +595,9 @@ def handle_post_hospital_flow(message, message_lower):
             phf_existing_appt_day, phf_existing_appt_time = generate_existing_phf_appointment()
         if not phf_pcp_availability:
             phf_pcp_availability = generate_pcp_availability_within_7_days()
+        phf_pcp_availability = _availability_on_or_before_deadline(
+            phf_pcp_availability
+        )
         if phf_pcp_availability:
             phf_reschedule_pending = False
             # Bug fix: route the next turn (the caller's day/time pick)
@@ -585,6 +616,9 @@ def handle_post_hospital_flow(message, message_lower):
         else:
             if not phf_covering_availability:
                 phf_covering_availability = generate_covering_provider_availability_within_7_days()
+            phf_covering_availability = _availability_on_or_before_deadline(
+                phf_covering_availability
+            )
             if phf_covering_availability:
                 phf_reschedule_pending = False
                 # Bug fix: route the next turn (accept/decline or a
