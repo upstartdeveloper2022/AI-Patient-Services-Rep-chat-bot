@@ -9992,7 +9992,10 @@ def chat():
         ):
             Sprint13.phf_flow_active = True
             Sprint13.phf_reschedule_pending = True
-        elif Sprint13.detect_phf_cancel_intent(message_lower):
+        elif Sprint13.detect_phf_cancel_intent(message_lower) or (
+                Sprint13.detect_generic_cancel_intent(message_lower)
+                and Sprint13.get_stored_appointment_record(patient_first_name, patient_last_name)
+        ):
             Sprint13.phf_flow_active = True
             Sprint13.phf_cancel_pending = True
         elif Sprint13.detect_phf_inquiry_intent(message_lower) or Sprint13.phf_inquiry_intent_detected or (
