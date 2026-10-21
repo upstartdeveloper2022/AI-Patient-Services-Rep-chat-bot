@@ -1131,6 +1131,15 @@ def imaging_reason_already_stated(message_lower):
     return bool(_IMAGING_REASON_STATED.search(message_lower))
 
 
+def lab_reason_already_stated(message_lower):
+    """A contextual wellness/physical visit can itself explain why labs
+    are being requested; an active request to schedule that visit cannot."""
+    return bool(
+        _WELLNESS_NOUN_RE.search(message_lower)
+        and wellness_mention_is_contextual(message_lower)
+    )
+
+
 def _prior_study_named(message_lower):
     """The existing study the provider is to review, or None."""
     for pattern, label in _IMAGING_PRIOR_STUDY:
@@ -2082,6 +2091,18 @@ def _handle_reason_awareness_flow(message, message_lower, kind):
                 f"conversation. Can you verify your phone number so that when "
                 f"{imaging_provider_name} calls, they are able to reach you?"
             )
+
+    if stage is None and kind == "lab" and lab_reason_already_stated(message_lower):
+        lab_order_req_reason = message.strip()
+        lab_order_req_provider_aware = None
+        lab_order_req_stage = "complete"
+        requests_flow_active = False
+        return (
+            "Thank you, I've put in a message with that information "
+            "for the provider. Please allow up to 72 business hours "
+            "for this to be processed. Is there anything else I can "
+            "help you with today?"
+        )
 
     if stage is None:
         if kind == "imaging":
