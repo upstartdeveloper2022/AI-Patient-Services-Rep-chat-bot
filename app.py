@@ -197,6 +197,13 @@ referral_specialist_phone = None
 # other per-call state in home().
 nurse_visit_active = False
 
+# Out-of-medication refill state: once a patient asks for a refill/renewal
+# AND says they have none left, this stays True for the rest of the call so
+# the injected REFILL_OUT_OF_MEDICATION context keeps the 24-business-hour
+# turnaround and the short collection path on follow-up turns (e.g. the turn
+# where the patient gives a callback number). Reset in home().
+refill_out_of_medication_active = False
+
 # Medication-order request destination capture: the first turn of a
 # non-controlled med order request ("put in an order for my prolia shot")
 # is answered deterministically with "I will notate your request. Where
@@ -2265,6 +2272,33 @@ def detect_returning_ma_call(message_lower):
             if f"returning {ma_name} call" in message_lower:
                 return True
     return False
+
+
+_REFILL_REQUEST_PATTERN = re.compile(
+    r"\b(?:refill|re-fill|renew\w*|prescription|script|rx)\b"
+)
+# "out of it/them/that/this/any/my X", "ran out", "none left", ... A
+# patient who is only LOW ("almost out", "about to run out", "will run out")
+# is excluded so ordinary refills keep their existing behavior.
+_OUT_OF_MEDICATION_PATTERN = re.compile(
+    r"\bout\s+of\s+(?:it|them|that|this|any|my\s+\w+)\b"
+    r"|\bran\s+out\b|\bnone\s+left\b|\bnothing\s+left\b"
+    r"|\bno\s+more\s+(?:pills|tablets|medication|medicine)\b"
+)
+_NOT_YET_OUT_PATTERN = re.compile(
+    r"\b(?:almost|nearly|about\s+to|going\s+to|will|soon|low\s+on|"
+    r"running\s+low|running\s+out)\b"
+)
+
+
+def detect_refill_out_of_medication(message_lower):
+    """True when the patient requests a refill/renewal and states they
+    have no medication left (e.g. 'completely out of it', 'ran out')."""
+    if not _REFILL_REQUEST_PATTERN.search(message_lower):
+        return False
+    if not _OUT_OF_MEDICATION_PATTERN.search(message_lower):
+        return False
+    return not _NOT_YET_OUT_PATTERN.search(message_lower)
 
 
 def detect_nurse_visit(message_lower):
@@ -8277,7 +8311,7 @@ def home():
     global ma_request_reason_collected
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
-    global nurse_visit_active
+    global nurse_visit_active, refill_out_of_medication_active
     global medication_order_destination_pending
 
     profanity_count = 0
@@ -8404,6 +8438,7 @@ def home():
     referral_specialist_name = None
     referral_specialist_phone = None
     nurse_visit_active = False
+    refill_out_of_medication_active = False
     medication_order_destination_pending = False
     new_patient_flow_active = False
     new_patient_requested_provider = None
@@ -8563,7 +8598,7 @@ def chat():
     global controlled_substance_bridge_confirmed_insufficient
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
-    global nurse_visit_active
+    global nurse_visit_active, refill_out_of_medication_active
     global medication_order_destination_pending
     global ma_request_active, ma_request_name
     global ma_request_provider, ma_request_reason_collected
@@ -13715,6 +13750,47 @@ def chat():
             "anything else I can help you with today?'\n"
         )
 
+    # Out-of-medication refill: the patient asked for a refill/renewal and
+    # says they have none left. Sticky for the call so the follow-up turn
+    # (callback number) keeps the same handling. Controlled substances keep
+    # their own bridge flow and are excluded.
+    if (
+            not is_medical_professional_caller
+            and not controlled_substance_schedule
+            and detect_refill_out_of_medication(message_lower)
+    ):
+        refill_out_of_medication_active = True
+
+    refill_out_of_medication_context = ""
+    if (
+            refill_out_of_medication_active
+            and not is_medical_professional_caller
+            and not controlled_substance_schedule
+            and not controlled_substance_appt_pending
+    ):
+        refill_out_of_medication_context = (
+            "REFILL_OUT_OF_MEDICATION INJECTED BY SYSTEM:\n"
+            "The patient requested a refill/renewal and has said they are "
+            "OUT of the medication. This overrides the MEDICATION REFILLS "
+            "collection steps above.\n"
+            "- Whatever pharmacy name/location the patient already gave is "
+            "SUFFICIENT. Do NOT ask for a street address, store number, "
+            "cross street, or any more pharmacy detail.\n"
+            "- Do NOT ask for dosage, days remaining, or whether they have "
+            "enough to hold them over. Do NOT ask any bridge-prescription "
+            "questions. Do NOT offer or schedule an appointment.\n"
+            "- If a callback number has not been given yet, ask ONLY: "
+            "'May I get a good callback number for you?'\n"
+            "- State the turnaround as 'up to 24 business hours' (this "
+            "urgent out-of-medication refill is 24 business hours, NOT 72) "
+            "when confirming the request is being sent to the provider, "
+            "once only. Never say 72 business hours for this request.\n"
+            "- After the callback number is given, confirm the request has "
+            "been sent, state the 24 business hours once if not already "
+            "stated, and ask: 'Is there anything else I can help you with "
+            "today?'\n"
+        )
+
     lab_result_fax_outside_context = ""
     if (lab_result_fax_active or lab_result_fax_to_outside_detected) and not is_medical_professional_caller:
         already_has_fax_info_outside = bool(re.search(
@@ -14305,6 +14381,7 @@ def chat():
             individual_three_month_followup_context,
             nurse_ma_context,
             nurse_visit_context,
+            refill_out_of_medication_context,
             lab_order_fax_to_facility_context,
             lab_order_pickup_context,
             booking_reason_provided_context,
