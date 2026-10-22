@@ -2497,6 +2497,20 @@ RESCHEDULE_ACUTE_VISIT_TRIGGERS = [
     "reschedule it", "reschedule this", "like to reschedule",
 ]
 
+
+def detect_existing_appointment_reschedule_intent(message_lower):
+    """Recognize a request to move an appointment that is already on
+    the books.  The appointment context prevents a vague "move it" from
+    becoming scheduling intent on its own."""
+    return bool(
+        re.search(r"\b(?:reschedul(?:e|ing)|move|change)\b", message_lower)
+        and re.search(
+            r"\b(?:appointment|visit|checkup|check\s+up|physical|"
+            r"wellness|scheduled|booked)\b",
+            message_lower,
+        )
+    )
+
 CANCEL_ACUTE_VISIT_TRIGGERS = [
     "cancel my appointment", "cancel the appointment",
     "cancel that appointment",
@@ -8865,6 +8879,7 @@ def chat():
     if (
             not Sprint14.wellness_intent_detected
             and not Sprint14.wellness_flow_active
+            and not detect_existing_appointment_reschedule_intent(message_lower)
     ):
         _wellness_intent = Sprint14.detect_wellness_intent(message_lower)
         if _wellness_intent:
@@ -10103,6 +10118,31 @@ def chat():
             return jsonify({"response": fasting_response})
 
     # ── Sprint 14: Wellness / MAW / CHA / Refill / Lab-Order Workflow ──
+    # An explicit move/change request for an on-file wellness appointment
+    # must win over the generic wellness words in the same sentence. New
+    # wellness requests still enter the normal eligibility workflow below.
+    if (
+            pre_chart_complete and not Sprint13.phf_flow_active
+            and not Sprint14.wellness_flow_active
+            and detect_existing_appointment_reschedule_intent(message_lower)
+    ):
+        _wellness_reschedule_first = patient_first_name or caller_first_name
+        _wellness_reschedule_last = patient_last_name or caller_last_name
+        if _wellness_reschedule_first and _wellness_reschedule_last:
+            _wellness_reschedule_response = (
+                Sprint14.start_existing_wellness_reschedule(
+                    f"{_wellness_reschedule_first} {_wellness_reschedule_last}"
+                )
+            )
+            if _wellness_reschedule_response is not None:
+                conversation_history.append(
+                    {"role": "user", "content": user_message}
+                )
+                conversation_history.append(
+                    {"role": "assistant", "content": _wellness_reschedule_response}
+                )
+                return jsonify({"response": _wellness_reschedule_response})
+
     # Activated only once pre-chart is complete and no PHF conversation
     # is already in progress - mirrors the Sprint13 activation guard
     # directly above. Kept fully isolated: this block never reads or
