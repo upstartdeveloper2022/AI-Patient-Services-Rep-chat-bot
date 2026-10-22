@@ -12,9 +12,9 @@ ARCHITECTURE (per PDF Section 8 - "Sprint 14 Architecture Recommendation"):
     never reads or writes any Sprint13 state (phf_*). This is
     deliberate, per the explicit instruction to keep regression risk to
     Sprint 13 at zero.
-  - app.py owns routing and session control: it decides WHEN to call
+  - appbeforeclaude9272026.py owns routing and session control: it decides WHEN to call
     into this module (intent detection + dispatch, mirroring the same
-    pattern app.py already uses for Sprint13) and is responsible for
+    pattern appbeforeclaude9272026.py already uses for Sprint13) and is responsible for
     calling reset_state() at the start of each new call.
   - This module owns the workflow LOGIC and STATE for:
       1. Annual Wellness / Physical entry + eligibility (1yr+1day rule)
@@ -25,12 +25,12 @@ ARCHITECTURE (per PDF Section 8 - "Sprint 14 Architecture Recommendation"):
       5. Medicare Annual Wellness / CHA routing (Janet Walker path)
       6. Medication refill escalation (bridge-until-appointment)
       7. Lab order / EHR (MyChart) guidance
-  - Where app.py already tracks state that is safe to reuse (patient
+  - Where appbeforeclaude9272026.py already tracks state that is safe to reuse (patient
     identity already collected during pre-chart), this module reads it
     directly from `app`'s globals the same way Sprint13.py already
     does for its own patient-name capture (see handle_wellness_flow()
     below) - not a new dependency pattern, just following what's
-    already proven in this codebase. app.py only tracks a
+    already proven in this codebase. appbeforeclaude9272026.py only tracks a
     `dob_collected` BOOLEAN, not the raw DOB string, so this module
     captures its own DOB text locally when it needs the patient's
     actual age (age drives the MAW/CHA/insurance branch).
@@ -56,13 +56,13 @@ wellness_stage = None
 
 # Early-capture flags (set the moment intent is detected, even before
 # pre_chart_complete) so a request stated on the caller's very first
-# message isn't lost while app.py finishes pre-chart collection.
+# message isn't lost while appbeforeclaude9272026.py finishes pre-chart collection.
 # Mirrors Sprint13.phf_intent_detected exactly.
 wellness_intent_detected = None    # "wellness" | "maw" | "cha" | None
 refill_intent_detected = False
 lab_order_intent_detected = False
 
-# Identity - first/last pulled from app.py's pre-chart state; DOB is
+# Identity - first/last pulled from appbeforeclaude9272026.py's pre-chart state; DOB is
 # captured locally by this module (see note above).
 wellness_patient_first_name = None
 wellness_patient_last_name = None
@@ -89,6 +89,7 @@ wellness_covering_availability = None
 wellness_covering_provider_name = None  # "Elizabeth Horowitz" or "Janet Walker" depending on path
 wellness_patient_deadline_date = None    # datetime the patient must be seen by (e.g. travel departure), or None
 wellness_appointment_day = None
+wellness_reschedule_old_record = None
 wellness_pending_requested_date = None  # carries a specific date the patient named, across the age/insurance routing hop, so it isn't lost when Medicare/MAW/CHA determination has to run first
 
 # Appointment-too-far-out escalation (PDF Section 3)
@@ -126,7 +127,7 @@ couple_existing_located = False            # True once the couple's on-file appo
 couple_is_reschedule = False
 couple_is_cancel = False                   # True when the couple flow was entered to CANCEL both visits (not book/reschedule)
 couple_reschedule_old_days = None          # (day1, day2) of the couple's existing visits once a move is confirmed
-couple_patient1_first = None               # caller/husband-or-wife (from app.py pre-chart globals)
+couple_patient1_first = None               # caller/husband-or-wife (from appbeforeclaude9272026.py pre-chart globals)
 couple_patient1_last = None
 couple_patient2_first = None               # the spouse named by the caller
 couple_patient2_last = None
@@ -156,7 +157,7 @@ couple_pcp_earliest_offset = 1             # back-to-back slots never offered be
 # Constants
 # ─────────────────────────────────────────────
 
-# Mirrors app.py's own covering-provider constant/spelling exactly so
+# Mirrors appbeforeclaude9272026.py's own covering-provider constant/spelling exactly so
 # any future consolidation is a non-event; duplicated here rather than
 # imported to keep this file self-contained per the architecture rule.
 COVERING_PROVIDER_NAME = "Elizabeth Horowitz, NP"
@@ -214,7 +215,7 @@ MAW_TRIGGERS = [
 
 # Appointment lookup intent (patient asking about an already-scheduled
 # appointment, NOT requesting a new one). Checked BEFORE wellness intent
-# by app.py so "When is my annual physical?" routes to lookup rather
+# by appbeforeclaude9272026.py so "When is my annual physical?" routes to lookup rather
 # than re-entering the wellness scheduling workflow.
 APPOINTMENT_LOOKUP_TRIGGERS = [
     "when is my next appointment", "when's my next appointment",
@@ -418,6 +419,7 @@ def reset_state():
     global wellness_eligible_for_maw, wellness_eligible_for_cha
     global wellness_pcp_availability, wellness_covering_availability
     global wellness_covering_provider_name, wellness_appointment_day
+    global wellness_reschedule_old_record
     global wellness_patient_deadline_date
     global wellness_pending_requested_date
     global wellness_too_far_out_pending, wellness_too_far_out_reason
@@ -469,6 +471,7 @@ def reset_state():
     wellness_patient_deadline_date = None
     wellness_pending_requested_date = None
     wellness_appointment_day = None
+    wellness_reschedule_old_record = None
     wellness_too_far_out_pending = False
     wellness_too_far_out_reason = None
     wellness_work_in_requested = False
@@ -511,13 +514,13 @@ def reset_state():
 
 
 # ─────────────────────────────────────────────
-# Intent detection (called by app.py for routing)
+# Intent detection (called by appbeforeclaude9272026.py for routing)
 # ─────────────────────────────────────────────
 
 def detect_appointment_lookup_intent(message_lower):
     """Returns True if the patient is asking about an already-scheduled
     appointment (e.g. 'When is my annual physical?'), NOT requesting a
-    new one. app.py should check this BEFORE detect_wellness_intent so
+    new one. appbeforeclaude9272026.py should check this BEFORE detect_wellness_intent so
     lookup questions don't accidentally re-enter the scheduling flow."""
     return any(t in message_lower for t in APPOINTMENT_LOOKUP_TRIGGERS)
 
@@ -534,8 +537,8 @@ def detect_wellness_intent(message_lower):
 
     DEFENSIVE FIX: If the message is clearly an appointment lookup
     ("When is my annual physical?"), return None so the lookup path
-    in app.py can take precedence. This prevents a routing race where
-    wellness intent hijacks a lookup query before app.py checks lookup
+    in appbeforeclaude9272026.py can take precedence. This prevents a routing race where
+    wellness intent hijacks a lookup query before appbeforeclaude9272026.py checks lookup
     intent."""
     if detect_appointment_lookup_intent(message_lower):
         return None
@@ -720,7 +723,7 @@ def _mentions_couple_schedule_appointments(message_lower):
 
 
 def _caller_has_stored_sprint14_appointment():
-    """True when the caller (app.py pre-chart identity) already has an
+    """True when the caller (appbeforeclaude9272026.py pre-chart identity) already has an
     appointment on file in the Sprint14 store - i.e. this is a callback
     from a prior scheduling session. Uses the SAME store the couple
     flow writes to, so the couple reschedule/locate detection and the
@@ -841,7 +844,7 @@ def detect_dob_in_message(message):
     dob_pattern = re.compile(
         r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b|'
         r'\b(january|february|march|april|may|june|july|august|'
-        r'september|october|november|december)\s+\d{1,2},?\s+\d{4}\b',
+        r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{4}\b',
         re.IGNORECASE
     )
     return bool(dob_pattern.search(message))
@@ -851,7 +854,7 @@ def extract_dob_from_message(message):
     dob_pattern = re.compile(
         r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b|'
         r'\b(january|february|march|april|may|june|july|august|'
-        r'september|october|november|december)\s+\d{1,2},?\s+\d{4}\b',
+        r'september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*|\s+)\d{4}\b',
         re.IGNORECASE
     )
     match = dob_pattern.search(message)
@@ -860,7 +863,7 @@ def extract_dob_from_message(message):
 
 def calculate_age_from_dob(dob_string):
     """Parses a DOB string and returns age in years, or None if
-    unparseable. Mirrors app.py's calculate_age_from_dob()."""
+    unparseable. Mirrors appbeforeclaude9272026.py's calculate_age_from_dob()."""
     dob_patterns = ["%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y"]
     for fmt in dob_patterns:
         try:
@@ -1143,7 +1146,7 @@ def format_availability(availability_dict):
 def _next_adjacent_time(t1):
     """Returns the time slot exactly 30 minutes after t1 in
     AVAILABLE_TIMES, or None if no such slot exists (handles the
-    lunch break and the 4:40 PM odd slot). Mirrors app.py's own
+    lunch break and the 4:40 PM odd slot). Mirrors appbeforeclaude9272026.py's own
     couple-followup adjacency requirement."""
     t1_dt = datetime.strptime(t1, "%I:%M %p")
     for t2 in AVAILABLE_TIMES:
@@ -1438,15 +1441,15 @@ def classify_too_far_out_reason(message_lower):
 
 def _find_dob_in_history(conversation_history):
     """Recover a DOB the patient already stated earlier in this call
-    (almost always during app.py's own pre-chart identification)
+    (almost always during appbeforeclaude9272026.py's own pre-chart identification)
     instead of asking for it again.
 
     Root cause this works around: for a self-identifying patient
-    caller, app.py's pre-chart flow (determine_pre_chart_response)
+    caller, appbeforeclaude9272026.py's pre-chart flow (determine_pre_chart_response)
     only ever sets a `dob_collected` BOOLEAN - it never stores the raw
-    DOB text into any app.py global. (Only the new-patient and
+    DOB text into any appbeforeclaude9272026.py global. (Only the new-patient and
     medical-professional flows keep the raw text, and neither applies
-    here.) So there is no DOB value in app.py's state for this module
+    here.) So there is no DOB value in appbeforeclaude9272026.py's state for this module
     to read - the one place the raw text still exists is the literal
     conversation transcript itself.
 
@@ -1469,7 +1472,7 @@ def _find_dob_in_history(conversation_history):
 # Non-wellness pivot detection gate (Architecture Reviews #1-#3)
 # ─────────────────────────────────────────────
 # Finalized ownership model: Sprint14 owns Wellness/MAW/CHA (and their
-# wellness-specific eligibility/lab mini-flows). app.py owns Acute,
+# wellness-specific eligibility/lab mini-flows). appbeforeclaude9272026.py owns Acute,
 # Medication, Chronic-condition, and Paperwork appointments. Those four
 # reasons were previously only detectable from two call sites inside
 # the too-far-out-reason flow (not_eligible_followup and
@@ -1515,7 +1518,7 @@ def _execute_pivot_handoff(reason, message_lower=""):
     CRITICAL - also clears wellness_intent_detected (and, defensively,
     refill_intent_detected/lab_order_intent_detected). Traced defect:
     clearing wellness_flow_active alone is NOT sufficient to transfer
-    ownership. app.py's own activation block re-checks
+    ownership. appbeforeclaude9272026.py's own activation block re-checks
     Sprint14.wellness_intent_detected on every turn where
     wellness_flow_active is currently False:
         if not Sprint14.wellness_flow_active:
@@ -1524,7 +1527,7 @@ def _execute_pivot_handoff(reason, message_lower=""):
     wellness_intent_detected is set once, the moment the ORIGINAL
     wellness request is first mentioned, and is never cleared except
     by a full reset_state(). Without clearing it here, the very next
-    user turn after this handoff re-triggers app.py's own activation
+    user turn after this handoff re-triggers appbeforeclaude9272026.py's own activation
     block and silently pulls the conversation straight back into
     Sprint14 - which is why "ownership was not fully transferred" and
     why paperwork questioning kept resuming after a one-turn handoff
@@ -1603,11 +1606,11 @@ def _execute_pivot_handoff(reason, message_lower=""):
         # begin, so asking "tell me more" is a redundant round-trip
         # that re-asks what the patient already said (Task 3's root
         # cause). Returning None lets THIS SAME message fall through
-        # to app.py's existing pipeline and LLM call in the same turn
+        # to appbeforeclaude9272026.py's existing pipeline and LLM call in the same turn
         # - not a new code path, the identical None-fallthrough
         # pattern already used by determine_pre_chart_response(),
         # handle_med_pro_collection(), and handle_new_patient_flow().
-        # app.py's own WEEKLY AVAILABILITY injection and WORK NOTE /
+        # appbeforeclaude9272026.py's own WEEKLY AVAILABILITY injection and WORK NOTE /
         # PAPERWORK REQUESTS system-prompt section then handle this
         # message directly, with the patient's original wording -
         # e.g. "I need to schedule an appointment because..." - intact
@@ -1622,7 +1625,7 @@ def _execute_pivot_handoff(reason, message_lower=""):
         return None
 
     if reason == "acute":
-        # Let app.py's existing acute/urgent workflow handle this with
+        # Let appbeforeclaude9272026.py's existing acute/urgent workflow handle this with
         # full office-hours awareness, rather than intercepting with a
         # hardcoded bridging question that bypasses after-hours logic.
         return None
@@ -1633,11 +1636,11 @@ def _execute_pivot_handoff(reason, message_lower=""):
         # Alprazolam") - re-asking info already given, the identical
         # bug class already fixed for paperwork above. Unlike
         # paperwork, this checks a DETERMINISTIC Python-level signal
-        # rather than adding another prompt-compliance patch: app.py's
+        # rather than adding another prompt-compliance patch: appbeforeclaude9272026.py's
         # own detect_controlled_substance() already recognizes named
         # drugs (Schedule 1/2/3) with zero LLM-reliability risk. When
         # it fires, return None so this SAME message falls through to
-        # app.py's existing controlled-substance workflow (last-visit
+        # appbeforeclaude9272026.py's existing controlled-substance workflow (last-visit
         # window check, schedule-appropriate virtual/in-office rules)
         # in the same turn - a strictly richer, already-built path,
         # not a duplicate of it. When no recognized drug name is
@@ -1700,7 +1703,7 @@ def _save_appointments(data):
 
 
 def _resolve_patient_key(patient_full):
-    """Resolve a non-empty patient key, falling back to app.py globals
+    """Resolve a non-empty patient key, falling back to appbeforeclaude9272026.py globals
     if the passed-in value is missing. This prevents silent persistence
     failures when handle_wellness_flow()'s module-level copy of the
     patient's name happens to be None at booking time."""
@@ -1818,7 +1821,7 @@ def find_spouse_appointment_record(first, last):
 
 
 def get_next_appointment_for_patient(patient_full):
-    """Public API for app.py (or any caller) to look up the most
+    """Public API for appbeforeclaude9272026.py (or any caller) to look up the most
     recently scheduled Sprint14 appointment for a patient.
     Returns the appointment record dict or None."""
     patient_key = _resolve_patient_key(patient_full)
@@ -1832,13 +1835,39 @@ def get_next_appointment_for_patient(patient_full):
     return records[-1]
 
 
+def start_existing_wellness_reschedule(patient_full):
+    """Locate an already-booked wellness visit and offer replacement
+    availability without re-running new-visit eligibility."""
+    global wellness_flow_active, wellness_stage
+    global wellness_requested_visit_type, wellness_patient_pcp
+    global wellness_pcp_availability, wellness_reschedule_old_record
+
+    record = get_next_appointment_for_patient(patient_full)
+    if not record:
+        return None
+    wellness_reschedule_old_record = record
+    wellness_requested_visit_type = record.get("visit_type") or "wellness"
+    wellness_patient_pcp = record.get("provider") or "your provider"
+    wellness_pcp_availability = generate_wellness_pcp_availability()
+    wellness_stage = "check_pcp_availability"
+    wellness_flow_active = True
+    visit = _visit_type_label(wellness_requested_visit_type)
+    return (
+        f"I found your {visit} currently scheduled with "
+        f"{wellness_patient_pcp} on {record.get('appointment_day')}. "
+        f"Here is {wellness_patient_pcp}'s availability:\n"
+        f"{format_availability(wellness_pcp_availability)}\n"
+        "Which day and time works best for you?"
+    )
+
+
 # ─────────────────────────────────────────────
 # Appointment lookup handler
 # ─────────────────────────────────────────────
 
 def handle_appointment_lookup(message_lower):
     """Answer 'When is my appointment?' style questions by reading the
-    persisted appointment store. Called by app.py when
+    persisted appointment store. Called by appbeforeclaude9272026.py when
     detect_appointment_lookup_intent() fires."""
     import app
     first = getattr(app, "patient_first_name", None)
@@ -1862,11 +1891,11 @@ def handle_appointment_lookup(message_lower):
         )
     # Sprint 15 fix: a generic (non-wellness) appointment - e.g. a
     # 3-month follow-up booked through LLM-driven generic scheduling -
-    # lives in app.py's own generic_appointment_records store, NOT in
+    # lives in appbeforeclaude9272026.py's own generic_appointment_records store, NOT in
     # this Sprint14 wellness store. Without this fallback, a patient
     # whose only appointment on file is a generic one got "I don't see
     # any upcoming appointments" here, because the generic inquiry
-    # block in app.py (which reads that store) never runs - this lookup
+    # block in appbeforeclaude9272026.py (which reads that store) never runs - this lookup
     # handler short-circuits first. Read the generic store as the
     # fallback so every scheduled appointment is answerable in one place.
     generic = app.get_stored_generic_appointment_record(first, last)
@@ -1907,6 +1936,7 @@ def handle_wellness_flow(message, message_lower):
     global wellness_eligible_for_maw, wellness_eligible_for_cha
     global wellness_pcp_availability, wellness_covering_availability
     global wellness_covering_provider_name, wellness_appointment_day
+    global wellness_reschedule_old_record
     global wellness_patient_deadline_date
     global wellness_pending_requested_date
     global wellness_too_far_out_pending, wellness_too_far_out_reason
@@ -1918,9 +1948,9 @@ def handle_wellness_flow(message, message_lower):
     global lab_order_ehr_guidance_active, lab_order_ehr_stage
     global lab_order_uncomfortable_with_tech
 
-    # Pull identity already collected by app.py's pre-chart flow.
+    # Pull identity already collected by appbeforeclaude9272026.py's pre-chart flow.
     # Mirrors Sprint13.handle_post_hospital_flow()'s existing pattern
-    # of reading (not writing) app.py's globals for this same purpose.
+    # of reading (not writing) appbeforeclaude9272026.py's globals for this same purpose.
     import app
     if not wellness_patient_first_name and getattr(app, "patient_first_name", None):
         wellness_patient_first_name = app.patient_first_name
@@ -2292,6 +2322,12 @@ def handle_wellness_flow(message, message_lower):
             wellness_appointment_day = matched_slot
             wellness_stage = "complete"
             wellness_flow_active = False
+            if wellness_reschedule_old_record:
+                _remove_appointment_for_patient(
+                    patient_full,
+                    wellness_reschedule_old_record.get("appointment_day"),
+                )
+                wellness_reschedule_old_record = None
             _persist_appointment(
                 patient_full=patient_full,
                 visit_type=wellness_requested_visit_type,
@@ -2334,12 +2370,12 @@ def handle_wellness_flow(message, message_lower):
             )
 
         if reason == "acute":
-            # EXPANSION POINT: app.py owns the acute-visit workflow
+            # EXPANSION POINT: appbeforeclaude9272026.py owns the acute-visit workflow
             # (URGENT_SYMPTOM_TRIGGERS / same-day scheduling). This
             # module does not duplicate that logic - it hands the
-            # conversation back by ending its own flow so app.py's
+            # conversation back by ending its own flow so appbeforeclaude9272026.py's
             # existing acute/same-day detection can take over.
-            # Return None so app.py handles this turn directly with
+            # Return None so appbeforeclaude9272026.py handles this turn directly with
             # full office-hours awareness, rather than intercepting
             # with a hardcoded bridging question.
             wellness_too_far_out_pending = False
@@ -2523,7 +2559,7 @@ def _offer_covering_provider(for_maw_or_cha):
 # ─────────────────────────────────────────────
 
 def _sync_couple_identity(message, message_lower, app_module):
-    """Fill the couple's identities from app.py's globals (patient 1 is
+    """Fill the couple's identities from appbeforeclaude9272026.py's globals (patient 1 is
     the caller/pre-chart patient) and from the conversation history or
     the live message (patient 2 is the named spouse). Runs on every
     couple-flow turn so a name/relation stated late is still caught."""
@@ -2707,7 +2743,7 @@ def _present_couple_pcp_pairs(provider_label):
 def _handle_couple_wellness_flow(message, message_lower):
     """Schedule annual wellness/MAW/CHA visits for BOTH a husband and
     wife in one workflow:
-      1. Patient 1 = the caller (already identified by app.py).
+      1. Patient 1 = the caller (already identified by appbeforeclaude9272026.py).
       2. Patient 2 = the spouse, named by the caller or asked for.
       3. ONE shared insurance determination drives BOTH visit types -
          Steve never invents a different insurance per person.
