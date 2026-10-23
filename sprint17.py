@@ -1131,12 +1131,60 @@ def imaging_reason_already_stated(message_lower):
     return bool(_IMAGING_REASON_STATED.search(message_lower))
 
 
+# An upcoming visit of ANY kind (follow-up, appointment, recheck, ...) is the
+# same kind of context as a wellness/physical visit: it explains why labs are
+# wanted. The wellness nouns above are reused; this only widens the noun set
+# for the lab-reason check, so the other flows that share _WELLNESS_NOUN
+# (Sprint14 pre-emption, lab-exclusion sentence stripping) are unchanged.
+_LAB_VISIT_NOUN = (
+    r"(?:" + _WELLNESS_NOUN + r"|follow-?\s?ups?|appointments?|visits?|"
+    r"re-?checks?|check-?\s?ins?|exams?)"
+)
+_LAB_VISIT_NOUN_RE = re.compile(r"\b" + _LAB_VISIT_NOUN + r"\b")
+# The visit is stated AS the purpose ("for my 3 month follow up", "before my
+# appointment") or with timing ("my follow up is 2 weeks away", "next
+# month"), as opposed to merely appearing in the message.
+_LAB_VISIT_PURPOSE_RE = re.compile(
+    r"\b(?:for|before|ahead\s+of|prior\s+to|in\s+time\s+for|in\s+advance"
+    r"\s+of|going\s+(?:in)?to|due\s+(?:to|for)|to\s+prepare\s+for)\b"
+    r"(?:\W+\w+){0,5}?\W+" + _LAB_VISIT_NOUN + r"\b"
+)
+_LAB_VISIT_TIMING_RE = re.compile(
+    r"\b(?:upcoming|coming\s+up|next\s+(?:week|month|visit)|tomorrow|"
+    r"(?:in|within)\s+(?:a|an|\d+|one|two|three|four|a\s+few|a\s+couple)"
+    r"\s+(?:of\s+)?(?:days?|weeks?|months?)|"
+    r"\d+\s+(?:days?|weeks?|months?)\s+(?:away|from\s+now|out))\b"
+)
+# The caller is ACTING on the visit (schedule/book/reschedule/cancel/move it);
+# that is a scheduling request, not context.
+_LAB_VISIT_ACTION_RE = re.compile(
+    r"\b(?:schedul(?:e|ing)|book(?:ing)?|reschedul(?:e|ing)|rebook(?:ing)?|"
+    r"cancel(?:l?ing)?|move|moving|change|changing|set(?:ting)?\s+up)\b"
+    r"(?:\W+\w+){0,5}?\W+" + _LAB_VISIT_NOUN + r"\b"
+    r"|\b" + _LAB_VISIT_NOUN + r"\b(?:\W+\w+){0,6}?\W+"
+    r"(?:reschedul(?:e|ing)|rebook|cancel|move|change|push)\b"
+)
+
+
 def lab_reason_already_stated(message_lower):
     """A contextual wellness/physical visit can itself explain why labs
-    are being requested; an active request to schedule that visit cannot."""
+    are being requested; an active request to schedule that visit cannot.
+    The same holds for any upcoming visit stated as the purpose of the labs
+    (follow-up, appointment, recheck): the patient already gave the reason,
+    so it is not asked again. A request with no visit/reason context still
+    gets the reason question."""
+    if (
+            _WELLNESS_NOUN_RE.search(message_lower)
+            and wellness_mention_is_contextual(message_lower)
+    ):
+        return True
     return bool(
-        _WELLNESS_NOUN_RE.search(message_lower)
-        and wellness_mention_is_contextual(message_lower)
+        _LAB_VISIT_NOUN_RE.search(message_lower)
+        and (
+            _LAB_VISIT_PURPOSE_RE.search(message_lower)
+            or _LAB_VISIT_TIMING_RE.search(message_lower)
+        )
+        and not _LAB_VISIT_ACTION_RE.search(message_lower)
     )
 
 
