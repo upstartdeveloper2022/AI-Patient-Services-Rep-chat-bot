@@ -178,6 +178,11 @@ patient_voluntary_takeover = False
 response_time_stated = False
 office_hours_stated = False
 lab_result_fax_active = False
+# Existing lab orders being faxed/sent to an outside facility: the decision to
+# fax was already made, so later turns (the facility address, the hard-copy
+# question) must not fall back to the generic pickup-vs-fax script.
+lab_order_fax_to_facility_active = False
+lab_order_fax_info_received = False
 lab_result_inquiry_active = False
 ma_request_active = False
 ma_request_name = None
@@ -2345,6 +2350,31 @@ def _is_lab_representative_caller(message_lower=None):
 def detect_lab_order_pickup(message_lower):
     return any(
         trigger in message_lower for trigger in LAB_ORDER_PICKUP_TRIGGERS
+    )
+
+
+# Patient asks to SEND/FAX their EXISTING lab orders to an outside facility
+# ("Please send my existing lab orders to <lab>"). The facility is whatever
+# follows "to" - nothing is hard-coded. This is the same fax-to-facility
+# request as the "fax my lab orders to ..." triggers, but the wording
+# "send" was unowned, so Sprint14's lab-order EHR/send intent took it and
+# routed the patient to MyChart / document retrieval. Pickup, results and
+# new-order wording keep their own owners.
+_LAB_ORDER_SEND_TO_FACILITY_RE = re.compile(
+    r"\b(?:send|sending|forward|forwarding|fax|faxing|transmit)\b"
+    r"(?:\W+\w+){0,5}?\W+(?:lab\s+orders?|lab\s+requisitions?|requisitions?)"
+    r"\b(?:\W+\w+){0,3}?\W+(?:to|over\s+to)\b\s+\S"
+)
+_LAB_ORDER_SEND_EXCLUDE_RE = re.compile(
+    r"\b(?:results?|pick(?:ing)?\s*up|print\w*|new|put\s+in|find|locate|"
+    r"where|cancel\w*)\b"
+)
+
+
+def detect_existing_lab_order_send_to_facility(message_lower):
+    return bool(
+        _LAB_ORDER_SEND_TO_FACILITY_RE.search(message_lower)
+        and not _LAB_ORDER_SEND_EXCLUDE_RE.search(message_lower)
     )
 
 
@@ -8307,6 +8337,7 @@ def home():
     global new_patient_household_second_time, new_patient_household_primary_first_name
     global new_patient_household_primary_address
     global lab_result_fax_active
+    global lab_order_fax_to_facility_active, lab_order_fax_info_received
     global lab_result_inquiry_active
     global contagious_visit_active, contagious_same_day_check_pending
     global virtual_visit_offered
@@ -8378,6 +8409,8 @@ def home():
     response_time_stated = False
     office_hours_stated = False
     lab_result_fax_active = False
+    lab_order_fax_to_facility_active = False
+    lab_order_fax_info_received = False
     lab_result_inquiry_active = False
     contagious_visit_active = False
     contagious_same_day_check_pending = False
@@ -8583,6 +8616,7 @@ def chat():
     global third_party_consent_obtained, response_time_stated
     global patient_voluntary_takeover
     global office_hours_stated, lab_result_fax_active
+    global lab_order_fax_to_facility_active, lab_order_fax_info_received
     global lab_result_inquiry_active
     global contagious_visit_active, contagious_same_day_check_pending
     global virtual_visit_offered
@@ -8978,6 +9012,7 @@ def chat():
         Sprint14.refill_intent_detected = True
     if (
             not Sprint14.wellness_flow_active
+            and not detect_existing_lab_order_send_to_facility(message_lower)
             and (
             Sprint14.detect_lab_order_ehr_intent(message_lower)
             or Sprint14.detect_lab_send_request_intent(message_lower)
@@ -12011,9 +12046,17 @@ def chat():
     if lab_result_fax_to_outside_detected:
         lab_result_fax_active = True
 
+    existing_lab_order_send_to_facility = detect_existing_lab_order_send_to_facility(
+        message_lower
+    )
     lab_order_fax_to_facility_detected = any(
         trigger in message_lower for trigger in LAB_ORDER_FAX_TO_FACILITY_TRIGGERS
-    )
+    ) or existing_lab_order_send_to_facility
+    # Remember across turns that the patient already chose fax/send, so the
+    # follow-up turns do not re-enter the pickup-vs-fax decision.
+    lab_order_fax_active_before_turn = lab_order_fax_to_facility_active
+    if lab_order_fax_to_facility_detected:
+        lab_order_fax_to_facility_active = True
 
     patient_explicitly_requested_fax = any(
         phrase in message_lower for phrase in [
@@ -12351,10 +12394,58 @@ def chat():
 
     # Lab order fax to facility — patient explicitly asked to fax to a location
     lab_order_fax_to_facility_context = ""
+    _fax_info_in_message = bool(re.search(
+        r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b', message_lower
+    )) or detect_address_in_message(message_lower) or bool(re.search(
+        # numbered street address ("3450 n. wickham rd.") or a ZIP code
+        r'\b\d{1,6}\s+(?:[nsew]\.?\s+)?(?:[a-z.\']+\s+){0,3}'
+        r'(?:st|rd|ave|blvd|dr|ln|ct|pl|way|pkwy|hwy|cir)\b\.?'
+        r'|\b\d{5}(?:-\d{4})?\b', message_lower
+    ))
+    if lab_order_fax_active_before_turn and not lab_order_fax_to_facility_detected:
+        if not lab_order_fax_info_received and not _fax_info_in_message:
+            lab_order_fax_to_facility_context = (
+                "LAB_ORDER_FAX_TO_FACILITY INJECTED BY SYSTEM:\n"
+                "The patient already asked for their EXISTING lab orders to "
+                "be faxed/sent to a facility. The fax/send decision is made.\n"
+                "Do NOT ask fax-or-pickup. Do NOT treat this as a new lab "
+                "order. Still no fax number or address: say EXACTLY: 'Can "
+                "you please provide me with a fax number or the address so "
+                "that I can look up the fax number?'\n"
+            )
+        elif not lab_order_fax_info_received:
+            lab_order_fax_info_received = True
+            lab_order_fax_to_facility_context = (
+                "LAB_ORDER_FAX_TO_FACILITY INJECTED BY SYSTEM:\n"
+                "The patient already asked for their EXISTING lab orders to "
+                "be faxed/sent to a facility and has now given the "
+                "facility's fax number/address. The fax/send decision is "
+                "ALREADY MADE.\n"
+                "Do NOT ask 'would you like me to fax the lab orders or "
+                "pick them up'. Do NOT re-enter the pickup workflow. Do NOT "
+                "ask for the fax number/address again. Do NOT ask reason "
+                "for lab work. Do NOT ask if PCP aware. Do NOT say 72 "
+                "business hours.\n"
+                "Confirm you will fax the existing lab orders to that "
+                "facility. Then ask: 'Would you also like to come by and "
+                "pick up hard copies of the orders?'\n"
+            )
+        else:
+            lab_order_fax_to_facility_context = (
+                "LAB_ORDER_FAX_TO_FACILITY INJECTED BY SYSTEM:\n"
+                "The existing lab orders are being faxed to the facility "
+                "the patient named; the fax/send decision was already "
+                "made and the fax was confirmed.\n"
+                "Do NOT ask fax-or-pickup again and do NOT treat a pickup "
+                "mention as a new pickup request. If the patient answered "
+                "the hard-copy question: if YES state office hours ONCE; if "
+                "NO confirm fax is all that is needed. Then ask if there is "
+                "anything else you can help with.\n"
+            )
     if lab_order_fax_to_facility_detected:
-        already_has_fax_info = bool(re.search(
-            r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b', message_lower
-        )) or detect_address_in_message(message_lower)
+        if _fax_info_in_message:
+            lab_order_fax_info_received = True
+        already_has_fax_info = _fax_info_in_message
         lab_order_fax_to_facility_context = (
             "LAB_ORDER_FAX_TO_FACILITY INJECTED BY SYSTEM:\n"
             "Patient has explicitly requested lab orders be faxed to a specific facility.\n"
@@ -12389,7 +12480,10 @@ def chat():
 
     # Lab order pickup context — Bug 4 fixed
     lab_order_pickup_context = ""
-    if lab_order_pickup:
+    if lab_order_pickup and not (
+            lab_order_fax_active_before_turn
+            and not lab_order_fax_to_facility_detected
+    ):
         if patient_explicitly_requested_fax:
             lab_order_pickup_context = (
                 "LAB_ORDER_PICKUP_WITH_FAX_REQUESTED INJECTED BY SYSTEM:\n"
@@ -13452,7 +13546,10 @@ def chat():
             )
 
     lab_work_context = ""
-    if lab_work_detected and not is_medical_professional_caller:
+    if (
+            lab_work_detected and not is_medical_professional_caller
+            and not existing_lab_order_send_to_facility
+    ):
         lab_work_context = (
             "LAB_WORK_DETECTED — NEW ORDER INJECTED BY SYSTEM:\n"
             "Patient requesting NEW lab work. Full 5 step protocol:\n"
