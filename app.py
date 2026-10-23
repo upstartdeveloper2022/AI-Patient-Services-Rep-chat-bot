@@ -5202,6 +5202,15 @@ _MED_PRO_NON_NAME_WORDS = {
     "medical", "power", "wheelchair", "is", "are", "of", "and",
     "for", "from", "about", "regarding", "with", "my", "our",
     "your", "his", "her", "their", "to", "some",
+    # Organization words: a caller's employer ("Orlando Health", "Baptist
+    # Hospital") is never the patient. aggressive_name_extraction() takes the
+    # first capitalized word pair in a message that says "patient", which for
+    # "This is Elliot from Orlando Health. ... one of Dr. Anderson's
+    # patients" is the organization, not a person.
+    "health", "healthcare", "hospital", "hospitals", "center", "centre",
+    "clinic", "clinics", "pharmacy", "laboratory", "laboratories", "labs",
+    "diagnostics", "services", "group", "associates", "hospice", "system",
+    "systems", "university", "institute",
 }
 
 
