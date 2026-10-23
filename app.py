@@ -568,6 +568,10 @@ med_pro_critical_lab_announced = False
 # when the high-priority-message ask fires and consumed on the next
 # turn. Reset alongside the other per-call state in home().
 med_not_in_stock_callback_pending = False
+# Outside-pharmacy prescription-verification request stated in the opening
+# turn. Held while med-pro identity/PCP collection runs so it can be resumed
+# afterwards instead of asking the caller why they called.
+med_pro_script_verify_message = None
 # Medical-professional caller asking to speak directly with the patient's
 # PCP ("Can I speak with Dr. Mitchell?") after identity collection
 # completes. Stage machine: None | "regarding" (waiting for the reason)
@@ -5226,6 +5230,28 @@ def _extract_med_pro_patient_name(message):
     first, last = aggressive_name_extraction(message)
     if first and last and _is_med_pro_patient_name(first, last):
         return first, last
+    # Outside-pharmacy opener: "...received a prescription for <Med> for
+    # <First Last>, and I need to verify..." names the patient with a plain
+    # "for First Last" - no DOB token, no "patient" keyword, so none of the
+    # patterns above match and the name was re-asked. Last-resort fallback,
+    # gated on a prescription word; the medication (named by the same
+    # "prescription for <Med>" phrase) and organization words are skipped.
+    if re.search(r"\b(?:script|scripts|prescription|prescriptions|rx|e-?prescri\w+)\b",
+                 message, re.IGNORECASE):
+        med_match = re.search(
+            r"\b(?:prescription|script|rx|e-?prescription)s?\s+(?:for|of)\s+"
+            r"(?:the\s+|a\s+|an\s+)?([A-Za-z][A-Za-z\-]{2,30})",
+            message, re.IGNORECASE,
+        )
+        med_word = med_match.group(1).lower() if med_match else None
+        org_words = {"pharmacy", "pharmacies", "drugs", "drug", "clinic",
+                     "hospital", "office", "practice", "health", "care"}
+        for m in re.finditer(r"\bfor\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)\b", message):
+            cand_first, cand_last = m.group(1), m.group(2)
+            if cand_first.lower() == med_word or cand_last.lower() in org_words:
+                continue
+            if _is_med_pro_patient_name(cand_first, cand_last):
+                return cand_first, cand_last
     return None, None
 
 
@@ -5349,6 +5375,7 @@ def handle_med_pro_collection(message, message_lower):
     global med_pro_call_topic, med_pro_dme_order_pending
     global pcp_collected
     global med_pro_speak_requested
+    global med_pro_script_verify_message, med_not_in_stock_callback_pending
 
     # The topic is normally classified from the FIRST med-pro message at
     # interception time. A caller who only announces themselves up front
@@ -5359,6 +5386,14 @@ def handle_med_pro_collection(message, message_lower):
         med_pro_call_topic = "critical_lab"
     elif detect_speak_with_provider(message_lower):
         med_pro_speak_requested = True
+    elif (
+            med_pro_script_verify_message is None
+            and Sprint17.detect_script_verification(message_lower)
+            and not detect_med_not_in_stock_substitution(message_lower)
+    ):
+        # Remember the pharmacy's reason for calling (verify a script came
+        # from this office) so it survives name/DOB/PCP collection.
+        med_pro_script_verify_message = message
 
     if not med_pro_patient_first or not med_pro_patient_last:
         first, last = _extract_med_pro_patient_name(message)
@@ -5449,6 +5484,19 @@ def handle_med_pro_collection(message, message_lower):
         if med_pro_speak_requested:
             med_pro_speak_requested = False
             return _med_pro_provider_speak_response("your office")
+        if med_pro_script_verify_message is not None:
+            # Identity/PCP collection is done: resume the original script
+            # verification (Sprint17 FOUND / NOT FOUND) without re-asking
+            # why the caller phoned.
+            _verify_source = med_pro_script_verify_message
+            med_pro_script_verify_message = None
+            _verify_response, _verify_escalate = (
+                Sprint17.handle_script_verification(
+                    _verify_source, _verify_source.lower())
+            )
+            if _verify_escalate:
+                med_not_in_stock_callback_pending = True
+            return _verify_response
         return "Thank you for that. How can I help today?"
 
     if med_pro_call_topic == "dme":
@@ -8230,6 +8278,7 @@ def home():
     global med_pro_dme_callback_pending, med_pro_critical_lab_announced
     global med_pro_dme_fax_pending, med_pro_dme_fax_items
     global med_not_in_stock_callback_pending, med_pro_speak_stage
+    global med_pro_script_verify_message
     global med_pro_speak_requested
     global outside_provider_insurance_responded
     global parking_lot_wheelchair_close_pending
@@ -8512,6 +8561,7 @@ def home():
     med_pro_dme_fax_items = None
     med_pro_critical_lab_announced = False
     med_not_in_stock_callback_pending = False
+    med_pro_script_verify_message = None
     med_pro_speak_stage = None
     med_pro_speak_requested = False
     outside_provider_insurance_responded = False
@@ -8639,6 +8689,7 @@ def chat():
     global med_pro_dme_callback_pending, med_pro_critical_lab_announced
     global med_pro_dme_fax_pending, med_pro_dme_fax_items
     global med_not_in_stock_callback_pending, med_pro_speak_stage
+    global med_pro_script_verify_message
     global outside_provider_insurance_responded
     global parking_lot_wheelchair_close_pending
     global mychart_access_close_pending
