@@ -2371,6 +2371,44 @@ _LAB_ORDER_SEND_EXCLUDE_RE = re.compile(
 )
 
 
+# Patient asks to fax/send EXISTING results (any kind: lab, imaging, calcium
+# score, ...) to an outside provider they describe in their own words ("fax my
+# CT calcium score results to my cardiologist in Orlando"). The fixed
+# LAB_RESULT_FAX_TO_OUTSIDE_TRIGGERS need the exact phrases "fax my lab
+# results" / "fax results to", so a modifier between "my" and "results" matched
+# nothing and the model improvised a records-release script that asked for the
+# PRIMARY CARE provider's name, phone, email and location. The destination is
+# whatever follows "to"; nothing is hard-coded. Results sent to the patient
+# themself (or their email/portal) are not outside-provider transfers.
+_RESULTS_SEND_OUTSIDE_RE = re.compile(
+    r"\b(?:fax|faxing|send|sending|forward|forwarding|transmit)\b"
+    r"(?:\W+\w+){0,8}?\W+(?:results?|reports?)\b"
+    r"(?:\W+\w+){0,6}?\W+(?:to|over\s+to)\s+\S"
+)
+_RESULTS_SEND_EXCLUDE_RE = re.compile(
+    r"\bto\s+(?:me|myself|my\s+(?:email|e-mail|phone|mychart|portal|account|"
+    r"house|home|address))\b|\b(?:pick(?:ing)?\s*up|orders?)\b"
+)
+
+
+def detect_results_send_to_outside(message_lower):
+    return bool(
+        _RESULTS_SEND_OUTSIDE_RE.search(message_lower)
+        and not _RESULTS_SEND_EXCLUDE_RE.search(message_lower)
+    )
+
+
+def _outside_provider_label(message_lower):
+    """The kind of provider the patient named as the destination
+    ("cardiologist"), or a neutral word. Read from their own wording."""
+    m = re.search(r"\bto\s+(?:my|the|our)\s+([a-z\-]+)", message_lower)
+    word = m.group(1) if m else ""
+    if word.endswith(("ist", "ian", "surgeon")) or word in (
+            "doctor", "specialist", "physician", "provider"):
+        return word
+    return "provider"
+
+
 def detect_existing_lab_order_send_to_facility(message_lower):
     return bool(
         _LAB_ORDER_SEND_TO_FACILITY_RE.search(message_lower)
@@ -5246,7 +5284,7 @@ def _extract_med_pro_patient_name(message):
     # this stays as precise as before.
     dense = re.search(
         r"(?:for|about)\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)"
-        r"(?:\s*,)?(?:\s+(?:his|her|their))?\s*"
+        r"(?:\s*[,.;:])?(?:\s+(?:his|her|their))?\s*"
         r"(?:dob|date\s+of\s+birth)\b",
         message, re.IGNORECASE,
     )
@@ -12051,6 +12089,13 @@ def chat():
     lab_result_fax_to_outside_detected = any(
         trigger in message_lower for trigger in LAB_RESULT_FAX_TO_OUTSIDE_TRIGGERS
     )
+    # New wording only (the fixed triggers above keep their existing script).
+    results_outside_new_wording = (
+        not lab_result_fax_to_outside_detected
+        and detect_results_send_to_outside(message_lower)
+    )
+    if results_outside_new_wording:
+        lab_result_fax_to_outside_detected = True
     # Keep fax to outside active across follow-up messages so AI retains context
     if lab_result_fax_to_outside_detected:
         lab_result_fax_active = True
@@ -13963,10 +14008,22 @@ def chat():
             "name does NOT mean you have their contact information yet.\n"
             f"Fax number or address already provided this message: "
             f"{already_has_fax_info_outside}\n"
-            "If fax number or address NOT yet provided, say EXACTLY this "
-            "and nothing else: 'Can you please provide me with a fax "
-            "number or the address so that I can look up the fax "
-            "number?'\n"
+            + (
+                "If fax number or address NOT yet provided, say EXACTLY this "
+                "and nothing else: 'I can get that taken care of. May I have "
+                f"the {_outside_provider_label(message_lower)}'s name and "
+                "fax number? If you don't have the fax number, please give "
+                "me the address so I can look up the fax number.'\n"
+                "The results already exist and the destination is the "
+                "outside provider: do NOT ask for the primary care "
+                "provider's name, phone number, email address or location, "
+                "and do NOT treat this as a new test or imaging order.\n"
+                if results_outside_new_wording else
+                "If fax number or address NOT yet provided, say EXACTLY this "
+                "and nothing else: 'Can you please provide me with a fax "
+                "number or the address so that I can look up the fax "
+                "number?'\n"
+            ) +
             "Do NOT say 'using the address you've provided' or 'I've got "
             "the address' or anything implying you already possess "
             "contact information you have not actually been given.\n"
