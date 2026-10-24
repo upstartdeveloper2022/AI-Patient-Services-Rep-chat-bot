@@ -224,11 +224,15 @@ HOME_HEALTH_INSTRUCTIONS_TRIGGERS = [
     "orders to treat the patient", "care instructions for the patient",
 ]
 
+# "nurses" (plural) must count: "one of our nurses will be seeing <patient>"
+# matched neither half of this pattern (a trailing \b after "nurse" fails on
+# "nurses"), so the notice was never recognized and fell to the generic
+# medical-professional intake, which re-asked the patient's name and DOB.
 _HH_VISIT_NOTICE_PATTERN = re.compile(
-    r"\b(?:nurse|nursing\s+staff)\b[^.?!]{0,80}"
+    r"\b(?:nurses?|nursing\s+staff)\b[^.?!]{0,80}"
     r"\b(?:scheduled|schedule|visiting|visit|seeing|see|coming)\b|"
     r"\b(?:scheduled|schedule|visiting|visit|seeing|see|coming)\b"
-    r"[^.?!]{0,80}\b(?:nurse|nursing\s+staff)\b",
+    r"[^.?!]{0,80}\b(?:nurses?|nursing\s+staff)\b",
     re.IGNORECASE,
 )
 _HH_VISIT_TIME_PATTERN = re.compile(
@@ -2101,10 +2105,16 @@ def _handle_hh_visit_notice(message, message_lower):
     patient = f"{first} {last}" if first and last else "the patient"
     visit_time = _HH_VISIT_TIME_PATTERN.search(message)
     when = f" {visit_time.group(0)}" if visit_time else ""
+    # Keep the discharge context the caller gave (start of care follows a
+    # hospital discharge) in the acknowledgement instead of dropping it.
+    after = (
+        " following the hospital discharge"
+        if re.search(r"\bdischarg\w*\b", message_lower) else ""
+    )
     requests_flow_active = False
     return (
         f"Thank you. I've noted the upcoming Home Health nurse visit for "
-        f"{patient}{when} and will share this information with the care team. "
+        f"{patient}{when}{after} and will share this information with the care team. "
         "Is there anything else I can help you with today?"
     )
 
@@ -2630,7 +2640,15 @@ _ASK_OFFICE_FAX_RE = re.compile(
     r"(?:can|could|may)\s+(?:i|we)\s+(?:get|have)\s+"
     r"(?:(?:your|the)\s+)?(?:office\s+)?fax|"
     r"(?:can|could)\s+you\s+(?:give|tell)\s+(?:me\s+)?"
-    r"(?:(?:your|the)\s+)?(?:office\s+)?fax)\b"
+    r"(?:(?:your|the)\s+)?(?:office\s+)?fax|"
+    # Statement forms of the same ask: "I'm just calling to get the fax
+    # number", "I need your fax number", "looking for the office fax
+    # number". Without a question word none of the forms above matched, so
+    # the call went to patient intake (DOB / chart lookup). A fax number
+    # "for/of" some OTHER party is not ours (except our own office).
+    r"(?:get|need|want|looking\s+for|trying\s+to\s+(?:get|find)|"
+    r"have|find)\s+(?:(?:your|the)\s+)?(?:office\s+)?fax\s+number\b"
+    r"(?!\s+(?:for|of)\s+(?!(?:your|the)\s+(?:office|practice|clinic)\b)))"
 )
 
 # ── detectors ──
