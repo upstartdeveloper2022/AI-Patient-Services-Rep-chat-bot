@@ -3251,6 +3251,9 @@ def _handle_fax_notice(message, message_lower):
     if first and last and not ext_patient_first:
         globals()["ext_patient_first"], globals()["ext_patient_last"] = first, last
     _ext_capture_identity(message, bare_reply=(fn_stage == "ask_patient"))
+    # A professional caller whose patient name/DOB were already collected by
+    # app.py's intake (earlier in this call) must not be asked again.
+    _adopt_med_pro_identity()
     if fn_provider is None:
         fn_provider = _our_provider_named(message_lower)
     fax_line = ""
