@@ -1047,8 +1047,28 @@ def detect_lab_order_request(message_lower):
     return has_lab and bool(_LAB_REQUEST_CUE.search(message_lower))
 
 
+# A follow-up on an imaging order Steve ALREADY looked up this call ("Can you
+# remind me again what imaging order that was?"). It names no uncertainty cue
+# from the lists above and does carry request wording ("can you ... imaging
+# order"), so it was routed as a NEW imaging request and the reason question
+# was asked. Only applies once a lookup result exists for this call.
+_IMAGING_RECALL_RE = re.compile(
+    r"\b(?:remind\s+me|again|repeat|say\s+that|what\s+(?:was|is)\s+"
+    r"(?:that|it)|which\s+(?:one|test|scan|imaging)|what\s+(?:imaging|test|"
+    r"scan)\b[^.?!]{0,30}\b(?:was|is)\b)"
+)
+
+
 def detect_imaging_clarity(message_lower):
     if _contains_any(message_lower, IMAGING_CLARITY_TRIGGERS):
+        return True
+    if (
+            imaging_clarity_result
+            and _contains_any(message_lower, _IMAGING_CONTEXT_WORDS)
+            and _IMAGING_RECALL_RE.search(message_lower)
+            and not _IMAGING_EXCLUDE.search(message_lower)
+            and not re.search(r"\bshow(?:s|ed|ing|n)?\b", message_lower)
+    ):
         return True
     # A question about an imaging order the patient cannot recall, phrased
     # without any "imaging order" wording. Both halves are required: the
@@ -1064,8 +1084,29 @@ def detect_imaging_clarity(message_lower):
     )
 
 
+# "Can you send my MRI order to <facility>?" - an EXISTING order plus a
+# destination. The send cues above need "send to" back to back, so a
+# possessive/modality between the verb and "to" ("send my MRI order to ...")
+# matched nothing and the message fell to the new-imaging-request intake
+# (reason / provider-aware questions). Imaging word + send verb + "order" +
+# "to <destination>" is a transfer, mirroring the lab-order send-to-facility
+# rule in app.py. The destination is whatever follows "to".
+_IMAGING_ORDER_SEND_TO_RE = re.compile(
+    r"\b(?:send|sending|sent|forward|forwarding|fax|faxing|transmit)\b"
+    r"(?:\W+\w+){0,6}?\W+orders?\b(?:\W+\w+){0,4}?\W+"
+    r"(?P<to>to|over\s+to)\b\s*(?=\S)"
+)
+
+
 def detect_imaging_fax(message_lower):
     if _contains_any(message_lower, IMAGING_FAX_TRIGGERS):
+        return True
+    if (
+            _contains_any(message_lower, IMAGING_ORDER_TRIGGERS)
+            and _IMAGING_ORDER_SEND_TO_RE.search(message_lower)
+            and not _IMAGING_EXCLUDE.search(message_lower)
+            and not re.search(r"\bnew\b", message_lower)
+    ):
         return True
     # imaging modality + fax wording ("get my MRI order faxed to X").
     # Requires an imaging word so lab-order faxing stays with app.py.
@@ -1188,8 +1229,21 @@ def lab_reason_already_stated(message_lower):
     )
 
 
+# The study being REQUESTED ("I need an order for a CT scan") is not an
+# existing study for the provider to review. Mentions that are the object of
+# the request wording are removed before looking for a prior study, so only a
+# study named apart from the request ("...they did an x ray") counts.
+_REQUESTED_STUDY_RE = re.compile(
+    r"\b(?:need|needs|want|wants|order|ordered|request|requesting|requested|"
+    r"get|schedule|put\s+in)\b"
+    r"(?:\W+(?:an?|the|my|order|request|for|of|to|new|another|some))*\W+"
+    r"(?:x[\s-]?rays?|(?:ct|cat)[\s-]?scans?|cts?|ultrasounds?)\b"
+)
+
+
 def _prior_study_named(message_lower):
     """The existing study the provider is to review, or None."""
+    message_lower = _REQUESTED_STUDY_RE.sub(" ", message_lower)
     for pattern, label in _IMAGING_PRIOR_STUDY:
         if pattern.search(message_lower):
             return label
@@ -1225,6 +1279,16 @@ def _facility_named_in_message(message):
         if not tail or PHONE_PATTERN.search(tail):
             continue
         best = tail
+    if not best:
+        # "send my MRI order to <facility>": no back-to-back send cue exists,
+        # so read the destination after the "to" of the send-order phrase.
+        m = _IMAGING_ORDER_SEND_TO_RE.search(lowered)
+        if m:
+            tail = stripped[m.end():].strip()
+            tail = re.sub(r"^(?:the|a|an)\s+", "", tail,
+                          flags=re.IGNORECASE).strip()
+            if tail and not PHONE_PATTERN.search(tail):
+                best = tail
     if not best:
         return None
     # Keep it to a facility-like name: at most four words, and it must
