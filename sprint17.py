@@ -1990,6 +1990,18 @@ def _handle_hh_instructions(message, message_lower):
     global hh_instructions_deadline, hh_instructions_high_priority
 
     if hh_instructions_stage is None:
+        _ext_capture_identity(message)
+        _adopt_med_pro_identity()
+        _urgent = _HH_URGENT_RE.findall(message_lower)
+        if _urgent:
+            hh_instructions_high_priority = True
+            hh_instructions_deadline = ", ".join(dict.fromkeys(_urgent))
+            lead = "I'll put in a high priority message for the provider. "
+            if not ext_patient_dob:
+                hh_instructions_stage = "ask_dob"
+                return lead + _hh_instructions_dob_question()
+            hh_instructions_stage = "ask_contact"
+            return lead + "May I get a good contact number for you?"
         hh_instructions_ma_available = _resolve_availability("STEVE_FORCE_HH_MA_AVAILABLE")
         if hh_instructions_ma_available:
             hh_instructions_stage = "complete"
@@ -2095,6 +2107,42 @@ def _handle_hh_visit_notice(message, message_lower):
         f"{patient}{when} and will share this information with the care team. "
         "Is there anything else I can help you with today?"
     )
+
+
+def _adopt_med_pro_identity():
+    """Reuse the patient name/DOB app.py's medical-professional intake
+    already captured from the caller's opening statement, so this flow does
+    not discard it and re-ask. Fills ONLY what is still missing; anything the
+    caller stated in the current message (already captured) wins. Same
+    read-only app.py access as the death-certificate flow."""
+    try:
+        import app as _app
+        if not getattr(_app, "is_medical_professional_caller", False):
+            return
+        if not (ext_patient_first and ext_patient_last):
+            first = getattr(_app, "med_pro_patient_first", None)
+            last = getattr(_app, "med_pro_patient_last", None)
+            if first and last:
+                globals()["ext_patient_first"] = first
+                globals()["ext_patient_last"] = last
+        if not ext_patient_dob and getattr(_app, "med_pro_patient_dob", None):
+            globals()["ext_patient_dob"] = _app.med_pro_patient_dob
+    except Exception:
+        pass
+
+
+# The caller states the request is time-critical ("today", "before Monday",
+# "ASAP"). Such a request is notated as a high priority provider message
+# straight away; it does not wait on whether the medical assistant happens to
+# be free, and it is not told "the medical assistant is not available".
+# "this morning" etc. describe when something HAPPENED, not a deadline, so
+# they are deliberately not urgency cues.
+_HH_URGENT_RE = re.compile(
+    r"\b(?:today|tonight|asap|urgent(?:ly)?|immediately|right\s+away|"
+    r"as\s+soon\s+as\s+possible|"
+    r"(?:before|by)\s+(?:tomorrow|the\s+weekend|noon|"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day))\b"
+)
 
 
 def _hh_instructions_dob_question():
