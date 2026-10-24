@@ -880,6 +880,27 @@ def detect_home_health_decline(message_lower):
     return False
 
 
+# A home health AGENCY calling about a referral ("This is <name> from <agency>
+# Home Health. We are calling about a referral sent from Dr. X for <patient>
+# dob ..."). Neither the follow triggers nor any other home health detector
+# matched, so the call went to app.py's medical-professional collection and
+# then the generic referral lookup, which answered with a fabricated referral
+# (a made-up date, provider and unrelated reason such as "endocrinology").
+# Home health referral calls stay in the existing home health follow flow (the
+# provider is asked and the agency's contact number is taken) - no second home
+# health workflow. Requires the agency's own self-introduction, so a PATIENT
+# asking about a referral for home health is not treated as an agency.
+_HH_REFERRAL_WORD_RE = re.compile(r"\breferrals?\b")
+
+
+def _home_health_agency_referral_call(message_lower):
+    return bool(
+        _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
+        and _HH_REFERRAL_WORD_RE.search(message_lower)
+        and _EXTERNAL_CALLER_CUE.search(message_lower)
+    )
+
+
 def detect_home_health_follow(message_lower):
     return bool(
         _contains_any(message_lower, HOME_HEALTH_CONTEXT_WORDS)
@@ -887,7 +908,7 @@ def detect_home_health_follow(message_lower):
                 _contains_any(message_lower, HOME_HEALTH_FOLLOW_TRIGGERS)
                 or _HH_FOLLOW_FOR_PATTERN.search(message_lower)
         )
-    )
+    ) or _home_health_agency_referral_call(message_lower)
 
 
 def detect_home_health_instructions(message_lower):
