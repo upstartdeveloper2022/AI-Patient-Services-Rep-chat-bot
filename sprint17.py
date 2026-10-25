@@ -739,8 +739,25 @@ def _contains_any(message_lower, triggers):
 # Intent detection
 # ─────────────────────────────────────────────
 
+# Telling/praising/reporting TO the manager ("I want to tell the manager how
+# helpful Lisa was", "let the manager know ...", "thank the practice manager").
+# The fixed triggers above only cover "speak/talk to the manager" and the
+# complaint/compliment nouns, so this wording matched no workflow and the model
+# improvised a provider note. A cue verb must precede "the/your/a manager" (or
+# management), so a patient's OWN manager ("my manager needs a note") is not a
+# request. The existing Practice Manager workflow handles the rest.
+_PM_ADDRESSED_RE = re.compile(
+    r"\b(?:tell|let|inform|notify|thank|compliment|praise|recogni[sz]e|"
+    r"message|write|email|pass|share|report|say|speak|talk|reach|contact|"
+    r"want\s+to\s+give)\b[^.?!]{0,40}"
+    r"\b(?:(?:the|your|a)\s+(?:practice\s+)?manager|management)\b"
+)
+
+
 def detect_practice_manager_request(message_lower):
-    return _contains_any(message_lower, PRACTICE_MANAGER_TRIGGERS)
+    return _contains_any(message_lower, PRACTICE_MANAGER_TRIGGERS) or bool(
+        _PM_ADDRESSED_RE.search(message_lower)
+    )
 
 
 def detect_car_accident(message_lower):
@@ -803,17 +820,49 @@ def detect_patient_prior_auth_request(message_lower):
     )
 
 
+def _insurer_caller_in_context():
+    """True when the medical-professional caller introduced themselves as an
+    insurance/disability company representative in an EARLIER turn of this
+    call ("This is Joyce from <Company> Disability Insurance Company ...").
+    Detectors here are stateless per message, so a later turn ("We are
+    following up on disability paperwork we sent over 2 days ago") carries no
+    introduction and no insurer word and matched nothing - the model then said
+    it would "check the status" and closed. Same read-only app.py pattern as
+    _home_health_caller_in_context; scoped to medical-professional callers
+    whose earlier turn was an external self-introduction, so a patient who
+    merely mentioned insurance cannot trigger it."""
+    try:
+        import app as _app
+        if not getattr(_app, "is_medical_professional_caller", False):
+            return False
+        return any(
+            turn.get("role") == "user"
+            and _EXTERNAL_CALLER_CUE.search(turn.get("content", "").lower())
+            and re.search(
+                r"\b(?:insurance|insurer|carrier)\b",
+                turn.get("content", "").lower(),
+            )
+            for turn in getattr(_app, "conversation_history", [])
+        )
+    except Exception:
+        return False
+
+
 def detect_life_insurance_disability(message_lower):
     # A representative-style introduction is required so a PATIENT who
     # merely mentions their life insurance or a disability claim is not
     # treated as a company representative.
-    external_caller = bool(_EXTERNAL_CALLER_CUE.search(message_lower))
+    in_context = _insurer_caller_in_context()
+    external_caller = bool(_EXTERNAL_CALLER_CUE.search(message_lower)) or in_context
     existing_disability_intent = _contains_any(
         message_lower, LIFE_INSURANCE_DISABILITY_TRIGGERS
     )
     insurer_paperwork_intent = (
         _contains_any(message_lower, DISABILITY_PAPERWORK_TRIGGERS)
-        and bool(re.search(r"\b(?:insurance|insurer|carrier)\b", message_lower))
+        and (
+            in_context
+            or bool(re.search(r"\b(?:insurance|insurer|carrier)\b", message_lower))
+        )
     )
     return external_caller and (
         existing_disability_intent or insurer_paperwork_intent
@@ -1796,6 +1845,9 @@ def _handle_life_insurance(message, message_lower):
         # The representative is not a verified patient, so collect only
         # the patient identity needed to perform this chart lookup.
         _ext_capture_identity(message, bare_reply=(li_stage == "ask_patient"))
+        # Identity already collected by app.py's intake earlier in this call
+        # (name, DOB) is reused, not asked for again.
+        _adopt_med_pro_identity()
         if not (ext_patient_first and ext_patient_last):
             li_stage = "ask_patient"
             return (
@@ -1805,6 +1857,13 @@ def _handle_life_insurance(message, message_lower):
         if not ext_patient_dob:
             li_stage = "ask_patient"
             return f"Thank you. Could I get {ext_patient_first}'s date of birth?"
+        if _contains_any(message_lower, DISABILITY_PAPERWORK_TRIGGERS):
+            # The caller is asking about PAPERWORK they sent (has it been
+            # completed?), not a claim determination: answer with the
+            # paperwork-status reply, which explains what the chart can and
+            # cannot confirm and routes the question to the team.
+            li_stage = "complete"
+            return _handle_life_insurance(message, message_lower)
         li_stage = "complete"
         requests_flow_active = False
         if _life_insurance_documentation_on_file():
