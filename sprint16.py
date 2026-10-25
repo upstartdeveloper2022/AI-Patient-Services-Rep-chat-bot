@@ -241,6 +241,19 @@ _PATIENT_FOR_NAME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# GF-64: a professional's dense intro often names the patient with no
+# "patient" label at all ("...calling about Rebecca Moore DOB 3/14/1958"), so
+# neither pattern above matches and the flow re-asked for identity the caller
+# had just given. The DOB label itself is the anchor: the two words directly
+# before "DOB"/"date of birth"/"born" are the patient's name. Only consulted
+# when a DOB is also present, and both words must clear _NON_NAME_WORDS so
+# scaffolding ("the patient DOB ...", "her DOB ...") is never captured.
+_PATIENT_BEFORE_DOB_PATTERN = re.compile(
+    r"\b([A-Za-z][A-Za-z'\-]+)\s+([A-Za-z][A-Za-z'\-]+)\s*,?\s*"
+    r"(?:dob|d\.o\.b\.?|date\s+of\s+birth|born(?:\s+on)?)\b",
+    re.IGNORECASE,
+)
+
 # Tokens that are structurally "the name is Bob Barker" scaffolding or
 # common stop words - never a real first/last name (mirrors app.py's own
 # _MED_PRO_NON_NAME_WORDS idea).
@@ -301,6 +314,12 @@ _CALL_ENDING_PHRASES = (
     "that's all", "thats all", "all set",
     "no", "no thank you", "no thanks", "nope", "nope thank you",
     "nope thanks",
+    # GF-64: ordinary farewells/finality phrasings the list missed, so a
+    # caller saying "No. Have a good day" after the workflow closed was
+    # asked "anything else?" again instead of being told goodbye.
+    "have a good day", "have a nice day", "have a good one",
+    "that will be all", "that is all", "that's it", "thats it",
+    "i'm good", "im good",
 )
 
 
@@ -447,6 +466,12 @@ def _extract_patient_name(message):
                 fm.group(2).lower() not in _NON_NAME_WORDS
         ):
             return fm.group(1), fm.group(2)
+        for bm in _PATIENT_BEFORE_DOB_PATTERN.finditer(message):
+            if (
+                bm.group(1).lower() not in _NON_NAME_WORDS
+                and bm.group(2).lower() not in _NON_NAME_WORDS
+            ):
+                return bm.group(1), bm.group(2)
     parts = message.strip().rstrip(".!?,").split()
     if (
         len(parts) == 2
@@ -593,6 +618,7 @@ def _clean_request_details(message, message_lower):
     cleaned description, or the raw trimmed message if nothing can be
     pulled out."""
     low = message_lower
+    _orig_message, _orig_low = message, message_lower
     # First cut off any trailing follow-up subclause in the WHOLE message
     # ("We faxed over a request for the latest EKG ... did the office
     # receive that request?") so a closing "request?" can't become the
@@ -644,7 +670,42 @@ def _clean_request_details(message, message_lower):
         idx = tail.lower().find(cut)
         if idx != -1:
             tail = tail[:idx].rstrip()
-    return tail.strip().strip(".,!?")
+    result = tail.strip().strip(".,!?")
+    # GF-64: a dense intro ("...about <patient> DOB 3/14/1958. ... we faxed
+    # over a request yesterday, ... waiting on some documentation related to
+    # the referral ...") loses the real request: the " dob" cut above
+    # truncates the whole message before it and the leftover introduction
+    # (or a stray word like "yesterday") became the "requested items". When
+    # the cleaned text names no document at all but the caller's message
+    # does, take the phrase starting at the first document word after the
+    # DOB instead.
+    if not any(d in result.lower() for d in _DOC_REQUEST_WORDS):
+        dob_match = _DOB_PATTERN.search(_orig_message)
+        start_at = dob_match.end() if dob_match else 0
+        positions = [
+            m.start()
+            for d in _DOC_REQUEST_WORDS
+            for m in re.finditer(r"\b" + re.escape(d) + r"\b", _orig_low)
+            if m.start() >= start_at
+        ]
+        if positions:
+            phrase = _orig_message[min(positions):]
+            phrase = re.split(r"[.?!]", phrase, maxsplit=1)[0]
+            boundary = _CLAUSE_BOUNDARY_PATTERN.search(phrase)
+            if boundary:
+                phrase = phrase[:boundary.start()]
+            phrase = re.split(
+                r"\s+and\s+(?:i|we|he|she|they)\b", phrase,
+                maxsplit=1, flags=re.IGNORECASE,
+            )[0]
+            for cut in _DESCRIPTION_TAIL_CUTS:
+                idx = phrase.lower().find(cut)
+                if idx != -1:
+                    phrase = phrase[:idx]
+            phrase = phrase.strip().strip(".,!?")
+            if phrase:
+                return phrase
+    return result
 
 
 def _try_capture_request_details(message, message_lower, require_identity=False,
@@ -844,6 +905,13 @@ def _is_call_ending(message_lower):
     normalized = _canonical_call_ending(message_lower)
     if normalized in _CANONICAL_CALL_ENDINGS:
         return True
+
+    # A farewell followed by gratitude ("that will be all, thanks").
+    for suffix in ("thank you", "thanks"):
+        if normalized.endswith(" " + suffix) and (
+            normalized[:-(len(suffix) + 1)] in _CANONICAL_CALL_ENDINGS
+        ):
+            return True
 
     for prefix in ("no", "nope"):
         if normalized.startswith(prefix + " "):
