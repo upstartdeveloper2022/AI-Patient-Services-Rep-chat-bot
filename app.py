@@ -208,6 +208,8 @@ nurse_visit_active = False
 # turnaround and the short collection path on follow-up turns (e.g. the turn
 # where the patient gives a callback number). Reset in home().
 refill_out_of_medication_active = False
+# GF-66: callback number the caller already gave this call (None until given)
+callback_number_collected = None
 
 # Medication-order request destination capture: the first turn of a
 # non-controlled med order request ("put in an order for my prolia shot")
@@ -4956,6 +4958,76 @@ def patient_wants_to_decline(message_lower):
     return any(phrase in message_lower for phrase in NEW_PATIENT_DECLINE_PHRASES)
 
 
+_CALLBACK_ASK_RE = re.compile(
+    r"\b(?:call\s*back|contact|best|good)\s+(?:phone\s+)?number\b",
+    re.IGNORECASE,
+)
+_CALLBACK_PHONE_RE = re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b")
+
+
+_CALLBACK_NUMBER_CHANGE_RE = re.compile(
+    r"\b(?:different|another|new|wrong|incorrect|change[ds]?|updated?)\b"
+    r".{0,40}\bnumber\b|\bnumber\b.{0,40}\b(?:wrong|incorrect|change[ds]?)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_repeated_callback_ask(reply, number, user_message):
+    """GF-66: once the caller has given a callback number, a model reply that
+    asks for one again ("...May I get a good callback number for you?") has
+    that question replaced with an acknowledgment of the number already on
+    file. The CALLBACK_NUMBER_ALREADY_COLLECTED context asks the model not to
+    re-ask, but a scripted office-closed / results answer kept ending in the
+    question anyway, so the guarantee is made here. Only the question
+    sentence is replaced; every other word of the reply is untouched. A
+    caller who says the number is wrong or wants to give another is left
+    alone."""
+    if not number or not reply or _CALLBACK_NUMBER_CHANGE_RE.search(user_message or ""):
+        return reply
+    pieces = re.split(r"(?<=[.?!])\s+", reply)
+    out, replaced = [], False
+    for piece in pieces:
+        if piece.rstrip().endswith("?") and _CALLBACK_ASK_RE.search(piece):
+            if not replaced:
+                out.append(f"I have your callback number as {number}.")
+                replaced = True
+            continue
+        out.append(piece)
+    return " ".join(out) if replaced else reply
+
+
+def _callback_number_given(history, user_message):
+    """GF-66: Steve's last message asked for a callback/contact number and this
+    caller turn supplies one. Returns the number or None."""
+    for turn in reversed(history or []):
+        if turn.get("role") == "assistant":
+            if not _CALLBACK_ASK_RE.search(turn.get("content", "")):
+                return None
+            match = _CALLBACK_PHONE_RE.search(user_message or "")
+            return match.group(0) if match else None
+    return None
+
+
+_MA_TRANSFER_HOLD_RE = re.compile(
+    r"connect you with (.+?) now\.?\s+please hold for one moment",
+    re.IGNORECASE,
+)
+
+
+def _pending_ma_transfer_name(history):
+    """GF-66: the medical assistant is available and Steve has just said "Let
+    me go ahead and connect you with <MA> now. Please hold for one moment."
+    Returns that MA reference when that line is Steve's most recent message,
+    else None. Read from the transcript (like the other "last assistant
+    message" checks) so it covers the deterministic and the model-authored
+    routing replies alike, with no extra state to reset."""
+    for turn in reversed(history or []):
+        if turn.get("role") == "assistant":
+            match = _MA_TRANSFER_HOLD_RE.search(turn.get("content", ""))
+            return match.group(1).strip() if match else None
+    return None
+
+
 def is_virtual_appointment_request(message_lower, history):
     if not re.search(r"\b(?:virtual|video|telehealth)\b", message_lower):
         return False
@@ -8486,7 +8558,7 @@ def home():
     global ma_request_reason_collected
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
-    global nurse_visit_active, refill_out_of_medication_active
+    global nurse_visit_active, refill_out_of_medication_active, callback_number_collected
     global medication_order_destination_pending
 
     profanity_count = 0
@@ -8617,6 +8689,7 @@ def home():
     referral_specialist_phone = None
     nurse_visit_active = False
     refill_out_of_medication_active = False
+    callback_number_collected = None
     medication_order_destination_pending = False
     new_patient_flow_active = False
     new_patient_requested_provider = None
@@ -8778,7 +8851,7 @@ def chat():
     global controlled_substance_bridge_confirmed_insufficient
     global referral_lookup_done, referral_lookup_result
     global referral_specialist_name, referral_specialist_phone
-    global nurse_visit_active, refill_out_of_medication_active
+    global nurse_visit_active, refill_out_of_medication_active, callback_number_collected
     global medication_order_destination_pending
     global ma_request_active, ma_request_name
     global ma_request_provider, ma_request_reason_collected
@@ -8826,6 +8899,31 @@ def chat():
 
     user_message = request.json.get("message")
     message_lower = user_message.lower()
+
+    # GF-66: remember the callback number once the caller gives it, so the
+    # rest of the call (office-closed handling, MyChart, provider follow-up)
+    # never asks for it a second time.
+    _cb_given = _callback_number_given(conversation_history, user_message)
+    if _cb_given:
+        callback_number_collected = _cb_given
+
+    # GF-66: the "please hold" transfer line had no completion step, so the
+    # caller's next turn fell to the model with no owner (dead end). Complete
+    # the transfer the same way the other transfers do: confirm, give a
+    # fallback instruction, and close.
+    _ma_transfer_who = _pending_ma_transfer_name(conversation_history)
+    if _ma_transfer_who:
+        _ma_transfer_reply = (
+            f"Thank you for holding. I'm transferring you to "
+            f"{_ma_transfer_who} now. Should the call disconnect, please "
+            f"call us back and ask for {_ma_transfer_who}. Thank you for "
+            f"calling Sykes Creek Primary Care. Have a great day!"
+        )
+        conversation_history.extend([
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": _ma_transfer_reply},
+        ])
+        return jsonify({"response": _ma_transfer_reply})
 
     if virtual_florida_booking_pending:
         pending_booking = virtual_florida_booking_pending
@@ -11974,10 +12072,17 @@ def chat():
         # still does) made a weekend caller get the office-closed message
         # instead of the MA answer.
         if get_ma_availability():
+            # GF-66: the available branch used to end on "Please hold for
+            # one moment." - a statement with no question and no terminal
+            # state, so the call just stopped. Complete the transfer in this
+            # same reply, like the billing / Total Care transfers do.
             _returning_ma_reply = (
                 f"Please hold while I see if {_returning_ma_who} is "
                 f"available. Let me go ahead and connect you with "
-                f"{_returning_ma_who} now. Please hold for one moment."
+                f"{_returning_ma_who} now. Should the call disconnect, "
+                f"please call us back and ask for {_returning_ma_who}. "
+                f"Thank you for calling Sykes Creek Primary Care. Have a "
+                f"great day!"
             )
         else:
             _returning_ma_reply = (
@@ -14049,6 +14154,22 @@ def chat():
     ):
         refill_out_of_medication_active = True
 
+    callback_number_context = ""
+    if callback_number_collected:
+        callback_number_context = (
+            "CALLBACK_NUMBER_ALREADY_COLLECTED INJECTED BY SYSTEM:\n"
+            f"The caller already gave a callback number on this call: "
+            f"{callback_number_collected}.\n"
+            "Do NOT ask for a callback number again and do NOT ask them to "
+            "confirm it, for any request or message on this call. Use that "
+            "number (for example, confirm the message has been created and "
+            "someone will call them at it). Only accept a different number "
+            "if the caller volunteers one. This changes nothing else: keep "
+            "following every other instruction (office-hours wording, "
+            "MyChart suggestions, timeframes) - only skip the callback-number "
+            "question.\n"
+        )
+
     refill_out_of_medication_context = ""
     if (
             refill_out_of_medication_active
@@ -14733,6 +14854,7 @@ def chat():
             nurse_ma_context,
             nurse_visit_context,
             refill_out_of_medication_context,
+            callback_number_context,
             lab_order_fax_to_facility_context,
             lab_order_pickup_context,
             booking_reason_provided_context,
@@ -14790,6 +14912,9 @@ def chat():
                 f"reply trimmed from {len(assistant_message)} to {len(trimmed)} chars"
             )
             assistant_message = trimmed
+        assistant_message = _strip_repeated_callback_ask(
+            assistant_message, callback_number_collected, user_message
+        )
         virtual_confirmation = _extract_generic_appointment_confirmation(
             assistant_message
         )
