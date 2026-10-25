@@ -322,6 +322,8 @@ next_day_or_urgent_care_pending = False
 virtual_appointment_scheduling_active = False
 in_person_appointment_scheduling_active = False
 virtual_florida_booking_pending = None
+# GF-60: telehealth-eligibility gate for a virtual request: None -> "asked" -> "confirmed"
+virtual_florida_eligibility = None
 
 # Scenario 16/17: Reschedule / Cancel Acute Visit
 acute_existing_appt_day = None
@@ -846,10 +848,56 @@ _PARKING_LOT_WHEELCHAIR_EXCLUSIONS = re.compile(
 )
 
 
-def is_parking_lot_wheelchair_assistance(message_lower):
+_WHEELCHAIR_RE = re.compile(r"\bwheel\s*chair\b")
+_ARRIVAL_LOCATION_RE = re.compile(
+    r"\b(?:parking\s+lot|(?:my|the)\s+(?:car|vehicle)|"
+    r"(?:front\s+)?(?:door|entrance)|into\s+(?:the\s+)?(?:office|building|clinic))\b"
+)
+_ON_SITE_CUE_RE = re.compile(
+    r"\b(?:parking\s+lot|in\s+the\s+(?:car|lot)|out\s*front|outside|"
+    r"(?:i\s*am|i'm|we\s*are|we're)\s+(?:here|there|downstairs|at\s+the\s+(?:door|entrance)))\b"
+)
+_ON_SITE_REQUEST_RE = re.compile(
+    r"\b(?:help|assist(?:ance)?|bring|meet|from|need|someone|somebody|"
+    r"anyone|get|send|hurry|late)\b"
+)
+
+
+def _wheelchair_need_in_context(history, lookback=4):
+    """GF-59: an earlier caller turn already asked for wheelchair help."""
+    try:
+        user_turns = [
+            t.get("content", "").lower() for t in (history or [])
+            if t.get("role") == "user"
+        ][-lookback:]
+    except Exception:
+        return False
+    return any(
+        _WHEELCHAIR_RE.search(t) and not _PARKING_LOT_WHEELCHAIR_EXCLUSIONS.search(t)
+        for t in user_turns
+    )
+
+
+def is_parking_lot_wheelchair_assistance(message_lower, history=None):
+    # GF-59: the wheelchair need and the "I'm already in the parking lot"
+    # clarification can arrive in separate turns; honor the earlier request.
+    wheelchair_here = bool(_WHEELCHAIR_RE.search(message_lower))
+    if not wheelchair_here and history is not None:
+        if not (
+            _wheelchair_need_in_context(history)
+            and _ON_SITE_CUE_RE.search(message_lower)
+            and _ON_SITE_REQUEST_RE.search(message_lower)
+            and not _PARKING_LOT_WHEELCHAIR_EXCLUSIONS.search(message_lower)
+        ):
+            return False
+        return True
+    # GF-59b: an arrival request ("...get from the car into the office")
+    # is an operational front-desk request even without the words
+    # "parking lot"; owning it here keeps real-time office-hours context
+    # from sending the caller to urgent care.
     return (
-        bool(re.search(r"\bwheel\s*chair\b", message_lower))
-        and bool(re.search(r"\bparking\s+lot\b", message_lower))
+        wheelchair_here
+        and bool(_ARRIVAL_LOCATION_RE.search(message_lower))
         and bool(re.search(
             r"\b(?:help|assist(?:ance)?|bring|meet|from|need)\b",
             message_lower,
@@ -8396,7 +8444,7 @@ def home():
     global same_day_virtual_clinic_offer_pending
     global next_available_options_pending
     global next_day_or_urgent_care_pending
-    global virtual_appointment_scheduling_active, virtual_florida_booking_pending
+    global virtual_appointment_scheduling_active, virtual_florida_booking_pending, virtual_florida_eligibility
     global in_person_appointment_scheduling_active
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
@@ -8479,6 +8527,7 @@ def home():
     virtual_appointment_scheduling_active = False
     in_person_appointment_scheduling_active = False
     virtual_florida_booking_pending = None
+    virtual_florida_eligibility = None
     acute_existing_appt_day = None
     acute_existing_appt_time = None
     acute_reschedule_confirm_pending = False
@@ -8678,7 +8727,7 @@ def chat():
     global same_day_virtual_clinic_offer_pending
     global next_available_options_pending
     global next_day_or_urgent_care_pending
-    global virtual_appointment_scheduling_active, virtual_florida_booking_pending
+    global virtual_appointment_scheduling_active, virtual_florida_booking_pending, virtual_florida_eligibility
     global in_person_appointment_scheduling_active
     global acute_existing_appt_day, acute_existing_appt_time
     global acute_reschedule_confirm_pending, acute_cancel_confirm_pending
@@ -8820,8 +8869,15 @@ def chat():
         )
         return jsonify({"response": repeat_response})
 
-    if is_virtual_appointment_request(message_lower, conversation_history):
+    # GF-60: after a "not in Florida" answer, a bare "yes" to the in-person
+    # offer must not re-activate virtual mode via the history check.
+    if is_virtual_appointment_request(message_lower, conversation_history) and not (
+            virtual_florida_eligibility == "declined"
+            and not re.search(r"\b(?:virtual|video|telehealth)\b", message_lower)
+    ):
         virtual_appointment_scheduling_active = True
+        if virtual_florida_eligibility == "declined":
+            virtual_florida_eligibility = None
 
     if parking_lot_wheelchair_close_pending:
         parking_lot_wheelchair_close_pending = False
@@ -8838,7 +8894,7 @@ def chat():
     if (
             not pre_chart_complete
             and not new_patient_flow_active
-            and is_parking_lot_wheelchair_assistance(message_lower)
+            and is_parking_lot_wheelchair_assistance(message_lower, conversation_history)
     ):
         parking_lot_wheelchair_close_pending = True
         assistance_response = (
@@ -12701,6 +12757,7 @@ def chat():
             virtual_visit_recently_offered
             and patient_wants_to_proceed(message_lower)
             and not in_person_visit_selected
+            and virtual_florida_eligibility != "declined"
             and not is_medical_professional_caller
     )
     if virtual_visit_accepted_now:
@@ -12952,6 +13009,35 @@ def chat():
                         "present the times directly.\n"
                     )
                 availability_context = availability_text
+
+    # GF-60: the patient's explicit VIRTUAL request lived only in the
+    # virtual_appointment_scheduling_active flag (used after the reply to
+    # trigger the Florida question); the LLM never saw it, so a later
+    # deadline / work-note turn let it fall back to in-office slots.
+    # Tell it every turn the request is still virtual.
+    if (
+            availability_context
+            and virtual_appointment_scheduling_active
+            and not virtual_visit_accepted_now
+            and not is_medical_professional_caller
+    ):
+        availability_context += (
+            "VIRTUAL_APPOINTMENT_REQUESTED INJECTED BY SYSTEM:\n"
+            "The patient explicitly asked for a VIRTUAL appointment and "
+            "that request is still active. Present the times above as "
+            "VIRTUAL visit slots. Do NOT switch to, offer, or mention an "
+            "in-office appointment, and do NOT ask whether they would "
+            "prefer in-office or a later 'future' appointment. A stated "
+            "reason (including a work note) or deadline does not change "
+            "the visit type. If the patient gave a deadline, offer the "
+            "earliest available slots BEFORE the deadline day first, and "
+            "use a slot on the deadline day only if nothing earlier "
+            "exists. Do NOT ask about Florida or where the patient will "
+            "be - the system already handles telehealth eligibility"
+            + (" and it is CONFIRMED, so present the virtual times now"
+               if virtual_florida_eligibility == "confirmed" else "")
+            + ".\n"
+        )
 
     if availability_context:
         _today = datetime.now()
@@ -14456,6 +14542,57 @@ def chat():
         )
         return jsonify({"response": _reason_question_response})
 
+    # GF-60: telehealth eligibility is confirmed BEFORE any virtual slot is
+    # shown or chosen. Previously the question was asked only after the
+    # patient picked a time. Python-owned so the LLM can't skip it.
+    if (
+            virtual_appointment_scheduling_active
+            and pre_chart_complete
+            and not is_medical_professional_caller
+            and caller_is_patient
+            and not Sprint13.phf_flow_active
+            and not is_same_day
+            and not virtual_florida_booking_pending
+            and virtual_florida_eligibility != "confirmed"
+            and any(
+                turn.get("role") == "assistant"
+                and ("what is the reason" in turn.get("content", "").lower()
+                     or "seen for" in turn.get("content", "").lower())
+                for turn in conversation_history
+            )
+    ):
+        _tele_state = "Florida"
+        _tele_question = (
+            f"Will you be in {_tele_state} at the time of your virtual visit?"
+        )
+        _tele_reply = None
+        if virtual_florida_eligibility == "asked":
+            if re.search(r"\b(?:no|nope|not|never|outside|won.t)\b", message_lower):
+                virtual_florida_eligibility = "declined"
+                virtual_appointment_scheduling_active = False
+                _tele_reply = (
+                    f"I'm sorry, virtual visits can only be scheduled when "
+                    f"you'll be in {_tele_state}. Would you like to schedule "
+                    f"an in-person appointment instead?"
+                )
+            elif (
+                    re.match(r"^\s*(?:yes|yeah|yep|sure|i will|i'll be|i am|i'm)\b",
+                             message_lower)
+                    or re.search(rf"\b(?:in|inside)\s+{_tele_state.lower()}\b",
+                                 message_lower)
+            ):
+                virtual_florida_eligibility = "confirmed"
+            else:
+                _tele_reply = _tele_question
+        else:
+            virtual_florida_eligibility = "asked"
+            _tele_reply = _tele_question
+        if _tele_reply:
+            conversation_history.append(
+                {"role": "assistant", "content": _tele_reply}
+            )
+            return jsonify({"response": _tele_reply})
+
     # ── Generic couple joint-cancellation (LLM-fallback guard) ──────
     # "Please cancel appointments for my wife and myself" used to reach
     # the model here, which improvised "I would recommend having your
@@ -14656,11 +14793,15 @@ def chat():
         virtual_confirmation = _extract_generic_appointment_confirmation(
             assistant_message
         )
+        if virtual_florida_eligibility == "confirmed" and virtual_confirmation:
+            virtual_florida_eligibility = None
+            virtual_appointment_scheduling_active = False
         if in_person_appointment_scheduling_active and virtual_confirmation:
             in_person_appointment_scheduling_active = False
         if (
                 virtual_appointment_scheduling_active
                 and virtual_confirmation
+                and virtual_florida_eligibility != "confirmed"
                 and pre_chart_complete
                 and not is_medical_professional_caller
                 and not Sprint13.phf_flow_active
