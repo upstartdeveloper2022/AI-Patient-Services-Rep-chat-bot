@@ -964,6 +964,16 @@ def detect_home_health_follow(message_lower):
     ) or _home_health_agency_referral_call(message_lower)
 
 
+# GF-62: a Home Health caller asking for the provider's treatment guidance in
+# plain words ("I need instructions from Dr. X on how to treat it") carries
+# no written/verbal/home-health modifier, so it never reached this workflow
+# and fell to the LLM, which quoted the generic 72-business-hour timeline.
+_HH_PROVIDER_GUIDANCE_RE = re.compile(
+    r"\binstructions?\s+(?:from|on|for|regarding|about)\b|"
+    r"\binstructions?\b.{0,60}\b(?:how\s+to|treat(?:ment|ing)?|care\s+for)\b"
+)
+
+
 def detect_home_health_instructions(message_lower):
     return bool(
         (
@@ -973,6 +983,7 @@ def detect_home_health_instructions(message_lower):
         and (
                 _contains_any(message_lower, HOME_HEALTH_INSTRUCTIONS_TRIGGERS)
                 or _HH_INSTRUCTIONS_PATTERN.search(message_lower)
+                or _HH_PROVIDER_GUIDANCE_RE.search(message_lower)
         )
     )
 
