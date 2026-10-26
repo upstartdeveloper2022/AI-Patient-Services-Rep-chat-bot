@@ -4060,6 +4060,41 @@ def is_couple_back_to_back_followup_request(message_lower):
     )
 
 
+def _message_states_request(message_lower):
+    """True when a message already states what the caller wants (an
+    appointment cancel/reschedule/schedule request). Same detectors the
+    pre-chart "How can I help you today?" shortcut already defers to."""
+    return bool(
+        is_generic_couple_cancel_request(message_lower)
+        or any(t in message_lower for t in (
+            RESCHEDULE_ACUTE_VISIT_TRIGGERS + CANCEL_ACUTE_VISIT_TRIGGERS
+            + QUERY_ACUTE_VISIT_TRIGGERS + HOUSEHOLD_CANCEL_TRIGGERS))
+        or detect_be_seen_appointment_intent(message_lower)
+        or detect_explicit_appointment_request(message_lower)
+        or ("appointment" in message_lower
+            and ("schedule" in message_lower or "book" in message_lower
+                 or "cancel" in message_lower))
+    )
+
+
+def _held_pre_chart_reason(message_lower):
+    """GF-70: return the most recent EARLIER caller message of this call
+    that stated a request, but only when the current message states none
+    (so a bare missing-field answer such as a provider name never wipes
+    out a reason already given). None otherwise."""
+    if _message_states_request(message_lower):
+        return None
+    for turn in reversed(conversation_history):
+        if turn.get("role") != "user":
+            continue
+        earlier = turn.get("content") or ""
+        if earlier.lower() == message_lower:
+            continue
+        if _message_states_request(earlier.lower()):
+            return earlier
+    return None
+
+
 def is_generic_couple_cancel_request(message_lower):
     """Detect a couple-size joint cancellation that has no specialized
     flow of its own: "Please cancel appointments for my wife and myself"
@@ -10129,6 +10164,20 @@ def chat():
                 {"role": "assistant", "content": python_response}
             )
             return jsonify({"response": python_response})
+        # GF-70: the caller stated the reason in an EARLIER pre-chart turn
+        # ("...I need to cancel appointments for my spouse and myself.")
+        # and the turn that just completed identification was only the
+        # missing field ("Dr. Stroman"). That bare answer carries no
+        # intent, so the generic shortcut below discarded the reason and
+        # restarted the call. If this message states no request itself
+        # and an earlier message of this same call did, re-dispatch that
+        # earlier message so the normal machine for it takes over and
+        # asks only for what is genuinely still missing.
+        if pre_chart_complete and not third_party_detected:
+            _held_reason = _held_pre_chart_reason(message_lower)
+            if _held_reason:
+                user_message = _held_reason
+                message_lower = _held_reason.lower()
         # Patient gave everything at once — pre_chart_complete just
         # became True and no intermediate question was needed.
         # Return natural response directly without passing to AI.
