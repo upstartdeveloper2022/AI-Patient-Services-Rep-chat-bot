@@ -10072,6 +10072,19 @@ def chat():
             )
         )
                 and not detect_virtual_wait_annoyance(message_lower)
+                # GF-68: a request to schedule stated in the SAME message that
+                # completed identification (with or without the reason) is
+                # not "how can I help you today?" territory - asking again
+                # restarts a conversation the caller already moved forward.
+                # Same appointment-intent test the reason-question gate uses,
+                # so the normal scheduling path takes over and asks only for
+                # what is genuinely still missing.
+                and not (
+                    detect_be_seen_appointment_intent(message_lower)
+                    or detect_explicit_appointment_request(message_lower)
+                    or ("appointment" in message_lower
+                        and ("schedule" in message_lower or "book" in message_lower))
+                )
         ):
             chart_response = "Thank you for that. How can I help you today?"
             conversation_history.append(
