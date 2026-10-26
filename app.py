@@ -3888,7 +3888,80 @@ def get_ma_availability():
     return current_ma_availability
 
 
-def generate_referral_details(patient_pcp=None):
+# GF-69: the simulated referral on file used to be a random pick from the
+# reason list, so a cardiology office was told the referral was "for
+# dermatology follow-up". The caller's own words (organization name, specialty
+# or reason) name the specialty, so the reason is chosen from the matching
+# entries; with no recognizable specialty the pick stays random.
+_REFERRAL_SPECIALTY_REASONS = (
+    (r"\bcardi|\bheart\b|\bvascular", ("cardiac evaluation", "hypertension management")),
+    (r"\bneuro", ("neurological evaluation",)),
+    (r"\bderm|\bskin\b", ("dermatology follow-up",)),
+    (r"\burolog", ("urological evaluation", "frequent kidney stones")),
+    (r"\bnephro|\bkidney", ("frequent kidney stones",)),
+    (r"\bendocrin|\bdiabet", ("endocrinology consultation", "diabetes management", "thyroid evaluation")),
+    (r"\bpulmon|\blung\b|\brespirat", ("pulmonology evaluation",)),
+    (r"\bgastro|\bdigestive", ("gastroenterology consultation",)),
+    (r"\bortho|\bspine\b|\bsports\s+medicine|\bjoint\b|\bbone\b",
+     ("chronic back pain", "knee pain", "shoulder pain", "elbow pain",
+      "hip pain", "wrist pain", "osteoarthritis")),
+    (r"\bsleep", ("sleep apnea evaluation",)),
+    (r"\bthyroid", ("thyroid evaluation",)),
+)
+
+
+# GF-69b: a professional who says they are MISSING documentation for a
+# referral ("...still missing the most recent office notes needed before we
+# can schedule her") has stated the purpose of the call. Proposing a referral
+# from the chart and asking "Is that the referral you are calling about?"
+# ignores it (and the simulated chart referral is unrelated to their office).
+_DOC_NEED_RE = re.compile(
+    r"\b(?:missing|need(?:s|ed)?|waiting\s+(?:on|for)|"
+    r"haven'?t\s+(?:received|gotten)|have\s+not\s+(?:received|gotten))\s+"
+    r"((?:(?:the|her|his|their|some|any|most|recent|latest)\s+)*"
+    r"[^.,;]*?\b(?:office\s+notes?|visit\s+notes?|progress\s+notes?|"
+    r"clinical\s+notes?|chart\s+notes?|notes|medical\s+records|records|"
+    r"documentation|paperwork))\b",
+    re.IGNORECASE,
+)
+_CALLER_ORG_RE = re.compile(
+    r"\bfrom\s+((?:[A-Z][\w&'\-]*)(?:\s+(?:(?:of|and|&)\s+)?[A-Z][\w&'\-]*){0,6})"
+    r"\s+(?:calling|regarding|about|with|and)\b"
+)
+
+
+def _professional_documentation_need(message):
+    """(needed items, caller organization, caller first name) when the
+    professional's words state missing documentation, else None. Looks at
+    this message first, then earlier caller turns."""
+    texts = [message] + [t.get("content", "") for t in reversed(conversation_history)
+                         if t.get("role") == "user"]
+    for text in texts:
+        need = _DOC_NEED_RE.search(text or "")
+        if need:
+            org = _CALLER_ORG_RE.search(" ".join(texts[::-1]))
+            who = re.search(r"(?i:this\s+is)\s+([A-Z][a-z]+)", " ".join(texts[::-1]))
+            return (
+                need.group(1).strip(),
+                org.group(1) if org else None,
+                who.group(1) if who else None,
+            )
+    return None
+
+
+def _referral_reasons_for_caller(context_text):
+    """Reasons consistent with the specialty named earliest in the caller's
+    words, or None when no specialty is recognizable."""
+    text = (context_text or "").lower()
+    best = None
+    for pattern, reasons in _REFERRAL_SPECIALTY_REASONS:
+        match = re.search(pattern, text)
+        if match and (best is None or match.start() < best[0]):
+            best = (match.start(), reasons)
+    return best[1] if best else None
+
+
+def generate_referral_details(patient_pcp=None, context_text=""):
     days_ago = random.randint(1, 30)
     referral_date = (
             datetime.now() - timedelta(days=days_ago)
@@ -3904,7 +3977,8 @@ def generate_referral_details(patient_pcp=None):
         "sleep apnea evaluation", "thyroid evaluation",
         "elbow pain", "hip pain", "wrist pain", "osteoarthritis"
     ]
-    return referral_date, sending_provider, random.choice(reasons)
+    matched = _referral_reasons_for_caller(context_text)
+    return referral_date, sending_provider, random.choice(matched or reasons)
 
 
 def generate_last_visit_date(schedule_num):
@@ -5703,6 +5777,35 @@ def handle_med_pro_collection(message, message_lower):
         med_pro_call_topic = None
         return "Thank you for that. How can I help today."
 
+    # GF-69b: purpose first. The caller stated what they are missing, so
+    # acknowledge their organization and that need and take it into the fax
+    # workflow's send-it-over step (Sprint16 stage "received_callback":
+    # the next turn supplies the fax number) instead of proposing a chart
+    # referral.
+    _doc_need = (
+        _professional_documentation_need(message)
+        if not med_pro_referral_looked_up else None
+    )
+    if _doc_need and patient_full:
+        _needed, _org, _who = _doc_need
+        med_pro_referral_looked_up = True
+        med_pro_collection_complete = True
+        Sprint16.fax_flow_active = True
+        Sprint16.fax_intent_detected = False
+        Sprint16.fax_stage = "received_callback"
+        Sprint16.fax_received = True
+        Sprint16.fax_patient_first = med_pro_patient_first
+        Sprint16.fax_patient_last = med_pro_patient_last
+        Sprint16.fax_patient_dob = med_pro_patient_dob
+        Sprint16.fax_request_details = _needed
+        return (
+            f"Thank you{', ' + _who if _who else ''}. I do have a referral "
+            f"on file for {patient_full}"
+            f"{' to ' + _org if _org else ''}, and I understand you are "
+            f"still missing {_needed}. I can go ahead and fax these over "
+            f"to you. What is a good fax number to send these to?"
+        )
+
     if not med_pro_referral_looked_up:
         forced = get_harness_override("STEVE_FORCE_REFERRAL_FOUND")
         if forced is not None:
@@ -5719,7 +5822,12 @@ def handle_med_pro_collection(message, message_lower):
         if med_pro_referral_status == "FOUND":
             med_pro_referral_date, med_pro_referral_provider, \
                 med_pro_referral_reason = generate_referral_details(
-                patient_pcp=med_pro_patient_pcp
+                patient_pcp=med_pro_patient_pcp,
+                # GF-69: the caller's own words name their specialty.
+                context_text=" ".join(
+                    [t.get("content", "") for t in conversation_history
+                     if t.get("role") == "user"] + [message]
+                ),
             )
             med_pro_collection_complete = True
 
