@@ -215,6 +215,34 @@ def _resolve_relative_date(message):
         "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6
     }
 
+    # GF-73: recency phrasing the caller has already given ("discharged 2
+    # hours ago", "this morning", "tonight", "last night") names the date
+    # without saying "today" - it was ignored, so Steve asked for a date
+    # the caller had just supplied. Checked FIRST because these phrases
+    # are the most specific; an hours/minutes-ago offset is subtracted
+    # from the real clock so it also rolls back past midnight correctly.
+    _ago = re.search(
+        r"\b(\d{1,3}|an?|one|two|three|four|five|six|a\s+couple(?:\s+of)?|"
+        r"a\s+few|several)\s+(hours?|minutes?|mins?)\s+ago\b",
+        msg_lower,
+    )
+    if _ago:
+        _words = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+                  "five": 5, "six": 6, "a couple": 2, "a couple of": 2,
+                  "a few": 3, "several": 4}
+        _qty = re.sub(r"\s+", " ", _ago.group(1))
+        _n = int(_qty) if _qty.isdigit() else _words.get(_qty, 1)
+        _unit = "hours" if _ago.group(2).startswith("hour") else "minutes"
+        return (today - timedelta(**{_unit: _n})).strftime("%m/%d/%Y")
+
+    if "last night" in msg_lower:
+        return (today - timedelta(days=1)).strftime("%m/%d/%Y")
+
+    if re.search(
+            r"\b(?:this\s+(?:morning|afternoon|evening)|tonight|just\s+now)\b",
+            msg_lower):
+        return today.strftime("%m/%d/%Y")
+
     if "yesterday" in msg_lower:
         return (today - timedelta(days=1)).strftime("%m/%d/%Y")
 
