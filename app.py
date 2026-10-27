@@ -1915,9 +1915,20 @@ def _extract_day_time_from_reply(message):
         r"\b(\d{1,2})(?::?(\d{2}))?\s*(am|pm)\b",
         message, re.IGNORECASE
     )
-    if not day_match or not time_match:
+    # GF-72: "tomorrow at 11:00 AM" names no weekday, so it fell through
+    # to the caller's raw sentence being stored and echoed back. Resolve
+    # today / tomorrow / the day after tomorrow to the real weekday (the
+    # same resolver the availability matcher uses). The office is closed
+    # on weekends, so a weekend result rolls to Monday.
+    day_name = day_match.group(1).capitalize() if day_match else None
+    if not day_name and time_match:
+        _rel = _resolve_relative_day_name(message.lower())
+        if _rel:
+            day_name = _rel[0]
+            if day_name in ("Saturday", "Sunday"):
+                day_name = "Monday"
+    if not day_name or not time_match:
         return None
-    day_name = day_match.group(1).capitalize()
     hour = time_match.group(1)
     minutes = time_match.group(2) or "00"
     meridiem = time_match.group(3).upper()
@@ -5072,6 +5083,51 @@ _CALLBACK_ASK_RE = re.compile(
     re.IGNORECASE,
 )
 _CALLBACK_PHONE_RE = re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b")
+
+
+_REL_DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday",
+                  "saturday", "sunday")
+_REL_LABEL_BEFORE_RE = re.compile(
+    r"\b(today|tomorrow)\b(\s*\(\s*|\s*[,:\-\u2013\u2014]\s*)"
+    r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b(\s*\))?",
+    re.IGNORECASE,
+)
+_REL_LABEL_AFTER_RE = re.compile(
+    r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+    r"(\s*\(\s*(today|tomorrow)\s*\))",
+    re.IGNORECASE,
+)
+
+
+def _fix_relative_day_labels(reply, now=None):
+    """GF-71: a relative label next to a weekday ("Today (Tuesday)",
+    "Tomorrow, Wednesday", "Tuesday (today)") must agree with the real
+    calendar. The slot weekday is the truth (it comes from the schedule),
+    so a label that disagrees is dropped and the weekday kept; a correct
+    "tomorrow" is left exactly as written."""
+    if not reply:
+        return reply
+    now = now or datetime.now()
+
+    def _actual(label):
+        offset = 0 if label.lower() == "today" else 1
+        return _REL_DAY_NAMES[(now + timedelta(days=offset)).weekday()]
+
+    # Offered slots are never for today (the date table rolls today's own
+    # weekday to next week), so a "today" label on a weekday is always
+    # dropped; "tomorrow" is kept only when it really is that weekday.
+    def _before(m):
+        if m.group(1).lower() == "tomorrow" and _actual("tomorrow") == m.group(3).lower():
+            return m.group(0)
+        return m.group(3).capitalize()
+
+    def _after(m):
+        if m.group(3).lower() == "tomorrow" and _actual("tomorrow") == m.group(1).lower():
+            return m.group(0)
+        return m.group(1)
+
+    reply = _REL_LABEL_BEFORE_RE.sub(_before, reply)
+    return _REL_LABEL_AFTER_RE.sub(_after, reply)
 
 
 _CALLBACK_NUMBER_CHANGE_RE = re.compile(
@@ -13357,8 +13413,13 @@ def chat():
                 )
                 _holiday_days.append(_day_name)
             else:
+                # GF-71: say in Python which offered day (if any) is
+                # tomorrow / the day after, so the model never has to work
+                # out a relative label from the weekday list itself.
+                _rel = {1: " (TOMORROW)", 2: " (day after tomorrow)"}.get(
+                    (_real_date.date() - _today.date()).days, "")
                 _date_lines.append(
-                    f"{_day_name} = {_real_date.strftime('%B %d, %Y')}"
+                    f"{_day_name} = {_real_date.strftime('%B %d, %Y')}{_rel}"
                 )
         _valid_days_note = (
                 "REAL CALENDAR DATES INJECTED BY SYSTEM — use these EXACT "
@@ -13368,6 +13429,10 @@ def chat():
                 + "\n".join(_date_lines) + "\n"
                                            "Never state, offer, or confirm any date earlier than "
                                            f"today's actual date ({_today.strftime('%B %d, %Y')}).\n"
+                                           "These slots are NEVER for today. Use the word "
+                                           "\"tomorrow\" only for a day marked (TOMORROW) "
+                                           "above; otherwise name the weekday and date with "
+                                           "no Today/Tomorrow label.\n"
         )
         if _holiday_days:
             _valid_days_note += (
@@ -15085,6 +15150,7 @@ def chat():
         assistant_message = _strip_repeated_callback_ask(
             assistant_message, callback_number_collected, user_message
         )
+        assistant_message = _fix_relative_day_labels(assistant_message)
         virtual_confirmation = _extract_generic_appointment_confirmation(
             assistant_message
         )
