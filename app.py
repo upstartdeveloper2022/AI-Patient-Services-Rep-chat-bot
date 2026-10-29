@@ -5130,6 +5130,118 @@ def _fix_relative_day_labels(reply, now=None):
     return _REL_LABEL_AFTER_RE.sub(_after, reply)
 
 
+# GF-74: no refill flow has any use for a Pharmacy ID - patients do not
+# know one and the office never asks for one. The model sometimes invents
+# the ask when it cannot "find" a pharmacy the patient already described.
+_PHARMACY_ID_ASK_RE = re.compile(
+    r"\bpharmacy\s+(?:id|identification|identifier|npi|ncpdp)\b"
+    r"|\b(?:id|identification)\s+(?:number\s+)?(?:for|of)\s+(?:the|your)\b"
+    r"[^.?!]{0,60}\bpharmacy\b"
+    r"|\bstore\s+(?:id|number)\b|\bncpdp\b|\bnpi\b",
+    re.IGNORECASE,
+)
+
+_PHARMACY_ID_FALLBACK = (
+    "Thank you. So I can make sure the request goes to the right "
+    "location, could you please give me the pharmacy's phone number or "
+    "street address?"
+)
+
+
+def _reply_without_pharmacy_id_ask(messages, reply):
+    """If a model reply asks for a Pharmacy ID, regenerate it ONCE with an
+    explicit correction; if the retry still asks (or fails), fall back to
+    the only acceptable clarification - the pharmacy's phone number or
+    street address. Replies that do not ask for an ID are returned as-is."""
+    if not _PHARMACY_ID_ASK_RE.search(reply or ""):
+        return reply
+    note = (
+        "\n\nPHARMACY_ID_NOT_REQUIRED INJECTED BY SYSTEM:\n"
+        "Your previous draft asked for a Pharmacy ID. Never ask for a "
+        "Pharmacy ID, NPI, NCPDP or store number - patients do not have "
+        "one. The pharmacy the patient already described (name plus "
+        "location) is sufficient: accept it, say nothing about not "
+        "having it in the system, and continue with only the refill "
+        "information that is still genuinely missing. If nothing is "
+        "missing, confirm the request is being sent to the provider. "
+        "Only if the pharmacy truly cannot be told apart, ask for its "
+        "phone number or street address instead.\n"
+    )
+    try:
+        retry_messages = [dict(m) for m in messages]
+        retry_messages[0]["content"] = retry_messages[0]["content"] + note
+        retry = groq_create_completion(
+            model="qwen/qwen3.8-27b",
+            messages=retry_messages,
+            reasoning_effort="none",
+            max_completion_tokens=900,
+        )
+        retried = retry.choices[0].message.content or ""
+        if retried.strip() and not _PHARMACY_ID_ASK_RE.search(retried):
+            return retried
+    except Exception as exc:
+        print(f"[chat] pharmacy-id retry failed: {exc}")
+    return _PHARMACY_ID_FALLBACK
+
+
+# GF-75: for a controlled-substance refill that is WITHIN the follow-up
+# window, the order is: state last visit, then collect dosage, days
+# remaining and pharmacy. The "do you have enough ... until the provider
+# reviews it" question is bridge logic that only belongs after an
+# appointment is booked; the model sometimes opens with it instead.
+_BRIDGE_ENOUGH_RE = re.compile(
+    r"\b(?:do|will)\s+you\s+(?:currently\s+)?have\s+enough\b"
+    r"|\benough\s+[\w\s'-]{0,40}\b(?:to\s+(?:cover|hold|last|get)|until|"
+    r"before)\b",
+    re.IGNORECASE,
+)
+_COLLECT_ASK = {
+    "dosage": "the dosage you are taking",
+    "days": "how many days of medication you have remaining",
+    "pharmacy": "the name and phone number of your pharmacy",
+}
+
+
+def _fix_controlled_within_window_reply(reply, user_text, within_window):
+    """If a within-window controlled refill reply opens with the bridge
+    question, drop that sentence and ask for whatever refill information
+    the caller has not yet given (dosage, days remaining, pharmacy)."""
+    if not within_window or not reply or not _BRIDGE_ENOUGH_RE.search(reply):
+        return reply
+    # Split on sentence ends only: "Dr." / "Mr." / "Ms." are abbreviations,
+    # not ends (a period needs 3+ word characters before it; "Mrs." too).
+    sentences = re.split(
+        r"(?<=[?!])\s+|(?<=\w{3}\.)(?<!Mrs\.)\s+", reply.strip())
+    kept = [x for x in sentences if not _BRIDGE_ENOUGH_RE.search(x)]
+    # A dangling lead-in such as "Just to create the request," belongs to
+    # the dropped sentence, so it is gone with it.
+    low = (user_text or "").lower()
+    missing = []
+    if not re.search(r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|milligrams?)\b", low):
+        missing.append("dosage")
+    if not re.search(
+            r"\b(?:\d+|one|two|three|four|five|six|seven|a\s+few)\s+"
+            r"(?:days?|weeks?|pills?|tablets?)\b", low):
+        missing.append("days")
+    if "pharmacy" not in low and not re.search(
+            r"\b(?:sent?|send)\s+(?:it\s+|this\s+)?to\b", low):
+        missing.append("pharmacy")
+    if missing:
+        asks = [_COLLECT_ASK[m] for m in missing]
+        if len(asks) == 1:
+            ask = asks[0]
+        else:
+            ask = ", ".join(asks[:-1]) + (", and " if len(asks) > 2 else " and ") + asks[-1]
+        kept.append(f"Please tell me {ask}.")
+    else:
+        kept.append(
+            "Thank you. I have what I need and will send your refill "
+            "request to your provider for approval. Is there anything "
+            "else I can help you with today?"
+        )
+    return " ".join(kept)
+
+
 _CALLBACK_NUMBER_CHANGE_RE = re.compile(
     r"\b(?:different|another|new|wrong|incorrect|change[ds]?|updated?)\b"
     r".{0,40}\bnumber\b|\bnumber\b.{0,40}\b(?:wrong|incorrect|change[ds]?)\b",
@@ -8214,6 +8326,10 @@ MEDICATION REFILLS:
    state 72 business hours for this flow. Follow ONLY the exact
    Python-authored question or confirmation for this turn.
 1. Otherwise, collect: name, dosage, days remaining, pharmacy.
+   A pharmacy name plus where it is (shopping center, street, or city)
+   is SUFFICIENT - accept it and continue. NEVER ask for a Pharmacy ID,
+   NPI, NCPDP or store number. Only if the pharmacy truly cannot be
+   told apart, ask for its phone number or street address - nothing else.
 2. State 72 business hours once only.
 
 CONTROLLED SUBSTANCES:
@@ -14572,6 +14688,17 @@ def chat():
                 f"ALWAYS state last visit date first.\n"
                 f"IF NO appointment needed: collect refill info only. "
                 f"Do NOT mention appointments at all.\n"
+                + (
+                    "WITHIN-WINDOW COLLECTION ORDER (GF-75): after stating "
+                    "the last visit, ask for the dosage they take, how many "
+                    "days of medication they have remaining, and the name "
+                    "and phone number of their pharmacy - together, in "
+                    "that one message. Do NOT ask whether they have enough "
+                    "medication to cover them until the provider reviews "
+                    "the order: that bridge question belongs only AFTER an "
+                    "appointment has been booked.\n"
+                    if not needs_appointment else ""
+                )
             )
             if needs_appointment:
                 # Root cause fix (Bug #1/#2/#4): this branch determined
@@ -15147,6 +15274,17 @@ def chat():
                 f"reply trimmed from {len(assistant_message)} to {len(trimmed)} chars"
             )
             assistant_message = trimmed
+        assistant_message = _fix_controlled_within_window_reply(
+            assistant_message,
+            " ".join(
+                t.get("content", "") for t in conversation_history
+                if t.get("role") == "user"
+            ) + " " + user_message,
+            "NO — DO NOT SUGGEST ONE" in controlled_substance_context,
+        )
+        assistant_message = _reply_without_pharmacy_id_ask(
+            messages, assistant_message
+        )
         assistant_message = _strip_repeated_callback_ask(
             assistant_message, callback_number_collected, user_message
         )
