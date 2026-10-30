@@ -51,7 +51,10 @@ def _load_dotenv(path):
     if not os.path.exists(path):
         return
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig: a .env saved by Windows Notepad / PowerShell starts
+        # with a BOM, which "utf-8" leaves glued to the first variable
+        # name ("\ufeffGROQ_API_KEY"), so that key was silently never loaded.
+        with open(path, "r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -61,6 +64,16 @@ def _load_dotenv(path):
                 value = value.strip().strip('"').strip("'")
                 if name and name not in os.environ:
                     os.environ[name] = value
+                elif (name.startswith("GROQ_API_KEY")
+                      and os.environ.get(name) != value):
+                    # The real environment wins by design, but a stale OS
+                    # value silently beating a fresh .env key is a classic
+                    # "Invalid API Key" cause - say so (last 4 chars only).
+                    print(
+                        f"[groq] WARNING: {name} from the OS environment "
+                        f"(...{os.environ.get(name, '')[-4:]}) overrides the "
+                        f"different value in .env (...{value[-4:]})"
+                    )
     except OSError:
         pass
 
@@ -96,6 +109,12 @@ def _collect_groq_api_keys():
 
 
 GROQ_API_KEYS = _collect_groq_api_keys()
+# Startup fingerprint (last 4 chars only, never the key) so it is obvious
+# which keys THIS process loaded when a 401 appears.
+print(
+    f"[groq] {len(GROQ_API_KEYS)} key(s) loaded: "
+    + (", ".join(f"...{k[-4:]}" for k in GROQ_API_KEYS) or "NONE")
+)
 groq_clients = [Groq(api_key=key) for key in GROQ_API_KEYS]
 client = groq_clients[0] if groq_clients else None
 
