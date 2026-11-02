@@ -1,0 +1,753 @@
+# Centralized Intent Router Architecture Blueprint
+
+## Problem Statement
+
+The current 7,200+ line monolith exhibits **workflow interference architecture**:
+- Multiple systems detect intent independently (spouse consent, rescheduling, cancellation, PHF, new patient, etc.)
+- No message ownership enforcement
+- Competing trigger conditions cause cross-workflow contamination
+- Each new feature multiplies collision surface exponentially
+
+**Examples from current bugs:**
+1. Spouse consent workflow intercepts "My husband and I would like to reschedule" before reschedule workflow can own it
+2. Cancellation logic in one place, reschedule logic elsewhere—both run their checks against every message
+3. PHF workflow collides with pre-chart collection—had to add guards after-the-fact
+
+## Proposed Architecture: Centralized Intent Classification + Workflow Routing
+
+### Core Principles
+
+1. **Single Classification Pass**: Analyze the message ONCE and classify intent
+2. **Explicit Ownership**: Exactly ONE workflow owns a message at a time
+3. **Priority-Based Routing**: Clear precedence rules when multiple intents detected
+4. **Workflow Isolation**: Once claimed, a workflow can rely on no other workflow interfering
+5. **Backward Compatibility**: Can be introduced incrementally without full rewrite
+
+---
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Incoming User Message                    │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│         CENTRALIZED INTENT CLASSIFICATION ENGINE             │
+│  (Runs ONCE per message - single point of truth)            │
+│                                                              │
+│  1. Extract key features (names, dates, keywords, etc.)     │
+│  2. Detect ALL possible intents (non-exclusive)             │
+│  3. Score by priority/context                               │
+│  4. Return PRIMARY INTENT + SECONDARY INTENTS               │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                 ┌───────────┴───────────┐
+                 │                       │
+                 ▼                       ▼
+        ┌──────────────────┐    ┌─────────────────┐
+        │  PRIMARY INTENT  │    │ SECONDARY INFO  │
+        │  (string enum)   │    │ (context dict)  │
+        └──────────────────┘    └─────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│            INTENT ROUTER (Route to Workflow)                 │
+│                                                              │
+│  Switch(primary_intent) {                                   │
+│    case RESCHEDULE_APPOINTMENT: → reschedule_handler()      │
+│    case CANCEL_APPOINTMENT: → cancel_handler()              │
+│    case NEW_PATIENT: → new_patient_handler()                │
+│    case POST_HOSPITAL_FOLLOWUP: → phf_handler()             │
+│    case SPOUSE_CONSENT: → spouse_handler()                  │
+│    case PRE_CHART_COLLECTION: → prechart_handler()          │
+│    ... etc                                                   │
+│  }                                                           │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+        ┌────────────────────────────────────────┐
+        │   ACTIVE WORKFLOW HANDLER              │
+        │   (Owns the entire turn)               │
+        │                                        │
+        │   - Receives intent + context          │
+        │   - No interference from other flows   │
+        │   - Returns response or None           │
+        │   - Updates own state                  │
+        └────────────────────────────────────────┘
+                             │
+                             ▼
+                   ┌──────────────────┐
+                   │   LLM + Context  │
+                   │  (if no Python   │
+                   │   response)      │
+                   └──────────────────┘
+```
+
+---
+
+## Intent Classification System
+
+### Intent Enum (Single Source of Truth)
+
+```python
+# file: intent_classifier.py
+
+from enum import Enum
+from typing import Dict, List, NamedTuple
+
+class Intent(Enum):
+    """All possible primary intents in the system."""
+    
+    # Pre-chart workflows
+    PRE_CHART_COLLECTION = "pre_chart_collection"        # Priority: 90
+    HIPAA_VERIFICATION = "hipaa_verification"            # Priority: 89
+    MEDICAL_PROFESSIONAL_CALL = "medical_professional"   # Priority: 88
+    
+    # Patient workflows
+    NEW_PATIENT_SETUP = "new_patient_setup"              # Priority: 85
+    APPOINTMENT_LOOKUP = "appointment_lookup"             # Priority: 80
+    APPOINTMENT_BOOKING = "appointment_booking"           # Priority: 79
+    
+    # Existing appointment management
+    RESCHEDULE_APPOINTMENT = "reschedule_appointment"     # Priority: 75
+    CANCEL_APPOINTMENT = "cancel_appointment"             # Priority: 74
+    RESCHEDULE_CONFIRM = "reschedule_confirm"            # Priority: 73
+    CANCEL_CONFIRM = "cancel_confirm"                    # Priority: 72
+    
+    # Specialized workflows
+    POST_HOSPITAL_FOLLOWUP = "post_hospital_followup"     # Priority: 80 (can overlap with booking)
+    URGENT_SYMPTOMS = "urgent_symptoms"                   # Priority: 95 (highest - life safety)
+    ACUTE_CONTAGIOUS = "acute_contagious"                 # Priority: 90
+    
+    # Third-party workflows
+    SPOUSE_CONSENT = "spouse_consent"                     # Priority: 87
+    THIRD_PARTY_HIPAA = "third_party_hipaa"              # Priority: 86
+    
+    # Other
+    GENERAL_INQUIRY = "general_inquiry"                   # Priority: 50 (lowest)
+    LAB_WORK_INQUIRY = "lab_work_inquiry"                # Priority: 60
+    MEDICATION_INQUIRY = "medication_inquiry"             # Priority: 60
+
+
+class IntentResult(NamedTuple):
+    """Result of intent classification."""
+    primary_intent: Intent
+    confidence: float  # 0.0 - 1.0
+    secondary_intents: List[Intent]  # Can co-occur, but don't route
+    context: Dict  # {
+                  #   'patient_first_name': ...,
+                  #   'patient_last_name': ...,
+                  #   'has_existing_appointment': bool,
+                  #   'hospital_name': ...,
+                  #   'appointment_day': ...,
+                  #   'appointment_time': ...,
+                  #   'caller_is_patient': bool,
+                  #   'third_party_detected': bool,
+                  #   ... etc
+                  # }
+    reason: str  # Why this intent was selected
+
+
+# Priority ordering (lower = route first)
+INTENT_PRIORITY = {
+    Intent.URGENT_SYMPTOMS: 0,
+    Intent.MEDICAL_PROFESSIONAL_CALL: 1,
+    Intent.PRE_CHART_COLLECTION: 2,
+    Intent.HIPAA_VERIFICATION: 3,
+    Intent.SPOUSE_CONSENT: 4,
+    Intent.ACUTE_CONTAGIOUS: 5,
+    Intent.POST_HOSPITAL_FOLLOWUP: 10,
+    Intent.NEW_PATIENT_SETUP: 15,
+    Intent.RESCHEDULE_APPOINTMENT: 20,
+    Intent.CANCEL_APPOINTMENT: 21,
+    Intent.RESCHEDULE_CONFIRM: 22,
+    Intent.CANCEL_CONFIRM: 23,
+    Intent.APPOINTMENT_LOOKUP: 30,
+    Intent.APPOINTMENT_BOOKING: 35,
+    Intent.LAB_WORK_INQUIRY: 50,
+    Intent.MEDICATION_INQUIRY: 50,
+    Intent.GENERAL_INQUIRY: 100,
+}
+```
+
+---
+
+## Centralized Intent Classifier Implementation
+
+```python
+# file: intent_classifier.py (continued)
+
+import re
+from typing import Optional, Tuple
+
+class CentralIntentClassifier:
+    """
+    Single source of truth for intent detection.
+    Runs once per message; all workflow decisions based on this result.
+    """
+    
+    def __init__(self):
+        # Load pre-computed decision trees / ML models here if desired
+        pass
+    
+    def classify(self, message: str, context: Dict) -> IntentResult:
+        """
+        Classify a message to its primary intent.
+        
+        Args:
+            message: The user's raw message
+            context: Current state dict from appbeforeclaude9272026.py (globals converted to dict)
+                    {
+                        'pre_chart_complete': bool,
+                        'patient_first_name': str | None,
+                        'patient_last_name': str | None,
+                        'dob_collected': bool,
+                        'pcp_collected': bool,
+                        'hipaa_status_determined': bool,
+                        'new_patient_flow_active': bool,
+                        'acute_existing_appt_day': str | None,
+                        'acute_existing_appt_time': str | None,
+                        'contagious_visit_active': bool,
+                        ... other state flags
+                    }
+        
+        Returns:
+            IntentResult with primary_intent, confidence, secondary_intents, context dict
+        """
+        
+        msg_lower = message.lower()
+        detected_intents = {}  # {intent: confidence}
+        context_dict = {}
+        
+        # ─────────────────────────────────────────────────────────────
+        # HIGHEST PRIORITY: Life safety
+        # ─────────────────────────────────────────────────────────────
+        
+        if self._detect_urgent_symptoms(msg_lower):
+            detected_intents[Intent.URGENT_SYMPTOMS] = 0.99
+        
+        if self._detect_medical_professional(msg_lower):
+            detected_intents[Intent.MEDICAL_PROFESSIONAL_CALL] = 0.95
+        
+        # ─────────────────────────────────────────────────────────────
+        # HIGH PRIORITY: Pre-chart / HIPAA / Consent
+        # ─────────────────────────────────────────────────────────────
+        
+        if not context.get('pre_chart_complete'):
+            prechart_score = self._score_prechart_intent(message, context)
+            if prechart_score > 0.5:
+                detected_intents[Intent.PRE_CHART_COLLECTION] = prechart_score
+        
+        if (context.get('dob_collected') and context.get('pcp_collected') 
+                and context.get('third_party_detected')
+                and not context.get('hipaa_status_determined')):
+            detected_intents[Intent.HIPAA_VERIFICATION] = 0.9
+        
+        if self._detect_spouse_consent_workflow(msg_lower, context):
+            detected_intents[Intent.SPOUSE_CONSENT] = 0.85
+        
+        # ─────────────────────────────────────────────────────────────
+        # MEDIUM PRIORITY: Existing workflows
+        # ─────────────────────────────────────────────────────────────
+        
+        if context.get('acute_existing_appt_day'):
+            reschedule_score = self._score_reschedule_intent(msg_lower)
+            cancel_score = self._score_cancel_intent(msg_lower)
+            
+            if reschedule_score > 0.7:
+                detected_intents[Intent.RESCHEDULE_APPOINTMENT] = reschedule_score
+            if cancel_score > 0.7:
+                detected_intents[Intent.CANCEL_APPOINTMENT] = cancel_score
+        
+        if context.get('contagious_visit_active'):
+            detected_intents[Intent.ACUTE_CONTAGIOUS] = 0.8
+        
+        # ─────────────────────────────────────────────────────────────
+        # NEW WORKFLOWS
+        # ─────────────────────────────────────────────────────────────
+        
+        phf_score = self._score_phf_intent(msg_lower)
+        if phf_score > 0.6:
+            detected_intents[Intent.POST_HOSPITAL_FOLLOWUP] = phf_score
+        
+        if context.get('new_patient_flow_active'):
+            detected_intents[Intent.NEW_PATIENT_SETUP] = 0.8
+        
+        # ─────────────────────────────────────────────────────────────
+        # FALLBACK: General inquiries
+        # ─────────────────────────────────────────────────────────────
+        
+        if self._detect_lab_work(msg_lower):
+            detected_intents[Intent.LAB_WORK_INQUIRY] = 0.7
+        
+        if self._detect_medication_inquiry(msg_lower):
+            detected_intents[Intent.MEDICATION_INQUIRY] = 0.7
+        
+        # Default fallback
+        if not detected_intents:
+            detected_intents[Intent.GENERAL_INQUIRY] = 0.5
+        
+        # ─────────────────────────────────────────────────────────────
+        # SELECT PRIMARY INTENT BY PRIORITY
+        # ─────────────────────────────────────────────────────────────
+        
+        primary_intent = min(
+            detected_intents.keys(),
+            key=lambda i: INTENT_PRIORITY.get(i, 999)
+        )
+        
+        secondary_intents = [
+            intent for intent in detected_intents
+            if intent != primary_intent
+        ]
+        
+        confidence = detected_intents[primary_intent]
+        
+        return IntentResult(
+            primary_intent=primary_intent,
+            confidence=confidence,
+            secondary_intents=secondary_intents,
+            context=context_dict,
+            reason=f"Selected {primary_intent.value} with confidence {confidence:.2f}"
+        )
+    
+    # ─────────────────────────────────────────────────────────────
+    # Detection helper methods
+    # ─────────────────────────────────────────────────────────────
+    
+    def _detect_urgent_symptoms(self, msg_lower: str) -> bool:
+        """Detect life-threatening symptoms."""
+        urgent_triggers = [
+            "chest pain", "can't breathe", "difficulty breathing",
+            "stroke", "unconscious", "seizure", "bleeding",
+            "heart attack", "anaphylaxis"
+        ]
+        return any(trigger in msg_lower for trigger in urgent_triggers)
+    
+    def _detect_medical_professional(self, msg_lower: str) -> bool:
+        """Detect if caller is a medical professional."""
+        med_pro_triggers = [
+            "this is the pharmacy", "calling from the hospital",
+            "medical center", "specialist", "office manager",
+            "this is dr.", "calling from dr."
+        ]
+        return any(trigger in msg_lower for trigger in med_pro_triggers)
+    
+    def _score_prechart_intent(self, message: str, context: Dict) -> float:
+        """Score how much this message is pre-chart collection."""
+        if context.get('pre_chart_complete'):
+            return 0.0
+        
+        # If we've already asked for something and they're answering, score high
+        score = 0.3  # baseline
+        
+        # Names, DOB, PCP are pre-chart indicators
+        if re.search(r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b', message):
+            score += 0.2  # Looks like a name
+        if re.search(r'\d{1,2}/\d{1,2}/\d{2,4}|\b(january|february|march|april|may|june|july|august|september|october|november|december)\b', message.lower()):
+            score += 0.2  # Looks like a date
+        if re.search(r'\bdr\.\s+[a-z]+\b|patient of', message.lower()):
+            score += 0.2  # Provider mention
+        
+        return min(score, 1.0)
+    
+    def _score_reschedule_intent(self, msg_lower: str) -> float:
+        """Score reschedule intent."""
+        reschedule_phrases = [
+            "reschedule", "change", "move", "different time",
+            "other day", "can't make it", "can't come", "i'd rather",
+            "would prefer", "different appointment"
+        ]
+        return sum(1 for phrase in reschedule_phrases if phrase in msg_lower) * 0.2
+    
+    def _score_cancel_intent(self, msg_lower: str) -> float:
+        """Score cancel intent."""
+        cancel_phrases = [
+            "cancel", "don't want", "don't need", "no longer",
+            "nevermind", "forget it", "scratch that"
+        ]
+        return sum(1 for phrase in cancel_phrases if phrase in msg_lower) * 0.25
+    
+    def _score_phf_intent(self, msg_lower: str) -> float:
+        """Score post-hospital follow-up intent."""
+        phf_phrases = [
+            "post hospital", "post-hospital", "hospital follow", "hospitalized",
+            "discharged", "hospital stay", "follow-up appointment"
+        ]
+        return sum(1 for phrase in phf_phrases if phrase in msg_lower) * 0.3
+    
+    def _detect_spouse_consent_workflow(self, msg_lower: str, context: Dict) -> bool:
+        """Detect if this is a spouse consent workflow."""
+        spouse_phrases = [
+            "my husband", "my wife", "my spouse", "spouse", "partner"
+        ]
+        return (any(phrase in msg_lower for phrase in spouse_phrases) 
+                and context.get('third_party_detected')
+                and context.get('patient_first_name'))
+    
+    def _detect_lab_work(self, msg_lower: str) -> bool:
+        """Detect lab work inquiries."""
+        lab_triggers = [
+            "lab", "lab work", "lab results", "blood work", "test results",
+            "labs", "bloodwork"
+        ]
+        return any(trigger in msg_lower for trigger in lab_triggers)
+    
+    def _detect_medication_inquiry(self, msg_lower: str) -> bool:
+        """Detect medication inquiries."""
+        med_triggers = [
+            "medication", "medicine", "prescribed", "prescription",
+            "metformin", "lisinopril", "what is it for"
+        ]
+        return any(trigger in msg_lower for trigger in med_triggers)
+```
+
+---
+
+## Workflow Handler Interface
+
+Each workflow becomes a class implementing this interface:
+
+```python
+# file: workflow_base.py
+
+from abc import ABC, abstractmethod
+from typing import Optional, Dict
+from intent_classifier import IntentResult
+
+class WorkflowHandler(ABC):
+    """Base class for all workflow handlers."""
+    
+    def __init__(self, state: Dict):
+        """
+        Args:
+            state: Global state dict (replaces global variables)
+        """
+        self.state = state
+    
+    @abstractmethod
+    def can_handle(self, intent_result: IntentResult) -> bool:
+        """
+        Check if this handler owns the intent.
+        
+        Returns:
+            True if this handler should be called, False otherwise
+        """
+        pass
+    
+    @abstractmethod
+    def handle(self, message: str, message_lower: str, 
+              intent_result: IntentResult) -> Optional[str]:
+        """
+        Process the message and return a response, or None if no response.
+        
+        Args:
+            message: Raw user message
+            message_lower: Lowercase version
+            intent_result: Classification result
+        
+        Returns:
+            Response string, or None to fall through to LLM
+        """
+        pass
+    
+    def update_state(self):
+        """Update global state dict after handling. Called automatically."""
+        pass
+
+
+# Example: Reschedule Handler
+class RescheduleHandler(WorkflowHandler):
+    
+    def can_handle(self, intent_result: IntentResult) -> bool:
+        return intent_result.primary_intent == Intent.RESCHEDULE_APPOINTMENT
+    
+    def handle(self, message: str, message_lower: str, 
+              intent_result: IntentResult) -> Optional[str]:
+        """
+        This handler now owns the entire reschedule workflow.
+        No other handler can interfere.
+        """
+        # All reschedule logic here
+        # Access state via self.state['variable_name']
+        # Return response or None
+        pass
+
+
+# Example: PHF Handler
+class PostHospitalFollowupHandler(WorkflowHandler):
+    
+    def can_handle(self, intent_result: IntentResult) -> bool:
+        return intent_result.primary_intent == Intent.POST_HOSPITAL_FOLLOWUP
+    
+    def handle(self, message: str, message_lower: str, 
+              intent_result: IntentResult) -> Optional[str]:
+        """
+        PHF workflow now isolated. No pre-chart interference.
+        No spouse consent interference.
+        """
+        # All PHF logic (from Sprint13) here
+        # State is explicit and passed in
+        pass
+```
+
+---
+
+## Router Implementation
+
+```python
+# file: intent_router.py
+
+from typing import Optional, Dict, List
+from intent_classifier import CentralIntentClassifier, IntentResult, Intent
+from workflow_base import WorkflowHandler
+
+class IntentRouter:
+    """Routes messages to appropriate workflow handlers."""
+    
+    def __init__(self):
+        self.classifier = CentralIntentClassifier()
+        self.handlers: List[WorkflowHandler] = []
+    
+    def register_handler(self, handler: WorkflowHandler):
+        """Register a workflow handler."""
+        self.handlers.append(handler)
+    
+    def route(self, message: str, state: Dict) -> Optional[str]:
+        """
+        Main routing method. Called from chat() endpoint.
+        
+        Args:
+            message: Raw user message
+            state: Current application state (globals as dict)
+        
+        Returns:
+            Response string if a handler handles it, None to use LLM
+        """
+        
+        message_lower = message.lower()
+        
+        # SINGLE CLASSIFICATION PASS
+        intent_result = self.classifier.classify(message, state)
+        
+        # Route to appropriate handler
+        for handler in self.handlers:
+            if handler.can_handle(intent_result):
+                response = handler.handle(message, message_lower, intent_result)
+                if response is not None or handler.consumed():
+                    return response
+        
+        # No handler claimed it; fall through to LLM
+        return None
+    
+    def consumed(self) -> bool:
+        """Did the last handler consume the message (even if no response)?"""
+        # Used to distinguish "no response, ask LLM" from "handler handled it, no response needed"
+        pass
+```
+
+---
+
+## Migration Path (Phase-Based)
+
+### Phase 1: Extract & Run (Week 1-2)
+1. Create `intent_classifier.py` with `CentralIntentClassifier`
+2. Create `intent_router.py` with `IntentRouter`
+3. Add to app.py `/chat` route:
+   ```python
+   from intent_router import IntentRouter
+   
+   router = IntentRouter()
+   # ... register handlers ...
+   
+   @app.route("/chat", methods=["POST"])
+   def chat():
+       user_message = request.json.get("message", "")
+       
+       # Convert globals to state dict
+       state = {
+           'pre_chart_complete': pre_chart_complete,
+           'patient_first_name': patient_first_name,
+           # ... all other globals ...
+       }
+       
+       # Route to workflow
+       response = router.route(user_message, state)
+       if response:
+           return jsonify({"response": response})
+       
+       # Fall through to LLM (existing code)
+       # ...
+   ```
+
+4. **Test**: Run existing tests. Router should return None for all intents (no handlers yet), LLM handles everything.
+
+### Phase 2: Wrap High-Collision Workflows (Week 2-3)
+1. Create `handlers/phf_handler.py` - wrap Sprint13 logic
+2. Create `handlers/reschedule_handler.py` - wrap acute reschedule
+3. Create `handlers/cancel_handler.py` - wrap acute cancel
+4. Create `handlers/spouse_handler.py` - wrap spouse consent
+
+Register them:
+```python
+router.register_handler(RescheduleHandler(state))
+router.register_handler(CancelHandler(state))
+router.register_handler(PHFHandler(state))
+router.register_handler(SpouseConsentHandler(state))
+```
+
+**Benefit**: No more collisions on these 4 workflows. Tests should improve.
+
+### Phase 3: Wrap Pre-Chart (Week 3-4)
+1. Create `handlers/prechart_handler.py`
+2. Extract `determine_pre_chart_response()` logic
+3. Register it at highest priority (after life safety)
+
+**Benefit**: Pre-chart fully isolated from all other workflows.
+
+### Phase 4: Consolidate & Refactor (Week 4+)
+1. Once handlers prove out, consolidate into modular files
+2. Extract shared utilities
+3. Migrate to class-based state (instead of globals)
+
+---
+
+## Collision Prevention Mechanisms
+
+### 1. Priority Ordering
+```python
+# Intent router ALWAYS picks by priority, never by order of detection
+INTENT_PRIORITY = {
+    Intent.URGENT_SYMPTOMS: 0,              # Always wins
+    Intent.MEDICAL_PROFESSIONAL_CALL: 1,    # Before pre-chart
+    Intent.PRE_CHART_COLLECTION: 2,         # Before workflows
+    Intent.HIPAA_VERIFICATION: 3,
+    Intent.SPOUSE_CONSENT: 4,
+    Intent.POST_HOSPITAL_FOLLOWUP: 10,      # After critical paths
+    Intent.RESCHEDULE_APPOINTMENT: 20,
+    Intent.CANCEL_APPOINTMENT: 21,
+    # ... etc
+}
+```
+
+### 2. Mutual Exclusivity Rules
+```python
+# In classifier.handle():
+if primary_intent == Intent.RESCHEDULE_APPOINTMENT:
+    # Block cancel intent even if detected
+    if Intent.CANCEL_APPOINTMENT in detected_intents:
+        detected_intents[Intent.CANCEL_APPOINTMENT] = 0.0
+
+if primary_intent == Intent.SPOUSE_CONSENT:
+    # Block reschedule/cancel until consent complete
+    if context.get('spouse_consent_stage') != 'complete':
+        for intent in [Intent.RESCHEDULE_APPOINTMENT, Intent.CANCEL_APPOINTMENT]:
+            if intent in detected_intents:
+                detected_intents[intent] = 0.0
+```
+
+### 3. Stage-Based Gating
+```python
+# Handler only processes if system is in correct stage
+class RescheduleHandler(WorkflowHandler):
+    def can_handle(self, intent_result):
+        # Only handle if acute appointment exists
+        return (intent_result.primary_intent == Intent.RESCHEDULE_APPOINTMENT
+                and self.state.get('acute_existing_appt_day') is not None)
+```
+
+### 4. Message Consumption Flag
+```python
+class WorkflowHandler(ABC):
+    def consumed(self) -> bool:
+        """
+        Returns True if handler consumed the message.
+        Router will NOT call LLM if True, even if response is None.
+        """
+        pass
+
+# In router:
+for handler in self.handlers:
+    if handler.can_handle(intent_result):
+        response = handler.handle(message, message_lower, intent_result)
+        if response or handler.consumed():
+            return response  # Don't try other handlers or LLM
+```
+
+---
+
+## Collision Prevention Examples
+
+### Before (Current Problem)
+```
+Message: "My husband and I would like to reschedule our appointment"
+
+1. Spouse consent detector runs → triggers spouse workflow
+2. Reschedule detector runs → triggers reschedule workflow
+3. HIPAA detector runs → triggers HIPAA workflow
+4. Three workflows now fighting for ownership
+5. Result: Confusing handoff or incorrect workflow chosen
+```
+
+### After (Centralized Router)
+```
+Message: "My husband and I would like to reschedule our appointment"
+
+1. Classifier runs ONCE:
+   - Detects: spouse_consent (0.8), reschedule (0.7), hipaa (0.6)
+   
+2. Priority sort:
+   - SPOUSE_CONSENT (priority 4)
+   - HIPAA_VERIFICATION (priority 3)
+   - RESCHEDULE (priority 20)
+   
+3. Router picks primary: SPOUSE_CONSENT
+   - Explicit rule: "Spouse workflow blocks reschedule until complete"
+   
+4. Result: Clear ownership, no confusion
+```
+
+---
+
+## Benefits Summary
+
+| Issue | Before | After |
+|-------|--------|-------|
+| Competing workflows | Each detects independently | Single classification, explicit priority |
+| Collision surfaces | N × (N-1) pairs collide | Single router makes all decisions |
+| New workflow risk | Multiplies collision risk | Add to priority table, inherit safety |
+| Debugging conflicts | Trace through N interceptors | Check `IntentResult.reason` |
+| State management | 100+ global variables | Single state dict passed to handlers |
+| Fallthrough behavior | LLM sees multiple workflows' context injections | LLM sees context only from chosen workflow |
+| Testing workflows | Hard to isolate—all others run too | Test handler with mocked state |
+| Scaling | Linear degradation as features add | O(1) collision risk regardless of count |
+
+---
+
+## Implementation Checklist
+
+- [ ] Create `intent_classifier.py` with `Intent` enum and `CentralIntentClassifier`
+- [ ] Create `intent_router.py` with `IntentRouter` and `WorkflowHandler` base
+- [ ] Integrate router into `/chat` route (return None by default, LLM handles all)
+- [ ] Create `handlers/phf_handler.py` (move Sprint13 logic)
+- [ ] Create `handlers/reschedule_handler.py` (move acute reschedule)
+- [ ] Create `handlers/cancel_handler.py` (move acute cancel)
+- [ ] Create `handlers/spouse_handler.py` (move spouse consent)
+- [ ] Test each handler independently
+- [ ] Verify no regressions on existing scenarios
+- [ ] Create `handlers/prechart_handler.py` (move pre-chart logic)
+- [ ] Remove guards and after-the-fact collision fixes
+- [ ] Document intent classification rules
+
+---
+
+## Next Steps
+
+1. **Week 1**: Create base files and integrate (non-breaking)
+2. **Week 2**: Wrap high-collision workflows
+3. **Week 3**: Test and refine
+4. **Week 4+**: Expand to more workflows, eventually migrate to classes
+
+This approach lets you incrementally fix collisions without a full rewrite, and gives you a scalable foundation for the next 50 workflows without exponential collision risk.
