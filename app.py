@@ -64,16 +64,6 @@ def _load_dotenv(path):
                 value = value.strip().strip('"').strip("'")
                 if name and name not in os.environ:
                     os.environ[name] = value
-                elif (name.startswith("GROQ_API_KEY")
-                      and os.environ.get(name) != value):
-                    # The real environment wins by design, but a stale OS
-                    # value silently beating a fresh .env key is a classic
-                    # "Invalid API Key" cause - say so (last 4 chars only).
-                    print(
-                        f"[groq] WARNING: {name} from the OS environment "
-                        f"(...{os.environ.get(name, '')[-4:]}) overrides the "
-                        f"different value in .env (...{value[-4:]})"
-                    )
     except OSError:
         pass
 
@@ -6381,7 +6371,25 @@ def handle_new_patient_flow(message, message_lower):
     # Capture the patient's name only after determining whether the caller
     # is registering a minor; in that case the caller's own introduction
     # must not be stored as the patient.
-    if new_patient_first_name is None:
+    # GF-77: the reply to "What insurance do you have?" ("Florida Blue",
+    # "United Healthcare") is two capitalized words, which the name
+    # extractor read as the patient's first and last name - so the name
+    # question was skipped and the call went straight to date of birth.
+    # When the question just asked was about insurance, only take a name
+    # from the reply if the caller actually introduced themselves.
+    _last_assistant_text = (
+        conversation_history[-1].get("content", "").lower()
+        if conversation_history
+        and conversation_history[-1].get("role") == "assistant" else ""
+    )
+    _answering_insurance_question = (
+        "insurance" in _last_assistant_text
+        and not re.search(
+            r"\b(?:my\s+name\s+is|my\s+name['\u2019]?s|name\s+is|this\s+is)\b",
+            message_lower,
+        )
+    )
+    if new_patient_first_name is None and not _answering_insurance_question:
         _early_name = extract_names_from_message(message)
         if (
             new_patient_is_minor
