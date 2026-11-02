@@ -2350,7 +2350,7 @@ def _handle_reason_awareness_flow(message, message_lower, kind):
             return (
                 f"{imaging_provider_name} {review}, however I will notate our "
                 f"conversation. Can you verify your phone number so that when "
-                f"{imaging_provider_name} calls, they are able to reach you?"
+                f"our office calls, we are able to reach you?"
             )
 
     if stage is None and kind == "lab" and lab_reason_already_stated(message_lower):
@@ -2385,7 +2385,8 @@ def _handle_reason_awareness_flow(message, message_lower, kind):
         requests_flow_active = False
         return (
             f"Thank you. I have notated your request and our conversation, "
-            f"and {provider} will be able to reach you{reach} to review it. "
+            f"and our office will be able to reach you{reach} once "
+            f"{provider} has reviewed it. "
             f"Please allow up to 24 business hours for that to be processed. "
             f"Is there anything else I can help you with today?"
         )
